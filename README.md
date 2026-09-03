@@ -67,4 +67,4 @@ Issues and pull requests are welcome. Please open an issue to discuss significan
 
 ## License
 
-[MIT](LICENSE) — feel free to adapt this if you'd prefer a different license; MIT is used here as a permissive default.
+[MIT] — This was Vibe Coded specifically for open source alternatives to commercial software or free tier software with paywalls for expanability.
