@@ -1,0 +1,63 @@
+strain_name: "Example Auto (Reference Profile)"
+description: >
+  A general-purpose 12-week auto-flowering profile. Adjust durations and targets
+  to match your specific genetics. Copy this file and rename it for your strain.
+author: "Helix Cultivate"
+version: "1.0"
+
+stages:
+  germination:
+    duration_days: 4
+    vpd_target_kpa: 0.40
+    temp_c: 24.0
+    rh_pct: 80.0
+    photoperiod_h: 20.0
+
+  seedling:
+    duration_days: 10
+    vpd_target_kpa: 0.60
+    temp_c: 23.5
+    rh_pct: 75.0
+    photoperiod_h: 20.0
+
+  early_veg:
+    duration_days: 14
+    vpd_target_kpa: 0.80
+    temp_c: 24.0
+    rh_pct: 70.0
+    photoperiod_h: 18.0
+
+  late_veg:
+    duration_days: 14
+    vpd_target_kpa: 0.95
+    temp_c: 24.0
+    rh_pct: 65.0
+    photoperiod_h: 18.0
+
+  stretch:
+    duration_days: 14
+    vpd_target_kpa: 1.05
+    temp_c: 25.0
+    rh_pct: 60.0
+    photoperiod_h: 12.0
+
+  peak_flower:
+    duration_days: 28
+    vpd_target_kpa: 1.20
+    temp_c: 26.0
+    rh_pct: 50.0
+    photoperiod_h: 12.0
+
+  ripening:
+    duration_days: 14
+    vpd_target_kpa: 1.40
+    temp_c: 24.0
+    rh_pct: 45.0
+    photoperiod_h: 12.0
+
+  drying:
+    duration_days: 10
+    vpd_target_kpa: 1.10
+    temp_c: 18.0
+    rh_pct: 55.0
+    photoperiod_h: 0.0

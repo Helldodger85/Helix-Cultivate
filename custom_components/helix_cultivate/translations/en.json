@@ -1,0 +1,346 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Helix Cultivate — Environment Setup",
+        "description": "Choose how your growing environment is set up. Coordinated manages both your primary grow space and the outer room it sits in (the conditioning room) to pre-treat your air. Standalone only manages the climate directly inside the grow space.",
+        "data": {
+          "topology": "Operating Mode",
+          "primary_temp_sensor": "Primary Grow Space — Temperature Sensor (required)",
+          "primary_humidity_sensor": "Primary Grow Space — Humidity Sensor (required)"
+        },
+        "data_description": {
+          "topology": "Coordinated pre-conditions supply air through a dedicated conditioning room before it enters the grow space. Standalone reads and controls the grow space directly.",
+          "primary_temp_sensor": "The main temperature sensor inside your primary grow space canopy zone.",
+          "primary_humidity_sensor": "The main relative humidity sensor inside your primary grow space canopy zone."
+        }
+      },
+      "zone1_devices": {
+        "title": "Helix Cultivate — Conditioning Room Appliances",
+        "description": "Map optional conditioning room (Zone 1) climate appliances. Leave fields blank if not applicable.",
+        "data": {
+          "lung_temp_sensor": "Conditioning Room Temperature Sensor",
+          "lung_humidity_sensor": "Conditioning Room Humidity Sensor",
+          "zone1_ac": "Zone 1 Air Conditioner / Cooler",
+          "zone1_is_reverse_cycle": "This unit is a Reverse-Cycle Heat Pump",
+          "zone1_heater": "Zone 1 Heater (or Backup Heater if Reverse-Cycle)",
+          "zone1_backup_heater_threshold_c": "Backup Heater Stage-On Threshold (°C outdoor)",
+          "zone1_humidifier": "Zone 1 Humidifier",
+          "zone1_dehumidifier": "Zone 1 Dehumidifier"
+        },
+        "data_description": {
+          "zone1_is_reverse_cycle": "Check if your Air Conditioner can also heat. The Heater field becomes a backup / staging heater when this is enabled.",
+          "zone1_backup_heater_threshold_c": "Only active when the AC is a Reverse-Cycle unit. The backup heater stages on when outdoor temperature falls below this value."
+        }
+      },
+      "zone2_devices": {
+        "title": "Helix Cultivate — Grow Space Appliances & Extra Sensors",
+        "description": "Map optional grow space (Zone 2) climate appliances and additional canopy sensor pairs. Leave fields blank if not applicable.",
+        "data": {
+          "upper_canopy_temp_sensor": "Upper Canopy Temperature Sensor",
+          "upper_canopy_humidity_sensor": "Upper Canopy Humidity Sensor",
+          "mid_canopy_temp_sensor": "Mid Canopy Temperature Sensor",
+          "mid_canopy_humidity_sensor": "Mid Canopy Humidity Sensor",
+          "lower_canopy_temp_sensor": "Lower Canopy Temperature Sensor",
+          "lower_canopy_humidity_sensor": "Lower Canopy Humidity Sensor",
+          "exhaust_fan": "Exhaust Fan",
+          "zone2_ac": "Zone 2 Air Conditioner / Cooler",
+          "zone2_is_reverse_cycle": "This unit is a Reverse-Cycle Heat Pump",
+          "zone2_heater": "Zone 2 Heater",
+          "zone2_humidifier": "Zone 2 Humidifier",
+          "zone2_dehumidifier": "Zone 2 Dehumidifier",
+          "outdoor_weather_entity": "Outdoor Weather Entity (Feedforward MPC)"
+        },
+        "data_description": {
+          "upper_canopy_temp_sensor": "Optional. If mapped, overrides the primary sensor for upper-canopy temperature readings.",
+          "upper_canopy_humidity_sensor": "Optional. If mapped, overrides the primary sensor for upper-canopy humidity readings.",
+          "mid_canopy_temp_sensor": "Optional. Mid-canopy temperature sensor for stratification detection.",
+          "mid_canopy_humidity_sensor": "Optional. Mid-canopy humidity sensor for stratification detection.",
+          "lower_canopy_temp_sensor": "Optional. Lower-canopy temperature sensor for stratification detection.",
+          "lower_canopy_humidity_sensor": "Optional. Lower-canopy humidity sensor for stratification detection."
+        }
+      },
+      "fan_matrix": {
+        "title": "Helix Cultivate — Circulation Fan Matrix",
+        "description": "Assign up to 4 fan or switch entities per canopy tier. Slots left blank are ignored at runtime.",
+        "data": {
+          "upper_fan_1": "Upper Canopy Fan Slot 1",
+          "upper_fan_2": "Upper Canopy Fan Slot 2",
+          "upper_fan_3": "Upper Canopy Fan Slot 3",
+          "upper_fan_4": "Upper Canopy Fan Slot 4",
+          "mid_fan_1": "Mid Canopy Fan Slot 1",
+          "mid_fan_2": "Mid Canopy Fan Slot 2",
+          "mid_fan_3": "Mid Canopy Fan Slot 3",
+          "mid_fan_4": "Mid Canopy Fan Slot 4",
+          "lower_fan_1": "Lower Canopy Fan Slot 1",
+          "lower_fan_2": "Lower Canopy Fan Slot 2",
+          "lower_fan_3": "Lower Canopy Fan Slot 3",
+          "lower_fan_4": "Lower Canopy Fan Slot 4",
+          "fan_control_mode": "Fan Control Mode",
+          "breeze_enabled": "Enable Breeze / Natural Wind Engine",
+          "breeze_variance": "Breeze Speed Variance (±%)"
+        },
+        "data_description": {
+          "fan_control_mode": "PWM 10-Step runs in 10% increments; Continuous allows 0–100%; Bang-Bang uses on/off relay.",
+          "breeze_variance": "The fan speed will randomly deviate ±this percentage from the base speed at 8–25 second intervals."
+        }
+      },
+      "lighting": {
+        "title": "Helix Cultivate — Grow Lighting",
+        "description": "Map the grow light and configure dimming, sunrise/sunset ramps, DLI tracking, and time-lapse camera.",
+        "data": {
+          "grow_light": "Grow Light Entity",
+          "light_type": "Light Type",
+          "light_dimmable": "Light is Dimmable",
+          "sunrise_ramp_min": "Sunrise / Sunset Ramp Duration (minutes)",
+          "dli_sensor": "PAR / PPFD Sensor (DLI Engine)",
+          "grow_camera": "Grow Camera (Time-Lapse Snapshots)"
+        },
+        "data_description": {
+          "sunrise_ramp_min": "Duration of the gradual sunrise and sunset intensity ramp.",
+          "dli_sensor": "Optional. If mapped, the integration calculates cumulative DLI and can extend photoperiod to compensate for dimming.",
+          "grow_camera": "Optional. If mapped, a snapshot is triggered 10 minutes before lights-out each day."
+        }
+      },
+      "safety_params": {
+        "title": "Helix Cultivate — Safety & Control Parameters",
+        "description": "Configure control algorithm, safety cutoffs, anti-short-cycle, and leaf temperature offset.",
+        "data": {
+          "control_algorithm": "Control Algorithm",
+          "heater_cutoff_c": "Zone 1 Heater Over-Temp Cutoff (°C)",
+          "thermal_runaway_c": "Canopy Thermal Runaway Guard (°C)",
+          "anti_short_cycle_min": "Compressor Anti-Short-Cycle Dwell (minutes)",
+          "leaf_temp_offset_c": "Leaf Temperature Offset (°C)",
+          "exhaust_min_pct": "Exhaust Minimum Negative Pressure Floor (%)"
+        },
+        "data_description": {
+          "control_algorithm": "Bang-Bang uses deadband hysteresis; True PID uses Proportional-Integral-Derivative control for variable devices.",
+          "heater_cutoff_c": "Zone 1 heater is killed immediately if canopy temperature exceeds this threshold.",
+          "thermal_runaway_c": "Grow light dims to 0% and exhaust is forced to 100% if canopy temperature exceeds this threshold.",
+          "anti_short_cycle_min": "Minimum dwell time between compressor restarts (dehumidifiers, AC units).",
+          "leaf_temp_offset_c": "Applied to canopy dry-bulb temperature for accurate Leaf VPD calculation. Typically -2.5°C.",
+          "exhaust_min_pct": "Exhaust fan will never go below this percentage to maintain negative pressure."
+        }
+      },
+      "energy": {
+        "title": "Helix Cultivate — Energy & Cost Tracking",
+        "description": "Enter your electricity rate to enable cycle cost tracking.",
+        "data": {
+          "electricity_rate": "Electricity Rate ($/kWh)"
+        }
+      },
+      "stage_setup": {
+        "title": "Helix Cultivate — Grow Stage & Recipe",
+        "description": "Configure the initial grow stage, progression mode, and optional strain recipe file.",
+        "data": {
+          "initial_stage": "Initial Grow Stage",
+          "progression_mode": "Stage Progression Mode",
+          "stage_start_date": "Stage Start Date",
+          "smooth_glides": "Enable Smooth Glides (Interpolated Setpoints)",
+          "recipe_file": "Strain Recipe File (filename in recipes/ folder)"
+        },
+        "data_description": {
+          "progression_mode": "Manual: stage is locked until you change it. Timeframe Managed: auto-advances on elapsed days.",
+          "smooth_glides": "When enabled, VPD/Temp/RH targets are linearly interpolated day-by-day across stage durations rather than hard-stepping.",
+          "recipe_file": "Optional YAML filename (e.g. my_strain.yaml) inside the recipes/ folder. Leave blank to use built-in defaults."
+        }
+      }
+    },
+    "error": {
+      "entity_not_found": "The selected entity could not be found in Home Assistant. Please check the entity ID.",
+      "cannot_connect": "Unable to connect to the specified entity.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "Helix Cultivate is already configured.",
+      "single_instance_allowed": "Only a single instance of Helix Cultivate is supported."
+    }
+  },
+  "options": {
+    "step": {
+      "topology": {
+        "title": "Reconfigure — Environment Setup",
+        "description": "Choose how your growing environment is set up. Coordinated manages both your primary grow space and the outer room it sits in (the conditioning room) to pre-treat your air. Standalone only manages the climate directly inside the grow space.",
+        "data": {
+          "topology": "Operating Mode",
+          "primary_temp_sensor": "Primary Grow Space — Temperature Sensor (required)",
+          "primary_humidity_sensor": "Primary Grow Space — Humidity Sensor (required)"
+        },
+        "data_description": {
+          "topology": "Coordinated pre-conditions supply air through a dedicated conditioning room before it enters the grow space. Standalone reads and controls the grow space directly.",
+          "primary_temp_sensor": "The main temperature sensor inside your primary grow space canopy zone.",
+          "primary_humidity_sensor": "The main relative humidity sensor inside your primary grow space canopy zone."
+        }
+      },
+      "zone1_devices": {
+        "title": "Reconfigure — Conditioning Room Appliances",
+        "data": {
+          "lung_temp_sensor": "Conditioning Room Temperature Sensor",
+          "lung_humidity_sensor": "Conditioning Room Humidity Sensor",
+          "zone1_ac": "Zone 1 Air Conditioner / Cooler",
+          "zone1_is_reverse_cycle": "This unit is a Reverse-Cycle Heat Pump",
+          "zone1_heater": "Zone 1 Heater (or Backup Heater if Reverse-Cycle)",
+          "zone1_backup_heater_threshold_c": "Backup Heater Stage-On Threshold (°C outdoor)",
+          "zone1_humidifier": "Zone 1 Humidifier",
+          "zone1_dehumidifier": "Zone 1 Dehumidifier"
+        }
+      },
+      "zone2_devices": {
+        "title": "Reconfigure — Grow Space Appliances & Extra Sensors",
+        "data": {
+          "upper_canopy_temp_sensor": "Upper Canopy Temperature Sensor",
+          "upper_canopy_humidity_sensor": "Upper Canopy Humidity Sensor",
+          "mid_canopy_temp_sensor": "Mid Canopy Temperature Sensor",
+          "mid_canopy_humidity_sensor": "Mid Canopy Humidity Sensor",
+          "lower_canopy_temp_sensor": "Lower Canopy Temperature Sensor",
+          "lower_canopy_humidity_sensor": "Lower Canopy Humidity Sensor",
+          "exhaust_fan": "Exhaust Fan",
+          "zone2_ac": "Zone 2 Air Conditioner / Cooler",
+          "zone2_is_reverse_cycle": "This unit is a Reverse-Cycle Heat Pump",
+          "zone2_heater": "Zone 2 Heater",
+          "zone2_humidifier": "Zone 2 Humidifier",
+          "zone2_dehumidifier": "Zone 2 Dehumidifier",
+          "outdoor_weather_entity": "Outdoor Weather Entity (Feedforward MPC)"
+        }
+      },
+      "fan_matrix": {
+        "title": "Reconfigure — Circulation Fan Matrix",
+        "data": {
+          "upper_fan_1": "Upper Canopy Fan Slot 1",
+          "upper_fan_2": "Upper Canopy Fan Slot 2",
+          "upper_fan_3": "Upper Canopy Fan Slot 3",
+          "upper_fan_4": "Upper Canopy Fan Slot 4",
+          "mid_fan_1": "Mid Canopy Fan Slot 1",
+          "mid_fan_2": "Mid Canopy Fan Slot 2",
+          "mid_fan_3": "Mid Canopy Fan Slot 3",
+          "mid_fan_4": "Mid Canopy Fan Slot 4",
+          "lower_fan_1": "Lower Canopy Fan Slot 1",
+          "lower_fan_2": "Lower Canopy Fan Slot 2",
+          "lower_fan_3": "Lower Canopy Fan Slot 3",
+          "lower_fan_4": "Lower Canopy Fan Slot 4",
+          "fan_control_mode": "Fan Control Mode",
+          "breeze_enabled": "Enable Breeze / Natural Wind Engine",
+          "breeze_variance": "Breeze Speed Variance (±%)"
+        }
+      },
+      "lighting": {
+        "title": "Reconfigure — Grow Lighting",
+        "data": {
+          "grow_light": "Grow Light Entity",
+          "light_type": "Light Type",
+          "light_dimmable": "Light is Dimmable",
+          "sunrise_ramp_min": "Sunrise / Sunset Ramp Duration (minutes)",
+          "dli_sensor": "PAR / PPFD Sensor (DLI Engine)",
+          "grow_camera": "Grow Camera (Time-Lapse Snapshots)"
+        }
+      },
+      "safety_params": {
+        "title": "Reconfigure — Safety & Control Parameters",
+        "data": {
+          "control_algorithm": "Control Algorithm",
+          "heater_cutoff_c": "Zone 1 Heater Over-Temp Cutoff (°C)",
+          "thermal_runaway_c": "Canopy Thermal Runaway Guard (°C)",
+          "anti_short_cycle_min": "Compressor Anti-Short-Cycle Dwell (minutes)",
+          "leaf_temp_offset_c": "Leaf Temperature Offset (°C)",
+          "exhaust_min_pct": "Exhaust Minimum Negative Pressure Floor (%)",
+          "notify_target": "Mobile Push Notification Target"
+        }
+      },
+      "energy": {
+        "title": "Reconfigure — Energy & Cost Tracking",
+        "data": {
+          "electricity_rate": "Electricity Rate ($/kWh)"
+        }
+      },
+      "stage_setup": {
+        "title": "Reconfigure — Grow Stage & Recipe",
+        "data": {
+          "initial_stage": "Grow Stage",
+          "progression_mode": "Stage Progression Mode",
+          "stage_start_date": "Stage Start Date",
+          "smooth_glides": "Enable Smooth Glides (Interpolated Setpoints)",
+          "recipe_file": "Strain Recipe File (filename in recipes/ folder)"
+        }
+      }
+    },
+    "error": {
+      "entity_not_found": "The selected entity could not be found in Home Assistant.",
+      "unknown": "An unexpected error occurred."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "upper_canopy_temp": { "name": "Upper Canopy Temperature" },
+      "upper_canopy_rh": { "name": "Upper Canopy Humidity" },
+      "mid_canopy_temp": { "name": "Mid Canopy Temperature" },
+      "mid_canopy_rh": { "name": "Mid Canopy Humidity" },
+      "lower_canopy_temp": { "name": "Lower Canopy Temperature" },
+      "lower_canopy_rh": { "name": "Lower Canopy Humidity" },
+      "lung_temp": { "name": "Conditioning Room Temperature" },
+      "lung_rh": { "name": "Conditioning Room Humidity" },
+      "leaf_vpd": { "name": "Leaf VPD" },
+      "upper_enthalpy": { "name": "Upper Canopy Enthalpy" },
+      "lung_enthalpy": { "name": "Conditioning Room Enthalpy" },
+      "exhaust_speed": { "name": "Exhaust Speed" },
+      "dli_today": { "name": "DLI Today" },
+      "cycle_cost": { "name": "Cycle Cost" },
+      "cycle_kwh": { "name": "Cycle Energy" },
+      "grow_stage": { "name": "Grow Stage" },
+      "stage_day": { "name": "Stage Day" }
+    },
+    "switch": {
+      "smooth_glides": { "name": "Smooth Glides" },
+      "breeze_upper": { "name": "Upper Canopy Breeze Mode" },
+      "breeze_mid": { "name": "Mid Canopy Breeze Mode" },
+      "breeze_lower": { "name": "Lower Canopy Breeze Mode" },
+      "dli_extension": { "name": "DLI Photoperiod Extension" }
+    },
+    "number": {
+      "vpd_target": { "name": "VPD Target" },
+      "temp_setpoint": { "name": "Temperature Setpoint" },
+      "rh_setpoint": { "name": "Humidity Setpoint" },
+      "heater_cutoff": { "name": "Heater Over-Temp Cutoff" },
+      "thermal_runaway": { "name": "Thermal Runaway Guard" },
+      "anti_short_cycle": { "name": "Anti-Short-Cycle Dwell" },
+      "exhaust_min_pct": { "name": "Exhaust Minimum Floor" },
+      "leaf_temp_offset": { "name": "Leaf Temp Offset" },
+      "upper_fan_speed": { "name": "Upper Canopy Fan Speed" },
+      "mid_fan_speed": { "name": "Mid Canopy Fan Speed" },
+      "lower_fan_speed": { "name": "Lower Canopy Fan Speed" },
+      "upper_fan_variance": { "name": "Upper Canopy Breeze Variance" },
+      "mid_fan_variance": { "name": "Mid Canopy Breeze Variance" },
+      "lower_fan_variance": { "name": "Lower Canopy Breeze Variance" },
+      "light_intensity": { "name": "Grow Light Intensity" },
+      "sunrise_ramp_min": { "name": "Sunrise / Sunset Ramp" },
+      "electricity_rate": { "name": "Electricity Rate" }
+    },
+    "select": {
+      "topology": { "name": "Operating Mode" },
+      "grow_stage": { "name": "Grow Stage" },
+      "progression_mode": { "name": "Stage Progression Mode" },
+      "control_algorithm": { "name": "Control Algorithm" },
+      "upper_fan_control": { "name": "Upper Canopy Fan Control Mode" },
+      "mid_fan_control": { "name": "Mid Canopy Fan Control Mode" },
+      "lower_fan_control": { "name": "Lower Canopy Fan Control Mode" },
+      "light_type": { "name": "Grow Light Type" }
+    }
+  },
+  "issues": {
+    "conditioning_room_no_lung_sensors": {
+      "title": "Conditioning Room Has No Sensors",
+      "description": "The Conditioning Room module is enabled but no lung-room temperature or humidity sensors are mapped. Map both sensors in Settings > Hardware Mapping, or disable the Conditioning Room module."
+    },
+    "vpd_range_implausible": {
+      "title": "Implausible VPD Range Configured",
+      "description": "One or more grow stages have a day VPD range where the maximum is lower than the minimum, or exceeds 4.0 kPa. Review your stage profiles in the Plant Cycle tab or imported recipe."
+    },
+    "backup_heater_no_entity": {
+      "title": "Backup Heater Threshold Set Without an Entity",
+      "description": "A Zone 1 backup heater outdoor-temperature threshold is configured, but no backup heater (or primary heater acting as backup) entity is mapped. Map a heater entity in Settings > Hardware Mapping, or set the threshold to 0 to disable this feature."
+    },
+    "drying_unlocked_no_sensor": {
+      "title": "Drying Zone Unlocked Without Sensors",
+      "description": "The drying zone custom profile is unlocked, but the drying temperature or humidity sensor is not mapped. Custom drying control requires both sensors — map them in Settings > Hardware Mapping, or re-lock the drying zone to use the fixed 60/60 cure profile."
+    }
+  }
+}
