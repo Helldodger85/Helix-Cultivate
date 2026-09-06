@@ -8,6 +8,6 @@
   "requirements": [],
   "codeowners": ["@helix-cultivate"],
   "homeassistant": "2024.6.0",
-  "documentation": "https://github.com/helix-cultivate/helix_cultivate",
-  "issue_tracker": "https://github.com/helix-cultivate/helix_cultivate/issues"
+  "documentation": "https://github.com/Helldodger85/Helix-Cultivate",
+  "issue_tracker": "https://github.com/Helldodger85/Helix-Cultivate/issues"
 }

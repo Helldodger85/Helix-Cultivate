@@ -5,7 +5,7 @@ import asyncio
 import logging
 import random
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from typing import Any, Optional
 
 from homeassistant.config_entries import ConfigEntry
@@ -25,6 +25,8 @@ from .const import (
     CONF_DRYING_HUMIDITY_SENSOR,
     CONF_DRYING_TEMP_SENSOR,
     CONF_ELECTRICITY_RATE,
+    CONF_EM_DRYING_SENSORS,
+    CONF_EM_GLOBAL_SENSORS,
     CONF_EM_ZONE1_SENSORS,
     CONF_EM_ZONE2_SENSORS,
     CONF_ENABLE_CONDITIONING_ROOM,
@@ -56,6 +58,26 @@ from .const import (
     CONF_ZONE1_REVERSE_CYCLE,
     CONF_ZONE2_REVERSE_CYCLE,
     COORDINATOR_UPDATE_INTERVAL,
+    CONF_TARIFF_MODE,
+    CONF_TARIFF_ANYTIME,
+    CONF_TARIFF_PEAK,
+    CONF_TARIFF_SHOULDER,
+    CONF_TARIFF_OFFPEAK,
+    CONF_TARIFF_PEAK_START,
+    CONF_TARIFF_PEAK_END,
+    CONF_TARIFF_SHOULDER_START,
+    CONF_TARIFF_SHOULDER_END,
+    TARIFF_ANYTIME,
+    TARIFF_TRIPLE,
+    DEFAULT_TARIFF_MODE,
+    DEFAULT_TARIFF_ANYTIME,
+    DEFAULT_TARIFF_PEAK,
+    DEFAULT_TARIFF_SHOULDER,
+    DEFAULT_TARIFF_OFFPEAK,
+    DEFAULT_TARIFF_PEAK_START,
+    DEFAULT_TARIFF_PEAK_END,
+    DEFAULT_TARIFF_SHOULDER_START,
+    DEFAULT_TARIFF_SHOULDER_END,
     DEFAULT_EXHAUST_SAFE_FLOOR_PCT,
     DEFAULT_FAN_SPEED_PCT,
     DEFAULT_HARVEST_VALUE,
@@ -170,6 +192,13 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ── Appliance dropout watchdog (Phase 10B) ────────────────────────────
         # Keys are role strings: "zone1_heater", "zone1_dehumid", etc.
         self._appliance_unavail_since: dict[str, Optional[datetime]] = {}
+        # Fire-once-per-episode guards so a sustained condition doesn't spam a
+        # critical mobile push on every ~30s coordinator tick. Each is cleared
+        # as soon as the underlying condition recovers, so a *new* episode
+        # still alerts.
+        self._appliance_dropout_alerted: dict[str, bool] = {}
+        self._sensor_dropout_alerted: bool = False
+        self._thermal_runaway_alerted: bool = False
 
         # ── Stage manager ─────────────────────────────────────────────────────
         self.stage_manager = StageManager(hass, self._config)
@@ -323,6 +352,25 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             ir.async_delete_issue(self.hass, DOMAIN, issue_id)
 
+        # ── 5. Primary sensor never configured (first-run) ────────────────────
+        # A brand-new config entry completes onboarding without any hardware
+        # mapped (deferred to the options flow), which otherwise looks
+        # identical to a genuine sensor dropout — see _async_update_data,
+        # which uses this same condition to suppress the critical alert for
+        # this specific case and raise this quiet Repairs issue instead.
+        issue_id = "primary_sensor_not_configured"
+        if not self._get(CONF_PRIMARY_TEMP_SENSOR):
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                issue_id,
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=issue_id,
+            )
+        else:
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+
     # ── Enthalpy calculation ──────────────────────────────────────────────────
 
     @staticmethod
@@ -383,11 +431,17 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _read_em_watts(self) -> float:
         """Sum instantaneous watt readings from all configured energy-monitor
-        sensors across zone1 + zone2 collapsed sensor lists. Returns 0.0 when
-        no sensors are configured or all readings are unavailable.
+        sensors across the zone1, zone2, drying, and global collapsed sensor
+        lists. Returns 0.0 when no sensors are configured or all readings are
+        unavailable.
         """
         total = 0.0
-        for list_key in (CONF_EM_ZONE1_SENSORS, CONF_EM_ZONE2_SENSORS):
+        for list_key in (
+            CONF_EM_ZONE1_SENSORS,
+            CONF_EM_ZONE2_SENSORS,
+            CONF_EM_DRYING_SENSORS,
+            CONF_EM_GLOBAL_SENSORS,
+        ):
             entity_ids = self._get(list_key) or []
             for entity_id in entity_ids:
                 if not entity_id:
@@ -407,9 +461,56 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return _safe_float(state.state)
 
+    def _current_tariff_rate(self) -> float:
+        """Resolve the currently-active electricity rate from the tariff config.
+
+        Honours CONF_TARIFF_MODE (anytime / dual / triple) and the configured
+        peak/shoulder/off-peak windows. Falls back to the legacy flat
+        CONF_ELECTRICITY_RATE when tariff_mode is "anytime" (or unset) so
+        existing installs that never touched the Energy step keep working
+        exactly as before.
+
+        Note: mirrors the options-flow-documented limitation that
+        midnight-crossing windows (e.g. 22:00-06:00) are not yet supported —
+        a window where start > end is treated as never active.
+        """
+        mode = self._get(CONF_TARIFF_MODE, DEFAULT_TARIFF_MODE)
+        if mode == TARIFF_ANYTIME:
+            return float(
+                self._get(
+                    CONF_TARIFF_ANYTIME,
+                    self._get(CONF_ELECTRICITY_RATE, DEFAULT_TARIFF_ANYTIME),
+                )
+            )
+
+        def _in_window(start_str: Any, end_str: Any) -> bool:
+            try:
+                sh, sm = (int(p) for p in str(start_str).split(":"))
+                eh, em = (int(p) for p in str(end_str).split(":"))
+                start, end = dtime(sh, sm), dtime(eh, em)
+            except (ValueError, TypeError, AttributeError):
+                return False
+            if start > end:
+                return False  # midnight-crossing windows not yet supported
+            return start <= dt_util.now().time() < end
+
+        if _in_window(
+            self._get(CONF_TARIFF_PEAK_START, DEFAULT_TARIFF_PEAK_START),
+            self._get(CONF_TARIFF_PEAK_END, DEFAULT_TARIFF_PEAK_END),
+        ):
+            return float(self._get(CONF_TARIFF_PEAK, DEFAULT_TARIFF_PEAK))
+
+        if mode == TARIFF_TRIPLE and _in_window(
+            self._get(CONF_TARIFF_SHOULDER_START, DEFAULT_TARIFF_SHOULDER_START),
+            self._get(CONF_TARIFF_SHOULDER_END, DEFAULT_TARIFF_SHOULDER_END),
+        ):
+            return float(self._get(CONF_TARIFF_SHOULDER, DEFAULT_TARIFF_SHOULDER))
+
+        return float(self._get(CONF_TARIFF_OFFPEAK, DEFAULT_TARIFF_OFFPEAK))
+
     def _accumulate_energy(self, interval_sec: float) -> None:
         """Accumulate cycle kWh via Riemann sum of EM sensor watts, then
-        update cycle cost from the configured electricity rate.
+        update cycle cost from the currently-active tariff rate.
 
         On the first tick since coordinator startup (or since a cycle reset),
         `_last_energy_tick` is None — the interval is skipped to avoid an
@@ -422,7 +523,7 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._cycle_kwh += (watts * elapsed_h) / 1000.0
         self._last_energy_tick = now
 
-        rate = float(self._get(CONF_ELECTRICITY_RATE, 0.282))
+        rate = self._current_tariff_rate()
         self._cycle_cost = self._cycle_kwh * rate
         if self.data:
             self.data[NS_ENERGY]["cycle_cost_usd"] = self._cycle_cost
@@ -433,10 +534,15 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _check_appliance_dropout(self, role: str, entity_id: Optional[str]) -> bool:
         """Track continuous unavailability of a role-mapped appliance entity.
 
-        Returns True once the entity has been unavailable for 5+ minutes
-        (triggers a persistent notification exactly once per dropout episode,
-        idempotent via a stable notification_id). Returns False immediately
-        when `entity_id` is None (not configured — not a dropout).
+        Returns True once the entity has been unavailable for 5+ minutes.
+        The critical notification (persistent + mobile push) fires exactly
+        once per dropout episode via `_appliance_dropout_alerted[role]` —
+        without this guard the notification would re-fire on every ~30s
+        coordinator tick for as long as the entity stays unavailable, since
+        `persistent_notification.create`'s idempotent notification_id only
+        dedupes the notification *entity*, not the mobile-push fan-out.
+        Returns False immediately when `entity_id` is None (not configured —
+        not a dropout).
         """
         if entity_id is None:
             return False
@@ -447,12 +553,15 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._appliance_unavail_since[role] = dt_util.utcnow()
             elapsed = dt_util.utcnow() - self._appliance_unavail_since[role]
             if elapsed >= timedelta(minutes=5):
-                self.hass.async_create_task(
-                    self._raise_appliance_dropout_notification(role, entity_id)
-                )
+                if not self._appliance_dropout_alerted.get(role, False):
+                    self.hass.async_create_task(
+                        self._raise_appliance_dropout_notification(role, entity_id)
+                    )
+                    self._appliance_dropout_alerted[role] = True
                 return True
         else:
             self._appliance_unavail_since[role] = None
+            self._appliance_dropout_alerted[role] = False
         return False
 
     async def _raise_appliance_dropout_notification(self, role: str, entity_id: str) -> None:
@@ -673,7 +782,17 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._get(CONF_PRIMARY_TEMP_SENSOR),
                 DEFAULT_EXHAUST_SAFE_FLOOR_PCT,
             )
-            await self._raise_dropout_notification()
+            if self._get(CONF_PRIMARY_TEMP_SENSOR):
+                # A sensor IS mapped but has gone stale/unavailable — this is a
+                # genuine fault, worth a critical alert (fired once per episode).
+                if not self._sensor_dropout_alerted:
+                    await self._raise_dropout_notification()
+                    self._sensor_dropout_alerted = True
+            # else: nothing has ever been mapped (fresh, not-yet-configured
+            # install) — _check_repairs_issues() already raises a quiet
+            # Repairs issue for this; don't also spam a critical push.
+        else:
+            self._sensor_dropout_alerted = False
 
         # ── Invoke climate engine ─────────────────────────────────────────────
         climate_state: dict[str, Any] = {}

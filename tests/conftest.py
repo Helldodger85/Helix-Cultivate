@@ -70,6 +70,14 @@ def mock_coord():
     coord._lights_state_prev = None
     coord._lights_on = MagicMock(return_value=True)
 
+    # ── fire-once-per-episode notification guards ──────────────────────────
+    # Real explicit bools (not left to MagicMock auto-vivification, which
+    # would return a truthy child Mock and silently skip the "not yet
+    # alerted" branch these guards depend on).
+    coord._thermal_runaway_alerted = False
+    coord._sensor_dropout_alerted = False
+    coord._appliance_dropout_alerted = {}
+
     # ── stage manager stub (used by drying-zone control) ───────────────────
     stage_manager = MagicMock()
     stage_manager.current_stage = "peak_flower"

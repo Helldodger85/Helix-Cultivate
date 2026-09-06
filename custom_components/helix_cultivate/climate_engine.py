@@ -333,6 +333,19 @@ class ClimateEngine:
     def _backup_heater_threshold(self) -> float:
         return float(self._get(CONF_ZONE1_BACKUP_HEATER_THRESHOLD_C, DEFAULT_BACKUP_HEATER_THRESHOLD_C))
 
+    def _entity_is_on(self, entity_id: Optional[str]) -> bool:
+        """Return True if the given entity's current HA state is 'on'.
+
+        Used to capture an appliance's actual state *before* this tick's
+        ZoneInterlock (which holds no memory across ticks) overwrites it, so
+        on/off transitions for the anti-short-cycle timer can be detected
+        correctly. Returns False for unmapped/unavailable/unknown entities.
+        """
+        if not entity_id:
+            return False
+        state = self._coord.hass.states.get(entity_id)
+        return state is not None and state.state == "on"
+
     def _apply_sensor_offset(
         self,
         raw: Optional[float],
@@ -555,9 +568,19 @@ class ClimateEngine:
     # ── Thermal runaway guard ─────────────────────────────────────────────────
 
     async def _handle_thermal_runaway(self, canopy_temp: float) -> bool:
-        """Check and act on canopy thermal runaway. Returns True if triggered."""
+        """Check and act on canopy thermal runaway. Returns True if triggered.
+
+        The safety response (kill heaters, dim light, force exhaust — applied
+        by the caller via the returned True) is re-applied every tick for as
+        long as the runaway condition holds, as it must be. The critical
+        notifications are gated behind `_coord._thermal_runaway_alerted` so
+        they fire once per episode rather than on every ~30s tick — without
+        this, a sustained runaway would generate a duplicate mobile push per
+        tick for as long as canopy temp stays over threshold.
+        """
         threshold = self._thermal_runaway_threshold()
         if canopy_temp < threshold:
+            self._coord._thermal_runaway_alerted = False
             return False
 
         _LOGGER.warning(
@@ -579,26 +602,28 @@ class ClimateEngine:
         await self._set_reverse_cycle(self._get(CONF_ZONE1_REVERSE_CYCLE), None)
         await self._set_reverse_cycle(self._get(CONF_ZONE2_REVERSE_CYCLE), None)
 
-        await self._coord._notify_critical(
-            title="Helix Cultivate — Thermal Runaway Alert",
-            message=(
-                f"Canopy temperature ({canopy_temp:.1f}°C) exceeded thermal runaway "
-                f"guard ({threshold:.1f}°C). Grow light cut to 0%, exhaust forced to 100%. "
-                "All heaters killed. Check environment immediately."
-            ),
-            level="critical",
-        )
+        if not self._coord._thermal_runaway_alerted:
+            await self._coord._notify_critical(
+                title="Helix Cultivate — Thermal Runaway Alert",
+                message=(
+                    f"Canopy temperature ({canopy_temp:.1f}°C) exceeded thermal runaway "
+                    f"guard ({threshold:.1f}°C). Grow light cut to 0%, exhaust forced to 100%. "
+                    "All heaters killed. Check environment immediately."
+                ),
+                level="critical",
+            )
 
-        # ── Base Under Siege notification (idempotent, separate ID) ───────────
-        await self._coord._notify_critical(
-            title="⚠️ Helix Cultivate — Base Under Siege",
-            message=(
-                f"Warning: Base Under Siege. Thermal thresholds breached — "
-                f"canopy {canopy_temp:.1f}°C exceeds {threshold:.1f}°C ceiling. "
-                "All cooling engaged. Immediate inspection required."
-            ),
-            level="critical",
-        )
+            # ── Base Under Siege notification (idempotent, separate ID) ───────
+            await self._coord._notify_critical(
+                title="⚠️ Helix Cultivate — Base Under Siege",
+                message=(
+                    f"Warning: Base Under Siege. Thermal thresholds breached — "
+                    f"canopy {canopy_temp:.1f}°C exceeds {threshold:.1f}°C ceiling. "
+                    "All cooling engaged. Immediate inspection required."
+                ),
+                level="critical",
+            )
+            self._coord._thermal_runaway_alerted = True
 
         return True
 
@@ -1243,6 +1268,18 @@ class ClimateEngine:
             want_dehumid = False
 
         # ── Discrete appliance interlock ───────────────────────────────────────
+        # NOTE: ClimateEngine (and therefore ZoneInterlock) is instantiated fresh
+        # every coordinator tick, so `zone.ac_on`/`zone.dehumid_on` carry no
+        # memory of the *previous* tick's state on their own. To detect a
+        # was-on-now-turning-off transition for the anti-short-cycle timer, we
+        # must read the appliance's actual current HA state BEFORE calling
+        # request_cool()/request_dehumidify() overwrites the interlock's flag —
+        # comparing against zone.ac_on/zone.dehumid_on *after* that call always
+        # reads back the value we just set, so the transition can never be
+        # detected that way.
+        was_ac_on = self._entity_is_on(effective_discrete_ac_id)
+        was_dehumid_on = self._entity_is_on(dehumid_id)
+
         zone.request_heat(want_heat if effective_heater_id else False)
         if not want_heat and zone.heater_on:
             zone.request_heat(False)
@@ -1250,6 +1287,7 @@ class ClimateEngine:
         cool_allowed = zone.request_cool(want_cool if effective_discrete_ac_id else False)
         if not want_cool and zone.ac_on:
             zone.request_cool(False)
+        if was_ac_on and not want_cool:
             self._record_compressor_off(f"{zone_label}_ac")
 
         zone.request_humidify(want_humid)
@@ -1259,6 +1297,7 @@ class ClimateEngine:
         dehumid_allowed = zone.request_dehumidify(want_dehumid)
         if not want_dehumid and zone.dehumid_on:
             zone.request_dehumidify(False)
+        if was_dehumid_on and not want_dehumid:
             self._record_compressor_off(f"{zone_label}_dehumid")
 
         # ── Reverse-cycle control (heat pump via hvac_mode) ────────────────────
