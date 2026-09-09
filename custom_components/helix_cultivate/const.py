@@ -17,6 +17,19 @@ COORDINATOR_UPDATE_INTERVAL: timedelta = timedelta(seconds=30)
 # (and therefore a single reload), instead of one reload per change.
 OPTIONS_WRITE_DEBOUNCE_SEC: float = 1.5
 
+# Continuous minutes leaf VPD may sit outside [vpd_target_min, vpd_target_max]
+# before it's treated as chronic/sustained drift (as opposed to an instant
+# threshold breach) and fires helix_cultivate_chronic_drift_detected.
+CHRONIC_VPD_DRIFT_DWELL_MIN: float = 240.0  # 4 hours
+
+# ── Canopy uniformity diagnostic ─────────────────────────────────────────────
+# Spread (max - min) across active sensor *layers* (upper, plus mid/lower if
+# their sensor toggle is enabled) that counts as a gradient worth flagging,
+# once sustained for CANOPY_UNIFORMITY_DWELL_MIN.
+CANOPY_UNIFORMITY_TEMP_DELTA_C: float = 2.0
+CANOPY_UNIFORMITY_RH_DELTA_PCT: float = 8.0
+CANOPY_UNIFORMITY_DWELL_MIN: float = 15.0
+
 # ── Topology modes ───────────────────────────────────────────────────────────
 TOPOLOGY_COORDINATED: str = "coordinated"
 TOPOLOGY_STANDALONE: str = "standalone"
@@ -327,6 +340,16 @@ CONF_MID_CANOPY_HUMIDITY_SENSOR: str = "mid_canopy_humidity_sensor"
 CONF_LOWER_CANOPY_TEMP_SENSOR: str = "lower_canopy_temp_sensor"
 CONF_LOWER_CANOPY_HUMIDITY_SENSOR: str = "lower_canopy_humidity_sensor"
 
+# Independent sensor/fan layer toggles — sensor placement and fan placement
+# are separate hardware decisions and must never be assumed to move
+# together. Upper canopy has no toggle for either — it's the mandatory
+# primary layer for both. All default True so existing installs see no
+# change on upgrade.
+CONF_MID_CANOPY_SENSOR_ENABLED: str = "mid_canopy_sensor_enabled"
+CONF_LOWER_CANOPY_SENSOR_ENABLED: str = "lower_canopy_sensor_enabled"
+CONF_MID_CANOPY_FAN_ENABLED: str = "mid_canopy_fan_enabled"
+CONF_LOWER_CANOPY_FAN_ENABLED: str = "lower_canopy_fan_enabled"
+
 # Optional outdoor weather entity for feedforward MPC
 CONF_OUTDOOR_WEATHER_ENTITY: str = "outdoor_weather_entity"
 
@@ -393,6 +416,13 @@ CONF_LIGHT_DIMMABLE: str = "light_dimmable"
 CONF_SUNRISE_RAMP_MIN: str = "sunrise_ramp_min"
 CONF_DLI_SENSOR: str = "dli_sensor"
 CONF_GROW_CAMERA: str = "grow_camera"
+
+# Daily automated time-lapse still, captured via CONF_GROW_CAMERA if mapped.
+# Value is either the literal "solar_noon" (default — a consistent clock
+# time that tracks the actual local solar noon day to day) or a fixed
+# "HH:MM" 24-hour local time string.
+CONF_TIMELAPSE_CAPTURE_TIME: str = "timelapse_capture_time"
+DEFAULT_TIMELAPSE_CAPTURE_TIME: str = "solar_noon"
 
 # Control algorithm & safety parameters
 CONF_CONTROL_ALGORITHM: str = "control_algorithm"

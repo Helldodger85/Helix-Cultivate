@@ -5,13 +5,14 @@ import asyncio
 import logging
 import random
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.sun import get_astral_event_date
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -55,7 +56,17 @@ from .const import (
     CONF_ZONE1_HEATER,
     CONF_ZONE1_REVERSE_CYCLE,
     CONF_ZONE2_REVERSE_CYCLE,
+    CANOPY_UNIFORMITY_DWELL_MIN,
+    CANOPY_UNIFORMITY_RH_DELTA_PCT,
+    CANOPY_UNIFORMITY_TEMP_DELTA_C,
+    CHRONIC_VPD_DRIFT_DWELL_MIN,
+    CONF_LOWER_CANOPY_FAN_ENABLED,
+    CONF_LOWER_CANOPY_SENSOR_ENABLED,
+    CONF_MID_CANOPY_FAN_ENABLED,
+    CONF_MID_CANOPY_SENSOR_ENABLED,
+    CONF_TIMELAPSE_CAPTURE_TIME,
     COORDINATOR_UPDATE_INTERVAL,
+    DEFAULT_TIMELAPSE_CAPTURE_TIME,
     DEFAULT_EXHAUST_SAFE_FLOOR_PCT,
     DEFAULT_FAN_SPEED_PCT,
     DEFAULT_HARVEST_VALUE,
@@ -144,7 +155,6 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── Lights-off purge tracking ─────────────────────────────────────────
         self._lights_off_purge_until: Optional[datetime] = None
-        self._lights_state_prev: Optional[bool] = None
 
         # ── Energy session start ──────────────────────────────────────────────
         self._session_start: datetime = dt_util.utcnow()
@@ -171,12 +181,29 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Keys are role strings: "zone1_heater", "zone1_dehumid", etc.
         self._appliance_unavail_since: dict[str, Optional[datetime]] = {}
 
+        # ── Chronic VPD drift tracking ─────────────────────────────────────────
+        # Distinct from instant threshold breaches (thermal runaway, sensor
+        # dropout): tracks continuous time leaf VPD sits outside its target
+        # band, for slow drift that never crosses a hard threshold.
+        self._vpd_drift_since: Optional[datetime] = None
+        self._chronic_drift_alert_fired: bool = False
+
+        # ── Canopy uniformity diagnostic ────────────────────────────────────────
+        self._canopy_temp_spread: Optional[float] = None
+        self._canopy_rh_spread: Optional[float] = None
+        self._canopy_uniformity_insight: Optional[str] = None
+        self._uniformity_drift_since: Optional[datetime] = None
+        self._uniformity_alert_fired: bool = False
+
         # ── Stage manager ─────────────────────────────────────────────────────
         self.stage_manager = StageManager(hass, self._config)
         self.stage_manager.set_coordinator_ref(self)
 
-        # ── Snapshot tracking ─────────────────────────────────────────────────
-        self._last_snapshot_ts: Optional[datetime] = None
+        # ── Time-lapse snapshot tracking ────────────────────────────────────────
+        # Tracks the calendar date (not a rolling timestamp) so the daily
+        # capture lands on the configured clock time exactly once per day
+        # regardless of coordinator restarts.
+        self._last_snapshot_date: Optional[date] = None
 
         # ── Runtime setpoints (overridden by number entities) ─────────────────
         self.vpd_target: float = 1.0
@@ -466,30 +493,91 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             level="critical",
         )
 
-    # ── Camera snapshot ──────────────────────────────────────────────────────
+    # ── Time-lapse camera snapshot ────────────────────────────────────────────
 
-    async def _maybe_trigger_snapshot(self, lights_on_now: bool) -> None:
-        """Trigger grow camera snapshot at lights-off transition."""
+    async def _maybe_trigger_snapshot(self) -> None:
+        """Capture one time-lapse still per day at the configured clock time.
+
+        Inactive entirely when no camera is mapped to CONF_GROW_CAMERA — no
+        errors, no placeholder. Stills land under config/www/ (auto-allowed
+        by HA's camera.snapshot service) and are registered with the journal
+        store so close_out_harvest can compile the cycle's stills into a
+        time-lapse. See journal_store.py and close_out_harvest().
+        """
         camera_id: Optional[str] = self._get(CONF_GROW_CAMERA)
         if not camera_id:
             return
-        now = dt_util.utcnow()
-        if self._last_snapshot_ts is not None:
-            if (now - self._last_snapshot_ts).total_seconds() < 82800:  # < 23h
-                return
-        if lights_on_now and self._lights_state_prev is False:
-            self._last_snapshot_ts = None
-        if not lights_on_now and self._lights_state_prev is True:
+
+        today_local = dt_util.now().date()
+        if self._last_snapshot_date == today_local:
+            return
+
+        capture_setting = self._get(CONF_TIMELAPSE_CAPTURE_TIME, DEFAULT_TIMELAPSE_CAPTURE_TIME)
+        target_dt: Optional[datetime]
+        if capture_setting == DEFAULT_TIMELAPSE_CAPTURE_TIME:
+            target_dt = get_astral_event_date(self.hass, "noon")
+        else:
             try:
-                await self.hass.services.async_call(
-                    "camera",
-                    "snapshot",
-                    {"entity_id": camera_id, "filename": f"/tmp/helix_{now.strftime('%Y%m%d_%H%M')}.jpg"},
+                hour_str, minute_str = str(capture_setting).split(":", 1)
+                target_dt = dt_util.now().replace(
+                    hour=int(hour_str), minute=int(minute_str), second=0, microsecond=0
                 )
-                self._last_snapshot_ts = now
-                _LOGGER.info("Helix Cultivate: grow camera snapshot triggered at %s", now)
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Helix Cultivate: camera snapshot failed: %s", exc)
+            except (ValueError, TypeError):
+                target_dt = get_astral_event_date(self.hass, "noon")
+
+        if target_dt is None or dt_util.utcnow() < dt_util.as_utc(target_dt):
+            return
+
+        filename = self.hass.config.path(
+            "www", "helix_cultivate_timelapse", self._entry.entry_id,
+            f"{today_local.isoformat()}.jpg",
+        )
+        try:
+            await self.hass.services.async_call(
+                "camera",
+                "snapshot",
+                {"entity_id": camera_id, "filename": filename},
+                blocking=True,
+            )
+            self._last_snapshot_date = today_local
+            journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
+            if journal is not None:
+                await journal.async_add_timelapse_image(self._entry.entry_id, filename)
+            _LOGGER.info("Helix Cultivate: daily time-lapse still captured at %s", filename)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Helix Cultivate: daily time-lapse snapshot failed: %s", exc)
+
+    # ── Independent sensor/fan layer toggles ──────────────────────────────────
+
+    def _is_fan_tier_enabled(self, tier: str) -> bool:
+        """Whether the given canopy fan layer is active.
+
+        Upper is always active (mandatory primary layer, no toggle). Mid/
+        lower are independently toggleable and default enabled so existing
+        installs see no change on upgrade. This is the single choke point
+        the fan-control loop (breeze tasks, stratification boost, and any
+        direct set_fan_speed call) must respect so a disabled tier never has
+        a command sent to it — not just skipped with a null check.
+        """
+        if tier == FAN_TIER_UPPER:
+            return True
+        if tier == FAN_TIER_MID:
+            return bool(self._get(CONF_MID_CANOPY_FAN_ENABLED, True))
+        if tier == FAN_TIER_LOWER:
+            return bool(self._get(CONF_LOWER_CANOPY_FAN_ENABLED, True))
+        return False
+
+    def _is_sensor_tier_enabled(self, tier: str) -> bool:
+        """Whether the given canopy sensor layer is active (independent of
+        that tier's fan toggle — a tier can have sensors on with fans off,
+        or vice versa)."""
+        if tier == FAN_TIER_UPPER:
+            return True
+        if tier == FAN_TIER_MID:
+            return bool(self._get(CONF_MID_CANOPY_SENSOR_ENABLED, True))
+        if tier == FAN_TIER_LOWER:
+            return bool(self._get(CONF_LOWER_CANOPY_SENSOR_ENABLED, True))
+        return False
 
     # ── Breeze engine ─────────────────────────────────────────────────────────
 
@@ -538,6 +626,8 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _apply_fan_speed_to_tier(self, tier: str, speed_pct: float) -> None:
         """Send a unified speed command to all fans in a tier."""
+        if not self._is_fan_tier_enabled(tier):
+            return
         fan_ids = self._get_tier_fans(tier)
         if not fan_ids:
             return
@@ -658,8 +748,14 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 rh_frac = max(0.0, min(1.0, (svp_leaf - mid_vpd) / svp_air)) if svp_air else 0.0
                 self.rh_setpoint = round(rh_frac * 100.0, 1)
 
-        await self._maybe_trigger_snapshot(lights_on_now)
-        self._lights_state_prev = lights_on_now
+        await self._check_chronic_vpd_drift(leaf_vpd)
+        await self._check_canopy_uniformity(
+            upper_canopy_temp, upper_canopy_rh,
+            mid_canopy_temp, mid_canopy_rh,
+            lower_canopy_temp, lower_canopy_rh,
+        )
+
+        await self._maybe_trigger_snapshot()
 
         # ── Accumulate energy ──────────────────────────────────────────────────
         self._accumulate_dli(COORDINATOR_UPDATE_INTERVAL.total_seconds())
@@ -703,7 +799,7 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             (FAN_TIER_MID, "breeze_mid_enabled"),
             (FAN_TIER_LOWER, "breeze_lower_enabled"),
         ]:
-            enabled = getattr(self, enabled_attr, False)
+            enabled = getattr(self, enabled_attr, False) and self._is_fan_tier_enabled(tier)
             task = self._breeze_tasks.get(tier)
             if enabled and (task is None or task.done()):
                 self._start_breeze_task(tier)
@@ -754,13 +850,24 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Safety flags
                 "thermal_runaway": climate_state.get("thermal_runaway", False),
                 "last_update": now,
+                # Independent canopy sensor/fan layer toggles
+                "mid_canopy_sensor_enabled": self._is_sensor_tier_enabled(FAN_TIER_MID),
+                "lower_canopy_sensor_enabled": self._is_sensor_tier_enabled(FAN_TIER_LOWER),
+                "mid_canopy_fan_enabled": self._is_fan_tier_enabled(FAN_TIER_MID),
+                "lower_canopy_fan_enabled": self._is_fan_tier_enabled(FAN_TIER_LOWER),
+                # Canopy uniformity diagnostic
+                "canopy_temp_spread_c": self._canopy_temp_spread,
+                "canopy_rh_spread_pct": self._canopy_rh_spread,
+                "canopy_uniformity_insight": self._canopy_uniformity_insight,
             },
             NS_LIGHTING: {
                 "intensity_pct": self.light_intensity_pct,
                 "dli_today_mol": prev_lighting.get("dli_today_mol", 0.0),
                 "photoperiod_extended_min": prev_lighting.get("photoperiod_extended_min", 0),
                 "phase": "day" if lights_on_now else "night",
-                "last_snapshot_ts": self._last_snapshot_ts,
+                "last_snapshot_date": (
+                    self._last_snapshot_date.isoformat() if self._last_snapshot_date else None
+                ),
             },
             NS_ENERGY: {
                 # Use the authoritative private accumulator — do NOT read back
@@ -786,6 +893,166 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Exhaust is running at safe floor. VPD control is suspended."
             ),
             level="critical",
+        )
+
+    # ── Chronic VPD drift detection ───────────────────────────────────────────
+
+    async def _check_chronic_vpd_drift(self, leaf_vpd: Optional[float]) -> None:
+        """Track sustained (non-instant) VPD drift outside the target band.
+
+        Separate dwell-timer from the instant thermal-runaway/sensor-dropout
+        alerts — this fires once per continuous excursion episode that
+        outlasts CHRONIC_VPD_DRIFT_DWELL_MIN, for slow drift that never
+        actually crosses a hard safety threshold. Reset as soon as VPD
+        returns in-range, so a fresh episode can be detected and alerted on
+        again later.
+        """
+        if leaf_vpd is None:
+            return
+
+        in_range = self.vpd_target_min <= leaf_vpd <= self.vpd_target_max
+        if in_range:
+            self._vpd_drift_since = None
+            self._chronic_drift_alert_fired = False
+            return
+
+        now = dt_util.utcnow()
+        if self._vpd_drift_since is None:
+            self._vpd_drift_since = now
+            return
+
+        if self._chronic_drift_alert_fired:
+            return
+
+        elapsed_min = (now - self._vpd_drift_since).total_seconds() / 60.0
+        if elapsed_min < CHRONIC_VPD_DRIFT_DWELL_MIN:
+            return
+
+        self._chronic_drift_alert_fired = True
+        self.hass.bus.async_fire(
+            "helix_cultivate_chronic_drift_detected",
+            {
+                "entry_id": self._entry.entry_id,
+                "leaf_vpd_kpa": leaf_vpd,
+                "vpd_target_min": self.vpd_target_min,
+                "vpd_target_max": self.vpd_target_max,
+                "drift_duration_min": round(elapsed_min, 1),
+            },
+        )
+        await self._notify_critical(
+            title="Helix Cultivate — Chronic VPD Drift",
+            message=(
+                f"Leaf VPD has sat outside the {self.vpd_target_min:.2f}–"
+                f"{self.vpd_target_max:.2f} kPa target band for over "
+                f"{CHRONIC_VPD_DRIFT_DWELL_MIN / 60:.0f} hours (currently "
+                f"{leaf_vpd:.2f} kPa). Check for an actuator that isn't "
+                "keeping up, not just a momentary spike."
+            ),
+            level="critical",
+        )
+
+    # ── Canopy uniformity diagnostic ──────────────────────────────────────────
+
+    async def _check_canopy_uniformity(
+        self,
+        upper_temp: Optional[float],
+        upper_rh: Optional[float],
+        mid_temp: Optional[float],
+        mid_rh: Optional[float],
+        lower_temp: Optional[float],
+        lower_rh: Optional[float],
+    ) -> None:
+        """Diagnose a top-to-bottom canopy temp/RH gradient.
+
+        Keys off which sensor *layers* are enabled — completely independent
+        of fan tier toggle state. Always includes upper; includes mid/lower
+        only when their sensor toggle is on AND a reading is present. Skips
+        entirely with fewer than 2 active layers (nothing to compare against,
+        so a single-layer "spread of zero" would be meaningless).
+
+        Live spread values and a human-readable insight update every tick a
+        gradient is present, so the dashboard can show it immediately; the
+        helix_cultivate_canopy_uniformity_alert event itself still requires
+        the gradient to be sustained for CANOPY_UNIFORMITY_DWELL_MIN (reusing
+        the same dwell-timer pattern as saturation/chronic-drift detection),
+        to avoid firing on a single noisy reading.
+        """
+        layers: list[tuple[float, float]] = []
+        if upper_temp is not None and upper_rh is not None:
+            layers.append((upper_temp, upper_rh))
+        if (
+            self._is_sensor_tier_enabled(FAN_TIER_MID)
+            and mid_temp is not None
+            and mid_rh is not None
+        ):
+            layers.append((mid_temp, mid_rh))
+        if (
+            self._is_sensor_tier_enabled(FAN_TIER_LOWER)
+            and lower_temp is not None
+            and lower_rh is not None
+        ):
+            layers.append((lower_temp, lower_rh))
+
+        if len(layers) < 2:
+            self._canopy_temp_spread = None
+            self._canopy_rh_spread = None
+            self._canopy_uniformity_insight = None
+            self._uniformity_drift_since = None
+            self._uniformity_alert_fired = False
+            return
+
+        temps = [t for t, _ in layers]
+        rhs = [r for _, r in layers]
+        temp_spread = max(temps) - min(temps)
+        rh_spread = max(rhs) - min(rhs)
+        self._canopy_temp_spread = round(temp_spread, 1)
+        self._canopy_rh_spread = round(rh_spread, 1)
+
+        temp_exceeded = temp_spread > CANOPY_UNIFORMITY_TEMP_DELTA_C
+        rh_exceeded = rh_spread > CANOPY_UNIFORMITY_RH_DELTA_PCT
+        if not (temp_exceeded or rh_exceeded):
+            self._canopy_uniformity_insight = None
+            self._uniformity_drift_since = None
+            self._uniformity_alert_fired = False
+            return
+
+        insight_parts: list[str] = []
+        if rh_exceeded:
+            insight_parts.append(f"{rh_spread:.0f}% humidity gradient top-to-bottom")
+        if temp_exceeded:
+            insight_parts.append(f"{temp_spread:.1f}°C temperature gradient top-to-bottom")
+        self._canopy_uniformity_insight = (
+            " and ".join(insight_parts) + " — check for an airflow dead zone."
+        )
+
+        now = dt_util.utcnow()
+        if self._uniformity_drift_since is None:
+            self._uniformity_drift_since = now
+            return
+
+        if self._uniformity_alert_fired:
+            return
+
+        elapsed_min = (now - self._uniformity_drift_since).total_seconds() / 60.0
+        if elapsed_min < CANOPY_UNIFORMITY_DWELL_MIN:
+            return
+
+        self._uniformity_alert_fired = True
+        self.hass.bus.async_fire(
+            "helix_cultivate_canopy_uniformity_alert",
+            {
+                "entry_id": self._entry.entry_id,
+                "temp_spread_c": self._canopy_temp_spread,
+                "rh_spread_pct": self._canopy_rh_spread,
+                "insight": self._canopy_uniformity_insight,
+                "layers_compared": len(layers),
+                "drift_duration_min": round(elapsed_min, 1),
+            },
+        )
+        await self._notify_critical(
+            title="Helix Cultivate — Canopy Uniformity",
+            message=self._canopy_uniformity_insight,
+            level="warning",
         )
 
     # ── Public setpoint mutators (called by number/select entities) ───────────
@@ -886,6 +1153,26 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cost = (self.data or {}).get(NS_ENERGY, {}).get("cycle_cost_usd", self._cycle_cost)
         dollar_per_g = (cost / dry_weight_g) if dry_weight_g > 0 else 0.0
 
+        journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
+        if journal is None:
+            raise ValueError("Journal store is not initialised — cannot archive harvest")
+
+        # ── Compile this cycle's time-lapse stills into a GIF, if any ──────────
+        # Inactive entirely when no camera was ever mapped — the popped list
+        # is simply empty, so this is a no-op with no error and no
+        # placeholder in the harvest record.
+        timelapse_gif_url: Optional[str] = None
+        timelapse_stills = await journal.async_pop_timelapse_images(self._entry.entry_id)
+        if timelapse_stills:
+            rel_dir = f"helix_cultivate_timelapse/{self._entry.entry_id}"
+            gif_filename = f"timelapse_{dt_util.utcnow().strftime('%Y%m%dT%H%M%S')}.gif"
+            gif_abs_path = self.hass.config.path("www", rel_dir, gif_filename)
+            compiled = await journal.async_compile_timelapse_gif(
+                [rec["path"] for rec in timelapse_stills], gif_abs_path
+            )
+            if compiled:
+                timelapse_gif_url = f"/local/{rel_dir}/{gif_filename}"
+
         harvest_data: dict[str, Any] = {
             "wet_weight_g": wet_weight_g,
             "dry_weight_g": dry_weight_g,
@@ -896,12 +1183,23 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "dollar_per_g": round(dollar_per_g, 4),
             "revenue_usd": round(revenue, 2),
             "archived_at": dt_util.utcnow().isoformat(),
+            "timelapse_gif_url": timelapse_gif_url,
         }
 
-        journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
-        if journal is None:
-            raise ValueError("Journal store is not initialised — cannot archive harvest")
         record_id = await journal.archive_cycle(harvest_data)
+
+        # Let users build their own automations against harvest completion
+        # without going through Helix Cultivate's own notification system.
+        # See docs/events.md.
+        self.hass.bus.async_fire(
+            "helix_cultivate_harvest_complete",
+            {
+                "entry_id": self._entry.entry_id,
+                "dry_weight_g": dry_weight_g,
+                "cycle_cost_usd": cost,
+                "dollars_per_gram": round(dollar_per_g, 4),
+            },
+        )
 
         # Reset cycle counters
         self._cycle_kwh = 0.0

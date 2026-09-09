@@ -15,6 +15,7 @@ from homeassistant.components.http import StaticPathConfig
 
 from .const import DOMAIN, CONFIG_VERSION, CONFIG_MINOR_VERSION
 from .coordinator import HelixCoordinator
+from .intents import async_register_intents
 from .journal_store import async_setup_journal
 
 _LOGGER = logging.getLogger(__name__)
@@ -26,12 +27,24 @@ WS_CMD_TOGGLE_DRYING_LOCK: str = "helix_cultivate/toggle_drying_lock"
 WS_CMD_CLOSE_OUT_HARVEST: str = "helix_cultivate/close_out_harvest"
 WS_CMD_EXPORT_RECIPE: str = "helix_cultivate/export_recipe"
 WS_CMD_IMPORT_RECIPE: str = "helix_cultivate/import_recipe"
+WS_CMD_UPDATE_SETTINGS_FIELDS: str = "helix_cultivate/update_settings_fields"
 
 VALID_STAGE_TARGET_KEYS: frozenset[str] = frozenset({
     "day_temp_c", "night_temp_c",
     "day_vpd_min", "day_vpd_max",
     "night_vpd_min", "night_vpd_max",
     "light_intensity_pct", "photoperiod_h", "fan_speed_pct",
+})
+
+# Static config-entry-backed settings fields with an explicit Save button in
+# the frontend (as opposed to a live HA number/select entity) — Zone 2
+# dimensions/plant count, plus the independent mid/lower canopy sensor+fan
+# layer toggles saved from the same gear-icon hardware form. Extend this set
+# for future draft-style settings forms.
+VALID_SETTINGS_FIELD_KEYS: frozenset[str] = frozenset({
+    "zone2_width_m", "zone2_depth_m", "zone2_height_m", "zone2_plant_count",
+    "mid_canopy_sensor_enabled", "lower_canopy_sensor_enabled",
+    "mid_canopy_fan_enabled", "lower_canopy_fan_enabled",
 })
 
 PLATFORMS: list[Platform] = [
@@ -314,6 +327,46 @@ async def ws_update_stage_targets(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): WS_CMD_UPDATE_SETTINGS_FIELDS,
+        vol.Required("entry_id"): str,
+        vol.Required("fields"): dict,
+    }
+)
+@websocket_api.async_response
+async def ws_update_settings_fields(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Persist explicit-Save static config fields (e.g. Zone 2 dimensions).
+
+    Only keys present in VALID_SETTINGS_FIELD_KEYS are accepted. Routed
+    through the coordinator's debounced queue_option_write() — the same path
+    persistent number/select setters use — so a batch of fields saved
+    together from one form coalesces into a single config-entry write (and
+    therefore a single reload) rather than one per field.
+    """
+    entry: Optional[ConfigEntry] = hass.config_entries.async_get_entry(msg["entry_id"])
+    if entry is None:
+        connection.send_error(msg["id"], "entry_not_found", "Config entry not found")
+        return
+
+    coordinator: Optional[HelixCoordinator] = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "coordinator_not_found", "Coordinator not loaded")
+        return
+
+    validated: dict[str, Any] = {
+        k: v for k, v in msg["fields"].items() if k in VALID_SETTINGS_FIELD_KEYS
+    }
+    for field_key, field_value in validated.items():
+        coordinator._config[field_key] = field_value
+        coordinator.queue_option_write(field_key, field_value)
+    connection.send_result(msg["id"], {"success": True})
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): WS_CMD_CLOSE_OUT_HARVEST,
         vol.Required("wet_weight_g"): vol.Coerce(float),
         vol.Required("dry_weight_g"): vol.Coerce(float),
@@ -438,6 +491,7 @@ def _async_register_zone_device_ws_commands(hass: HomeAssistant) -> None:
         websocket_api.async_register_command(hass, ws_close_out_harvest)
         websocket_api.async_register_command(hass, ws_export_recipe)
         websocket_api.async_register_command(hass, ws_import_recipe)
+        websocket_api.async_register_command(hass, ws_update_settings_fields)
         hass.data.setdefault(DOMAIN, {})["_zone_ws_registered"] = True
         _LOGGER.info("Helix Cultivate: zone-device WebSocket commands registered")
     except Exception:  # noqa: BLE001
@@ -470,6 +524,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register zone hardware-mapping WebSocket commands (idempotent on reload)
     _async_register_zone_device_ws_commands(hass)
+
+    # Register Voice Assist intents (idempotent on reload)
+    async_register_intents(hass)
 
     # Forward setup to all platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

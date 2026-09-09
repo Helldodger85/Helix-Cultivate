@@ -59,6 +59,11 @@ EMPTY_STORE: dict[str, Any] = {
     },
     "ipm_events": [],
     "cycles_archive": [],
+    # Time-lapse still references captured during the current, in-progress
+    # cycle — {id, ts, entry_id, path}. Popped (read + cleared) at harvest
+    # close-out once compiled into a GIF. See coordinator.py's
+    # _maybe_trigger_snapshot()/close_out_harvest().
+    "timelapse_images": [],
 }
 
 
@@ -232,6 +237,82 @@ class JournalStore:
             dry_weight_g,
         )
         return record_id
+
+    # ── Time-lapse stills (Phase 12E) ───────────────────────────────────────────
+
+    async def async_add_timelapse_image(self, entry_id: str, path: str) -> dict[str, Any]:
+        """Register a captured daily time-lapse still. Returns the created record."""
+        record: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "ts": _now_epoch_ms(),
+            "entry_id": entry_id,
+            "path": path,
+        }
+        self._data["timelapse_images"].append(record)
+        await self._save()
+        return record
+
+    async def async_pop_timelapse_images(self, entry_id: str) -> list[dict[str, Any]]:
+        """Return and clear all time-lapse still records for entry_id.
+
+        Called once at harvest close-out — the popped stills belong to the
+        cycle that just ended, so the next cycle starts with an empty list.
+        Returned oldest-first (capture order) for GIF assembly.
+        """
+        matching = [
+            r for r in self._data["timelapse_images"] if r.get("entry_id") == entry_id
+        ]
+        self._data["timelapse_images"] = [
+            r for r in self._data["timelapse_images"] if r.get("entry_id") != entry_id
+        ]
+        await self._save()
+        return sorted(matching, key=lambda r: r["ts"])
+
+    @staticmethod
+    def _build_timelapse_gif_sync(image_paths: list[str], out_path: str) -> bool:
+        """Blocking Pillow work — must only run inside an executor job."""
+        import os
+
+        from PIL import Image
+
+        frames: list[Any] = []
+        for path in image_paths:
+            if not os.path.isfile(path):
+                continue
+            try:
+                frames.append(Image.open(path).convert("RGB"))
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning("Helix Journal: skipping unreadable time-lapse still %s", path)
+
+        if not frames:
+            return False
+
+        size = frames[0].size
+        frames = [f.resize(size) for f in frames]
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        frames[0].save(
+            out_path,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=400,
+            loop=0,
+            optimize=True,
+        )
+        return True
+
+    async def async_compile_timelapse_gif(
+        self, image_paths: list[str], out_path: str
+    ) -> bool:
+        """Compile captured stills into an animated GIF at out_path.
+
+        Blocking Pillow work runs in the executor so the event loop is never
+        blocked. Returns True if a GIF was actually written (False if no
+        readable stills were found — e.g. every file was deleted externally).
+        """
+        return await self._hass.async_add_executor_job(
+            self._build_timelapse_gif_sync, image_paths, out_path
+        )
 
 
 # ── WebSocket command handlers ─────────────────────────────────────────────────

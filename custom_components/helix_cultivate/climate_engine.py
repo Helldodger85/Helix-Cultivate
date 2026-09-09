@@ -907,10 +907,10 @@ class ClimateEngine:
             self._coord, "vpd_target_max", self._coord.vpd_target + VPD_DEADBAND_KPA
         )
 
-        if leaf_vpd < vpd_min and self._is_saturated(zone_label, "humidifier"):
-            return -VPD_ASSIST_STEP_C
-        if leaf_vpd > vpd_max and self._is_saturated(zone_label, "dehumidifier"):
+        if leaf_vpd < vpd_min and self._is_saturated(zone_label, "dehumidifier"):
             return +VPD_ASSIST_STEP_C
+        if leaf_vpd > vpd_max and self._is_saturated(zone_label, "humidifier"):
+            return -VPD_ASSIST_STEP_C
         return 0.0
 
     # ── Temperature trend + thermal purge (Phase 9D) ─────────────────────────
@@ -1472,6 +1472,8 @@ class ClimateEngine:
                 f"{rh_delta:.1f}" if rh_delta is not None else "N/A",
             )
             for tier in [FAN_TIER_MID, FAN_TIER_LOWER]:
+                if not self._coord._is_fan_tier_enabled(tier):
+                    continue
                 current_speed = self._coord.get_fan_speed(tier)
                 boosted = min(100.0, current_speed + 20.0)
                 await self._coord._apply_fan_speed_to_tier(tier, boosted)

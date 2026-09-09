@@ -1,0 +1,30 @@
+language: "en"
+intents:
+  HelixCultivateGetVpd:
+    data:
+      - sentences:
+          - "what's my vpd right now"
+          - "what is my vpd right now"
+          - "what's my vpd"
+          - "what is my vpd"
+          - "how's my vpd"
+          - "how is my vpd looking"
+          - "is my vpd in range"
+
+  HelixCultivateHarvestEstimate:
+    data:
+      - sentences:
+          - "how many days until harvest"
+          - "how many days [are there] until harvest"
+          - "how long until harvest"
+          - "when is harvest"
+          - "when will [my plant|it] be ready to harvest"
+
+  HelixCultivateGetStage:
+    data:
+      - sentences:
+          - "what stage is my grow in"
+          - "what stage is my plant in"
+          - "what grow stage am i in"
+          - "what stage are we in"
+          - "how far along is my grow"

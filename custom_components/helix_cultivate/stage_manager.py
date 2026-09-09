@@ -125,6 +125,27 @@ class StageManager:
         """Store a back-reference to the coordinator for override flag clearing."""
         self._coord_ref = coord
 
+    # ── HA bus events ────────────────────────────────────────────────────────
+
+    def _fire_stage_changed_event(self, previous_stage: str, new_stage: str) -> None:
+        """Fire helix_cultivate_stage_changed on the HA event bus.
+
+        Lets users build their own automations against stage transitions
+        without going through Helix Cultivate's own notification system.
+        See docs/events.md.
+        """
+        if self._coord_ref is None:
+            return
+        self._hass.bus.async_fire(
+            "helix_cultivate_stage_changed",
+            {
+                "entry_id": self._coord_ref._entry.entry_id,
+                "previous_stage": previous_stage,
+                "new_stage": new_stage,
+                "timestamp": dt_util.utcnow().isoformat(),
+            },
+        )
+
     # ── Config update ─────────────────────────────────────────────────────────
 
     def update_config(self, config: dict[str, Any]) -> None:
@@ -138,8 +159,10 @@ class StageManager:
             _LOGGER.info(
                 "Helix Cultivate: stage changed externally to '%s'", new_stage
             )
+            previous_stage = self._current_stage
             self._current_stage = new_stage
             self._stage_start_date = date.today()
+            self._fire_stage_changed_event(previous_stage, new_stage)
 
     # ── Recipe loader ─────────────────────────────────────────────────────────
 
@@ -252,6 +275,7 @@ class StageManager:
 
         idx = STAGE_SEQUENCE.index(self._current_stage)
         next_stage = STAGE_SEQUENCE[idx + 1]
+        previous_stage = self._current_stage
         _LOGGER.info(
             "Helix Cultivate: Advancing stage %s → %s", self._current_stage, next_stage
         )
@@ -264,6 +288,7 @@ class StageManager:
             self._coord_ref.temp_setpoint_manual_override = False
             self._coord_ref.vpd_target_manual_override = False
             self._coord_ref.rh_setpoint_manual_override = False
+        self._fire_stage_changed_event(previous_stage, next_stage)
 
     # ── Manual stage override (called by select entity) ───────────────────────
 
@@ -272,6 +297,7 @@ class StageManager:
         if stage not in STAGE_SEQUENCE:
             _LOGGER.warning("Helix Cultivate: invalid stage '%s' — ignoring", stage)
             return
+        previous_stage = self._current_stage
         _LOGGER.info("Helix Cultivate: manual stage set to '%s'", stage)
         self._current_stage = stage
         self._stage_start_date = date.today()
@@ -282,6 +308,8 @@ class StageManager:
             self._coord_ref.temp_setpoint_manual_override = False
             self._coord_ref.vpd_target_manual_override = False
             self._coord_ref.rh_setpoint_manual_override = False
+        if previous_stage != stage:
+            self._fire_stage_changed_event(previous_stage, stage)
 
     # ── Smooth glides interpolation ───────────────────────────────────────────
 
@@ -457,12 +485,15 @@ class StageManager:
         Called by `HelixCoordinator.close_out_harvest()` after the harvest
         record has been successfully archived.
         """
+        previous_stage = self._current_stage
         self._current_stage = STAGE_SEQUENCE[0]
         self._stage_start_date = date.today()
         self._stage_entry_day = {}
         self._cycle_complete = False
         self._config["current_stage"] = self._current_stage
         _LOGGER.info("Helix Cultivate: cycle reset — new grow cycle started at '%s'", self._current_stage)
+        if previous_stage != self._current_stage:
+            self._fire_stage_changed_event(previous_stage, self._current_stage)
 
     # ── Recipe export / import round-trip (Phase 11E) ─────────────────────────
 

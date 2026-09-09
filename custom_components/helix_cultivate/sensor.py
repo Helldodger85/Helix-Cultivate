@@ -300,6 +300,17 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
         if key == "exhaust_speed":
             attrs["thermal_runaway_active"] = climate.get("thermal_runaway", False)
             attrs["lights_on"] = climate.get("lights_on", False)
+            attrs["mid_canopy_sensor_enabled"] = climate.get("mid_canopy_sensor_enabled", True)
+            attrs["lower_canopy_sensor_enabled"] = climate.get("lower_canopy_sensor_enabled", True)
+            attrs["mid_canopy_fan_enabled"] = climate.get("mid_canopy_fan_enabled", True)
+            attrs["lower_canopy_fan_enabled"] = climate.get("lower_canopy_fan_enabled", True)
+            attrs["canopy_temp_spread_c"] = climate.get("canopy_temp_spread_c")
+            attrs["canopy_rh_spread_pct"] = climate.get("canopy_rh_spread_pct")
+            attrs["canopy_uniformity_insight"] = climate.get("canopy_uniformity_insight")
+            attrs["zone2_width_m"] = self.coordinator._get("zone2_width_m", 1.2)
+            attrs["zone2_depth_m"] = self.coordinator._get("zone2_depth_m", 1.2)
+            attrs["zone2_height_m"] = self.coordinator._get("zone2_height_m", 2.0)
+            attrs["zone2_plant_count"] = self.coordinator._get("zone2_plant_count", 4)
 
         if key == "cycle_cost":
             attrs["cycle_kwh"] = (self.coordinator.data or {}).get(NS_ENERGY, {}).get("cycle_kwh", 0.0)

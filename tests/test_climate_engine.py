@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from homeassistant.util import dt as dt_util
 
 from custom_components.helix_cultivate.climate_engine import (
     THERMAL_PURGE_MARGIN_C,
@@ -82,14 +83,14 @@ def test_vpd_assist_bias_stateless(engine, monkeypatch):
     order or how many times it has already been invoked this tick — the
     method holds no internal state of its own (Phase 9C design constraint).
     """
-    # Force the dehumidifier to appear saturated; VPD is above vpd_target_max
-    # (1.2), so the expected response is a +VPD_ASSIST_STEP_C bias (warmer
-    # air holds more moisture → lowers RH → raises VPD further is undesired;
-    # per docstring, biasing UP nudges toward correcting an over-wet zone).
+    # Force the humidifier to appear saturated; VPD is above vpd_target_max
+    # (1.2, air too dry). The humidifier is the appliance that would be
+    # running to correct that, so a saturated humidifier means temp must be
+    # nudged DOWN (-VPD_ASSIST_STEP_C) to raise RH / lower VPD instead.
     monkeypatch.setattr(
         engine,
         "_is_saturated",
-        lambda zone_label, appliance: appliance == "dehumidifier",
+        lambda zone_label, appliance: appliance == "humidifier",
     )
 
     leaf_vpd = 1.5  # > vpd_target_max
@@ -97,7 +98,61 @@ def test_vpd_assist_bias_stateless(engine, monkeypatch):
     second = engine._vpd_assist_bias("zone2", leaf_vpd)
     third = engine._vpd_assist_bias("zone2", leaf_vpd)
 
-    assert first == second == third == pytest.approx(VPD_ASSIST_STEP_C)
+    assert first == second == third == pytest.approx(-VPD_ASSIST_STEP_C)
+
+
+# ── _vpd_assist_bias against real _is_saturated (regression for the swapped-
+#    appliance-check bug: the code once checked humidifier saturation on the
+#    "too wet" branch and dehumidifier saturation on the "too dry" branch) ───
+
+def test_vpd_assist_bias_saturated_dehumidifier_at_low_vpd(engine, mock_coord):
+    """A genuinely saturated dehumidifier (10+ min continuous runtime, VPD
+    trend flat/not improving) with VPD stuck below vpd_target_min (too wet)
+    must nudge temp UP to help raise VPD — exercised via the real
+    _is_saturated/_vpd_trend logic, not a monkeypatch.
+    """
+    now = dt_util.utcnow()
+    for i in range(4):
+        mock_coord._vpd_history.append((now - timedelta(minutes=3 - i), 0.5))
+    mock_coord._dehumid_on_since = {"zone2": now - timedelta(minutes=10)}
+    mock_coord._humid_on_since = {"zone2": None}
+
+    bias = engine._vpd_assist_bias("zone2", leaf_vpd=0.5)  # < vpd_target_min (0.8)
+
+    assert bias == pytest.approx(VPD_ASSIST_STEP_C)
+
+
+def test_vpd_assist_bias_saturated_humidifier_at_high_vpd(engine, mock_coord):
+    """A genuinely saturated humidifier (10+ min continuous runtime, VPD
+    trend flat/not improving) with VPD stuck above vpd_target_max (too dry)
+    must nudge temp DOWN to help lower VPD — exercised via the real
+    _is_saturated/_vpd_trend logic, not a monkeypatch.
+    """
+    now = dt_util.utcnow()
+    for i in range(4):
+        mock_coord._vpd_history.append((now - timedelta(minutes=3 - i), 1.5))
+    mock_coord._humid_on_since = {"zone2": now - timedelta(minutes=10)}
+    mock_coord._dehumid_on_since = {"zone2": None}
+
+    bias = engine._vpd_assist_bias("zone2", leaf_vpd=1.5)  # > vpd_target_max (1.2)
+
+    assert bias == pytest.approx(-VPD_ASSIST_STEP_C)
+
+
+def test_vpd_assist_bias_not_saturated_yields_no_bias(engine, mock_coord):
+    """A dehumidifier that has only just turned on (well under the 8-minute
+    dwell threshold) is not yet saturated, so no assist bias should fire even
+    though VPD is below vpd_target_min.
+    """
+    now = dt_util.utcnow()
+    for i in range(4):
+        mock_coord._vpd_history.append((now - timedelta(minutes=3 - i), 0.5))
+    mock_coord._dehumid_on_since = {"zone2": now - timedelta(minutes=2)}
+    mock_coord._humid_on_since = {"zone2": None}
+
+    bias = engine._vpd_assist_bias("zone2", leaf_vpd=0.5)
+
+    assert bias == 0.0
 
 
 def test_vpd_assist_bias_none_when_not_saturated(engine, monkeypatch):

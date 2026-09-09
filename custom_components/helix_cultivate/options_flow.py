@@ -49,6 +49,8 @@ from .const import (
     CONF_HEATER_CUTOFF_C,
     CONF_LEAF_TEMP_OFFSET_C,
     CONF_NOTIFY_TARGET,
+    CONF_TIMELAPSE_CAPTURE_TIME,
+    DEFAULT_TIMELAPSE_CAPTURE_TIME,
     CONF_LIGHT_DIMMABLE,
     CONF_LIGHT_TYPE,
     CONF_LOWER_CANOPY_HUMIDITY_SENSOR,
@@ -908,6 +910,10 @@ class HelixOptionsFlow(config_entries.OptionsFlow):
                     _par_sensor_sel(),
                 _opt_entity(CONF_GROW_CAMERA, c(CONF_GROW_CAMERA)):
                     selector.EntitySelector(selector.EntitySelectorConfig(domain="camera")),
+                vol.Optional(
+                    CONF_TIMELAPSE_CAPTURE_TIME,
+                    default=c(CONF_TIMELAPSE_CAPTURE_TIME, DEFAULT_TIMELAPSE_CAPTURE_TIME),
+                ): _text_sel(),
             }
         )
 

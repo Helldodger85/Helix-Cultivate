@@ -909,7 +909,6 @@ class HelixTabCycle extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._editingStage = null;    // null = show active stage; slug = edit that stage
     this._editingPeriod = 'day';  // 'day' | 'night'
-    this._stageDrafts = {};       // { [stage_slug]: { day_vpd_min, day_vpd_max, ... } }
     this._showHarvestForm = false;
     this._harvestReport = null;   // set after successful close_out_harvest WS call
     this._harvestError = null;
@@ -1006,27 +1005,51 @@ class HelixTabCycle extends HTMLElement {
   }
 
   _stageValue(stage, key) {
-    const draft = this._stageDrafts[stage];
-    if (draft && draft[key] !== undefined) return draft[key];
     const persisted = (this._data || {})[`stage_targets_${stage}`];
     if (persisted && persisted[key] !== undefined) return persisted[key];
     return (STAGE_DAYNIGHT_DEFAULTS_JS[stage] || STAGE_DAYNIGHT_DEFAULTS_JS.germination)[key];
   }
 
-  async _saveStageTargets(stage) {
-    const draft = this._stageDrafts[stage] || {};
-    if (!Object.keys(draft).length) return;
+  // Reads the currently-displayed slider values straight from the DOM and
+  // saves them in a single explicit action — no draft object that would need
+  // to survive this element being destroyed/recreated on a tab switch.
+  async _saveStageTargetsFromDom(stage, isDay) {
+    const q = (id) => this.shadowRoot.querySelector(id);
+    const tempKey = isDay ? 'day_temp_c' : 'night_temp_c';
+    const vpdMinKey = isDay ? 'day_vpd_min' : 'night_vpd_min';
+    const vpdMaxKey = isDay ? 'day_vpd_max' : 'night_vpd_max';
+    const targets = {
+      [tempKey]: parseFloat(q('#temp-anchor-slider').value),
+      [vpdMinKey]: parseFloat(q('#vpd-min-slider').value),
+      [vpdMaxKey]: parseFloat(q('#vpd-max-slider').value),
+      light_intensity_pct: parseFloat(q('#light-slider').value),
+      fan_speed_pct: parseFloat(q('#fan-slider').value),
+    };
+
     const entryId = (this._data || {}).entry_id;
-    if (!this._hass || !entryId) return;
+    const statusEl = this.shadowRoot.querySelector('#stage-save-status');
+    if (!this._hass || !entryId) {
+      if (statusEl) statusEl.textContent = '❌ Save failed — no config entry found';
+      return;
+    }
+    // Deliberately do NOT call this._render() after this WS round trip: the
+    // panel's own coordinator poll (up to ~30s away) is what refreshes
+    // this._data with the just-saved values, and re-rendering from the
+    // sliders' backing data before that arrives would visually snap the
+    // sliders back to their pre-save values. Update the status text in
+    // place instead, leaving the sliders exactly where the user left them.
+    if (statusEl) statusEl.textContent = 'Saving…';
     try {
       await this._hass.callWS({
         type: 'helix_cultivate/update_stage_targets',
         entry_id: entryId,
         stage,
-        targets: draft,
+        targets,
       });
+      if (statusEl) statusEl.textContent = '✅ Saved';
     } catch (e) {
       console.error('Helix Cultivate: stage target save failed', e);
+      if (statusEl) statusEl.textContent = '❌ Save failed — see console';
     }
   }
 
@@ -1074,6 +1097,11 @@ class HelixTabCycle extends HTMLElement {
           <div class="metric-row"><span class="metric-label">Revenue</span><span class="metric-val">$${fn(r.revenue_usd,2)}</span></div>
           <div class="sec">Stage Durations</div>
           ${stageDurRows}
+          ${r.timelapse_gif_url ? `
+            <div class="sec">🎞 Grow Time-Lapse</div>
+            <img src="${r.timelapse_gif_url}" alt="Grow cycle time-lapse"
+              style="width:100%;border-radius:8px;border:1px solid var(--hx-border)"/>
+          ` : ''}
           <button id="close-harvest-report-btn" style="margin-top:12px;width:100%;padding:10px;border-radius:8px;
             border:none;background:var(--hx-accent);color:#fff;font-weight:700;cursor:pointer">Start New Cycle</button>
         </div>`;
@@ -1227,6 +1255,11 @@ class HelixTabCycle extends HTMLElement {
           <span class="metric-label">Photoperiod</span>
           <span class="metric-val">${fn(photoperiod,1)} h</span>
         </div>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:12px">
+          <button id="save-stage-targets-btn" style="padding:9px 16px;border-radius:8px;border:none;
+            background:var(--hx-blue,#209cee);color:#fff;font-weight:600;cursor:pointer">💾 Save Stage Targets</button>
+          <span id="stage-save-status" style="font-size:.75rem;color:var(--hx-text2)"></span>
+        </div>
       </div>
       <!-- Progression mode -->
       <div class="card">
@@ -1296,11 +1329,7 @@ class HelixTabCycle extends HTMLElement {
       });
     });
 
-    // Helper to set a draft value + refresh RH guide text live
-    const setDraft = (key, val) => {
-      if (!this._stageDrafts[stage]) this._stageDrafts[stage] = {};
-      this._stageDrafts[stage][key] = val;
-    };
+    // Refresh the RH guide text live as the sliders move
     const refreshRhGuide = () => {
       const t = parseFloat(this.shadowRoot.querySelector('#temp-anchor-slider').value);
       const vMin = parseFloat(this.shadowRoot.querySelector('#vpd-min-slider').value);
@@ -1318,15 +1347,13 @@ class HelixTabCycle extends HTMLElement {
       vpdMinVal.textContent = fVPD(parseFloat(e.target.value));
       refreshRhGuide();
     });
-    vpdMinSl.addEventListener('change', e => {
-      setDraft(vpdMinKey, parseFloat(e.target.value));
-      this._saveStageTargets(stage);
-      // vpd_target is derived server-side as the midpoint of the persisted
-      // day/night VPD range (see coordinator.py's smooth-glide tick) — do not
-      // push this range endpoint directly to the live number.vpd_target
-      // entity, it isn't a valid target value on its own and would also
-      // latch vpd_target_manual_override, breaking automatic tracking.
-    });
+    // Stage-target persistence now happens only via the explicit "Save Stage
+    // Targets" button (bound below) — sliders no longer auto-save per change,
+    // which previously relied on a draft object that didn't survive this
+    // element being destroyed/recreated on tab switches. vpd_target is
+    // derived server-side as the midpoint of the persisted day/night VPD
+    // range (see coordinator.py's smooth-glide tick), so the VPD min/max
+    // sliders never push directly to a live number entity either way.
 
     // VPD max slider
     const vpdMaxSl = this.shadowRoot.querySelector('#vpd-max-slider');
@@ -1335,12 +1362,10 @@ class HelixTabCycle extends HTMLElement {
       vpdMaxVal.textContent = fVPD(parseFloat(e.target.value));
       refreshRhGuide();
     });
-    vpdMaxSl.addEventListener('change', e => {
-      setDraft(vpdMaxKey, parseFloat(e.target.value));
-      this._saveStageTargets(stage);
-    });
 
-    // Temp anchor slider
+    // Temp anchor slider — the anchor IS the live point target for the
+    // active stage, so (unlike the VPD range endpoints) pushing it straight
+    // to number.helix_cultivate_temp_setpoint for a live preview is valid.
     const tempSl = this.shadowRoot.querySelector('#temp-anchor-slider');
     const tempVal = this.shadowRoot.querySelector('#temp-anchor-val');
     tempSl.addEventListener('input', e => {
@@ -1348,8 +1373,6 @@ class HelixTabCycle extends HTMLElement {
       refreshRhGuide();
     });
     tempSl.addEventListener('change', e => {
-      setDraft(tempKey, parseFloat(e.target.value));
-      this._saveStageTargets(stage);
       if (isActiveStage) {
         this._callService('number', 'set_value', {
           entity_id: 'number.helix_cultivate_temp_setpoint', value: parseFloat(e.target.value)
@@ -1357,13 +1380,12 @@ class HelixTabCycle extends HTMLElement {
       }
     });
 
-    // Light slider
+    // Light slider — direct point value, live-preview push is valid for the
+    // active stage exactly as with the temp anchor above.
     const lightSl = this.shadowRoot.querySelector('#light-slider');
     const lightVal = this.shadowRoot.querySelector('#light-val');
     lightSl.addEventListener('input', e => { lightVal.textContent = fPct(parseFloat(e.target.value)); });
     lightSl.addEventListener('change', e => {
-      setDraft('light_intensity_pct', parseFloat(e.target.value));
-      this._saveStageTargets(stage);
       if (isActiveStage) {
         this._callService('number', 'set_value', {
           entity_id: 'number.helix_cultivate_light_intensity', value: parseFloat(e.target.value)
@@ -1375,10 +1397,14 @@ class HelixTabCycle extends HTMLElement {
     const fanSl = this.shadowRoot.querySelector('#fan-slider');
     const fanVal = this.shadowRoot.querySelector('#fan-val');
     fanSl.addEventListener('input', e => { fanVal.textContent = fPct(parseFloat(e.target.value)); });
-    fanSl.addEventListener('change', e => {
-      setDraft('fan_speed_pct', parseFloat(e.target.value));
-      this._saveStageTargets(stage);
-    });
+
+    // Explicit Save — reads every slider above straight from the DOM.
+    const saveStageBtn = this.shadowRoot.querySelector('#save-stage-targets-btn');
+    if (saveStageBtn) {
+      saveStageBtn.addEventListener('click', () => {
+        this._saveStageTargetsFromDom(stage, isDay);
+      });
+    }
 
     // Progression toggle
     const progToggle = this.shadowRoot.querySelector('#prog-toggle');
@@ -1570,11 +1596,24 @@ function _hwPickerRow(keyDef, currentVal) {
     </div>`;
 }
 
-function _renderHwPicker(hwKeys, hwMap, hass, title) {
+function _hwLayerToggleRow(dataLayer, label, checked) {
+  return `
+    <div class="toggle-row">
+      <span class="toggle-lbl">${label}</span>
+      <label class="sw">
+        <input type="checkbox" class="hw-layer-toggle" data-layer="${dataLayer}" ${checked ? 'checked' : ''}/>
+        <span class="sw-track"></span>
+        <span class="sw-thumb"></span>
+      </label>
+    </div>`;
+}
+
+function _renderHwPicker(hwKeys, hwMap, hass, title, extraHtml = '') {
   return `
     <div class="card">
       <div class="card-title">⚙ ${title} — Hardware Mapping</div>
       ${hwKeys.map(k => _hwPickerRow(k, hwMap[k.key] || '')).join('')}
+      ${extraHtml}
       <div style="display:flex;gap:8px;margin-top:12px">
         <button class="hw-save-btn"
           style="flex:1;padding:9px;border-radius:8px;border:none;background:var(--hx-blue,#209cee);color:#fff;cursor:pointer;font-weight:600">💾 Save</button>
@@ -1585,7 +1624,7 @@ function _renderHwPicker(hwKeys, hwMap, hass, title) {
     </div>`;
 }
 
-function _bindHwPicker(shadowRoot, hostEl, hwKeys) {
+function _bindHwPicker(shadowRoot, hostEl, hwKeys, extraFieldsGetter = null) {
   hostEl._pendingDevices = {};
   shadowRoot.querySelectorAll('.hw-entity-slot').forEach(slot => {
     const key = slot.dataset.key;
@@ -1621,6 +1660,16 @@ function _bindHwPicker(shadowRoot, hostEl, hwKeys) {
           entry_id: entryId,
           devices: hostEl._pendingDevices,
         });
+        if (extraFieldsGetter) {
+          const fields = extraFieldsGetter();
+          if (fields && Object.keys(fields).length) {
+            await hostEl._hass.callWS({
+              type: 'helix_cultivate/update_settings_fields',
+              entry_id: entryId,
+              fields,
+            });
+          }
+        }
         hostEl._isEditingHardware = false;
         hostEl._hwFormBuilt = false;
         hostEl._pendingDevices = {};
@@ -1705,9 +1754,29 @@ class HelixTabGrowspace extends HTMLElement {
         // and any open entity-picker dropdown aren't torn down.
         return;
       }
+      // Mid/lower canopy sensor and fan layers are independently toggleable —
+      // sensor placement and fan placement are separate hardware decisions.
+      // Upper canopy has no toggle for either; it's the mandatory primary
+      // layer for both.
+      const layerToggles = `
+        <div class="sec">Canopy Layers</div>
+        ${_hwLayerToggleRow('mid_canopy_sensor_enabled', 'Mid Canopy Sensor', d.mid_canopy_sensor_enabled !== false)}
+        ${_hwLayerToggleRow('mid_canopy_fan_enabled', 'Mid Canopy Fan', d.mid_canopy_fan_enabled !== false)}
+        ${_hwLayerToggleRow('lower_canopy_sensor_enabled', 'Lower Canopy Sensor', d.lower_canopy_sensor_enabled !== false)}
+        ${_hwLayerToggleRow('lower_canopy_fan_enabled', 'Lower Canopy Fan', d.lower_canopy_fan_enabled !== false)}`;
+
       this.shadowRoot.innerHTML = `<style>${BASE_CSS}:host{display:block;}</style>`
-        + _renderHwPicker(ZONE2_HW_KEYS, d.hw_map || {}, this._hass, d.zone2_name || 'Primary Grow Space');
-      _bindHwPicker(this.shadowRoot, this, ZONE2_HW_KEYS);
+        + _renderHwPicker(
+            ZONE2_HW_KEYS, d.hw_map || {}, this._hass,
+            d.zone2_name || 'Primary Grow Space', layerToggles
+          );
+      _bindHwPicker(this.shadowRoot, this, ZONE2_HW_KEYS, () => {
+        const fields = {};
+        this.shadowRoot.querySelectorAll('.hw-layer-toggle').forEach(el => {
+          fields[el.dataset.layer] = el.checked;
+        });
+        return fields;
+      });
       this._hwFormBuilt = true;
       return;
     }
@@ -1728,6 +1797,34 @@ class HelixTabGrowspace extends HTMLElement {
         ${overrideChip('Exhaust',  null, (exhaust ?? 0) > 10, this._hass, true)}
       </div>`;
 
+    const midSensorOn = d.mid_canopy_sensor_enabled !== false;
+    const lowerSensorOn = d.lower_canopy_sensor_enabled !== false;
+    const midFanOn = d.mid_canopy_fan_enabled !== false;
+    const lowerFanOn = d.lower_canopy_fan_enabled !== false;
+
+    const tempCells = [
+      `<div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.upper_temp_c)}</div><div class="lbl">Upper °C</div></div>`,
+      midSensorOn ? `<div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.mid_temp_c)}</div><div class="lbl">Mid °C</div></div>` : '',
+      lowerSensorOn ? `<div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.lower_temp_c)}</div><div class="lbl">Lower °C</div></div>` : '',
+    ].join('');
+    const rhCells = [
+      `<div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.upper_rh_pct)}</div><div class="lbl">Upper RH</div></div>`,
+      midSensorOn ? `<div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.mid_rh_pct)}</div><div class="lbl">Mid RH</div></div>` : '',
+      lowerSensorOn ? `<div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.lower_rh_pct)}</div><div class="lbl">Lower RH</div></div>` : '',
+    ].join('');
+
+    const uniformityHtml = (d.canopy_uniformity_insight)
+      ? `<div class="metric-row" style="margin-top:4px">
+           <span class="metric-label">⚠ Canopy Uniformity</span>
+           <span class="metric-val" style="color:var(--hx-amber);font-size:.78rem;text-align:right">${d.canopy_uniformity_insight}</span>
+         </div>` : '';
+
+    const fanCards = [
+      this._fanCard('upper','Upper Canopy','⬆'),
+      midFanOn ? this._fanCard('mid','Mid Canopy','⟺') : '',
+      lowerFanOn ? this._fanCard('lower','Lower Canopy','⬇') : '',
+    ].join('');
+
     this.shadowRoot.innerHTML = `
       <style>${BASE_CSS}:host{display:block;}</style>
       <!-- Live readings -->
@@ -1735,13 +1832,10 @@ class HelixTabGrowspace extends HTMLElement {
         <div class="card-title" style="display:flex;align-items:center">🌱 ${d.zone2_name || 'Primary Grow Space'} — Live ${_gearBtnHtml()}</div>
         ${applianceRow}
         <div class="g3">
-          <div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.upper_temp_c)}</div><div class="lbl">Upper °C</div></div>
-          <div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.mid_temp_c)}</div><div class="lbl">Mid °C</div></div>
-          <div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.lower_temp_c)}</div><div class="lbl">Lower °C</div></div>
-          <div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.upper_rh_pct)}</div><div class="lbl">Upper RH</div></div>
-          <div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.mid_rh_pct)}</div><div class="lbl">Mid RH</div></div>
-          <div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.lower_rh_pct)}</div><div class="lbl">Lower RH</div></div>
+          ${tempCells}
+          ${rhCells}
         </div>
+        ${uniformityHtml}
         <hr/>
         <div class="metric-row">
           <span class="metric-label">Leaf VPD</span>
@@ -1774,9 +1868,7 @@ class HelixTabGrowspace extends HTMLElement {
       <!-- Fan matrix -->
       <div class="sec">🌀 Circulation Fan Matrix</div>
       <div class="g3">
-        ${this._fanCard('upper','Upper Canopy','⬆')}
-        ${this._fanCard('mid','Mid Canopy','⟺')}
-        ${this._fanCard('lower','Lower Canopy','⬇')}
+        ${fanCards}
       </div>`;
 
     // Setpoint bindings
@@ -2178,6 +2270,38 @@ class HelixTabSettings extends HTMLElement {
     if (this._hass) this._hass.callService(domain, service, data);
   }
 
+  // Reads Zone 2 width/depth/height/plant-count straight from the DOM and
+  // saves them in one explicit batch — these are static config-entry fields,
+  // not live HA entities, so there's nothing to auto-save on drag.
+  async _saveZone2Dimensions() {
+    const q = (id) => this.shadowRoot.querySelector(id);
+    const fields = {
+      zone2_width_m: parseFloat(q('#z2-width').value),
+      zone2_depth_m: parseFloat(q('#z2-depth').value),
+      zone2_height_m: parseFloat(q('#z2-height').value),
+      zone2_plant_count: parseInt(q('#z2-plants').value, 10),
+    };
+
+    const entryId = (this._data || {}).entry_id;
+    const statusEl = this.shadowRoot.querySelector('#zone2-dims-save-status');
+    if (!this._hass || !entryId) {
+      if (statusEl) statusEl.textContent = '❌ Save failed — no config entry found';
+      return;
+    }
+    if (statusEl) statusEl.textContent = 'Saving…';
+    try {
+      await this._hass.callWS({
+        type: 'helix_cultivate/update_settings_fields',
+        entry_id: entryId,
+        fields,
+      });
+      if (statusEl) statusEl.textContent = '✅ Saved';
+    } catch (e) {
+      console.error('Helix Cultivate: zone2 dimensions save failed', e);
+      if (statusEl) statusEl.textContent = '❌ Save failed — see console';
+    }
+  }
+
   _sectionBtn(id, label) {
     const active = this._section === id;
     return `<button class="sec-btn ${active ? 'active' : ''}" data-sec="${id}">${label}</button>`;
@@ -2270,6 +2394,11 @@ class HelixTabSettings extends HTMLElement {
         <div class="sec">Plant Count</div>
         <input type="number" id="z2-plants" min="1" max="100" step="1"
           value="${d.zone2_plant_count ?? 4}" style="width:80px"/>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:12px">
+          <button id="save-zone2-dims-btn" style="padding:9px 16px;border-radius:8px;border:none;
+            background:var(--hx-blue,#209cee);color:#fff;font-weight:600;cursor:pointer">💾 Save Dimensions</button>
+          <span id="zone2-dims-save-status" style="font-size:.75rem;color:var(--hx-text2)"></span>
+        </div>
         <div class="sec">Sunrise / Sunset Ramps</div>
         <div class="slider-row">
           <span class="slider-lbl">Sunrise Ramp</span>
@@ -2572,6 +2701,12 @@ class HelixTabSettings extends HTMLElement {
       });
     });
 
+    // Zone 2 dimensions — explicit Save (static config, not a live entity)
+    const saveZone2Btn = this.shadowRoot.querySelector('#save-zone2-dims-btn');
+    if (saveZone2Btn) {
+      saveZone2Btn.addEventListener('click', () => this._saveZone2Dimensions());
+    }
+
     // Sunrise ramp
     const sunriseRamp = this.shadowRoot.querySelector('#sunrise-ramp');
     const sunriseVal  = this.shadowRoot.querySelector('#sunrise-val');
@@ -2817,6 +2952,16 @@ class HelixPanel extends HTMLElement {
       zone2_depth_m:    this._attr('exhaust_speed', 'sensor', 'zone2_depth_m')    ?? 1.2,
       zone2_height_m:   this._attr('exhaust_speed', 'sensor', 'zone2_height_m')   ?? 2.0,
       zone2_plant_count: this._attr('exhaust_speed', 'sensor', 'zone2_plant_count') ?? 4,
+
+      // Independent canopy sensor/fan layer toggles (mid/lower only — upper
+      // is the mandatory primary layer for both, no toggle)
+      mid_canopy_sensor_enabled: this._attr('exhaust_speed', 'sensor', 'mid_canopy_sensor_enabled') ?? true,
+      lower_canopy_sensor_enabled: this._attr('exhaust_speed', 'sensor', 'lower_canopy_sensor_enabled') ?? true,
+      mid_canopy_fan_enabled: this._attr('exhaust_speed', 'sensor', 'mid_canopy_fan_enabled') ?? true,
+      lower_canopy_fan_enabled: this._attr('exhaust_speed', 'sensor', 'lower_canopy_fan_enabled') ?? true,
+      canopy_temp_spread_c: this._attr('exhaust_speed', 'sensor', 'canopy_temp_spread_c') ?? null,
+      canopy_rh_spread_pct: this._attr('exhaust_speed', 'sensor', 'canopy_rh_spread_pct') ?? null,
+      canopy_uniformity_insight: this._attr('exhaust_speed', 'sensor', 'canopy_uniformity_insight') ?? null,
 
       // Energy / tariff
       tariff_mode:          this._attr('exhaust_speed', 'sensor', 'tariff_mode')          ?? 'anytime',
