@@ -245,6 +245,82 @@ async def test_thermal_runaway_not_triggered_below_threshold(engine, mock_coord)
     mock_coord._notify_critical.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_thermal_runaway_notifies_once_per_sustained_episode(engine, mock_coord):
+    """Regression test: a sustained runaway must not re-fire the critical
+    notifications on every tick. Before this fix, `_notify_critical` had no
+    "already alerted" guard for this path (unlike the light-leak watchdog,
+    which already implements this correctly), so a multi-minute runaway
+    would generate a duplicate mobile push per ~30s coordinator tick.
+
+    The safety response itself (heater kill / exhaust override, verified by
+    `test_thermal_runaway_override` above) must still re-apply every tick —
+    only the notification is deduplicated.
+    """
+    fake_state = type("FakeState", (), {"state": "on"})()
+    mock_coord.hass.states.get.return_value = fake_state
+    runaway_temp = mock_coord._config["thermal_runaway_c"] + 1.0
+
+    first = await engine._handle_thermal_runaway(runaway_temp)
+    assert first is True
+    assert mock_coord._notify_critical.await_count == 2
+
+    # Still over threshold on the next tick — no *new* notifications.
+    second = await engine._handle_thermal_runaway(runaway_temp)
+    assert second is True
+    assert mock_coord._notify_critical.await_count == 2
+
+    # Temp recovers below threshold — episode ends, guard clears.
+    recovered = await engine._handle_thermal_runaway(
+        mock_coord._config["thermal_runaway_c"] - 5.0
+    )
+    assert recovered is False
+    assert mock_coord._notify_critical.await_count == 2
+
+    # A brand new episode alerts again.
+    third = await engine._handle_thermal_runaway(runaway_temp)
+    assert third is True
+    assert mock_coord._notify_critical.await_count == 4
+
+
+# ── _control_zone anti-short-cycle recording ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_control_zone_records_compressor_off_when_ac_turns_off(engine, mock_coord):
+    """Regression test for the anti-short-cycle ordering bug: previously
+    `zone.request_cool(...)` overwrote `zone.ac_on` *before* the "was this
+    appliance on a moment ago" check ran, so `_record_compressor_off` was
+    unreachable for any discrete (non-reverse-cycle) AC or dehumidifier —
+    the user-configurable anti-short-cycle dwell never actually engaged.
+    """
+    from custom_components.helix_cultivate.climate_engine import ZoneInterlock
+
+    ac_id = "switch.zone2_ac"
+
+    def fake_states_get(entity_id):
+        if entity_id == ac_id:
+            return type("FakeState", (), {"state": "on"})()
+        return None
+
+    mock_coord.hass.states.get.side_effect = fake_states_get
+    mock_coord.temp_setpoint = 24.0
+
+    zone = ZoneInterlock("zone2")
+
+    await engine._control_zone(
+        zone=zone,
+        zone_label="zone2",
+        current_temp=24.0,  # inside the temp deadband -> no cool demand
+        leaf_vpd=1.0,       # inside the VPD deadband -> no humidify/dehumidify demand
+        heater_id=None,
+        ac_id=ac_id,
+        humid_id=None,
+        dehumid_id=None,
+    )
+
+    assert mock_coord._last_compressor_off.get("zone2_ac") is not None
+
+
 # ── _control_exhaust thermal_runaway hard override ──────────────────────────
 
 @pytest.mark.asyncio

@@ -341,6 +341,10 @@
     "drying_unlocked_no_sensor": {
       "title": "Drying Zone Unlocked Without Sensors",
       "description": "The drying zone custom profile is unlocked, but the drying temperature or humidity sensor is not mapped. Custom drying control requires both sensors — map them in Settings > Hardware Mapping, or re-lock the drying zone to use the fixed 60/60 cure profile."
+    },
+    "primary_sensor_not_configured": {
+      "title": "Primary Sensor Not Configured Yet",
+      "description": "No primary canopy temperature sensor is mapped yet, so climate control is paused and exhaust is held at a safe floor. This is expected right after installing — open Settings > Hardware Mapping to finish setup."
     }
   }
 }

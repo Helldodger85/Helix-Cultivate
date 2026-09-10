@@ -45,6 +45,21 @@ function _swOn(hass, entityId) {
   return _state(hass, entityId) === 'on';
 }
 
+// Escape free-text before interpolating it into an innerHTML template
+// literal. Journal/IPM entries (label, note, etc.) come from plain <input>
+// fields typed by whoever has access to the panel — without this, a
+// crafted value (e.g. "<img src=x onerror=...>") is stored verbatim and
+// executes for every future viewer of the tab that renders it back.
+function escapeHtml(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function fn(v, d = 1, fb = '—') {
   if (v === null || v === undefined || (typeof v === 'number' && isNaN(v))) return fb;
   return Number(v).toFixed(d);
@@ -3712,10 +3727,10 @@ class HelixTabJournal extends HTMLElement {
       <div class="hx-j-list">
         ${entries.length === 0 ? '<p class="hx-j-empty">No entries yet.</p>' : entries.map(e => `
           <div class="hx-j-entry">
-            <span class="hx-j-tag hx-tag-${e.type}">${e.type}</span>
-            <span class="hx-j-label">${e.label || e.note || '—'}</span>
-            ${e.dose ? `<span class="hx-j-dose">${e.dose} ${e.unit}</span>` : ''}
-            ${e.volume_l ? `<span class="hx-j-vol">${e.volume_l}L</span>` : ''}
+            <span class="hx-j-tag hx-tag-${escapeHtml(e.type)}">${escapeHtml(e.type)}</span>
+            <span class="hx-j-label">${escapeHtml(e.label || e.note) || '—'}</span>
+            ${e.dose ? `<span class="hx-j-dose">${escapeHtml(e.dose)} ${escapeHtml(e.unit)}</span>` : ''}
+            ${e.volume_l ? `<span class="hx-j-vol">${escapeHtml(e.volume_l)}L</span>` : ''}
             <span class="hx-j-ts">${this._fmtTs(e.ts)}</span>
           </div>
         `).join('')}
@@ -3737,9 +3752,9 @@ class HelixTabJournal extends HTMLElement {
       <div class="hx-j-list">
         ${events.length === 0 ? '<p class="hx-j-empty">No IPM events recorded.</p>' : events.map(e => `
           <div class="hx-j-entry">
-            <span class="hx-j-tag hx-tag-ipm">${e.type.replace('_',' ')}</span>
+            <span class="hx-j-tag hx-tag-ipm">${escapeHtml(e.type.replace('_',' '))}</span>
             <span class="hx-j-ts">${this._fmtTs(e.ts)}</span>
-            ${e.note ? `<span class="hx-j-label">${e.note}</span>` : ''}
+            ${e.note ? `<span class="hx-j-label">${escapeHtml(e.note)}</span>` : ''}
           </div>
         `).join('')}
       </div>
