@@ -7,7 +7,7 @@ from typing import Any
 # ── Integration identity ─────────────────────────────────────────────────────
 DOMAIN: str = "helix_cultivate"
 CONFIG_VERSION: int = 1
-CONFIG_MINOR_VERSION: int = 2
+CONFIG_MINOR_VERSION: int = 3
 
 # ── Coordinator ──────────────────────────────────────────────────────────────
 COORDINATOR_UPDATE_INTERVAL: timedelta = timedelta(seconds=30)

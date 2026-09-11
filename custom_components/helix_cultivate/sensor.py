@@ -253,6 +253,16 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{coordinator._entry.entry_id}_{description.key}"
+        # Pin entity_id to the stable description key rather than letting HA
+        # derive it from the human-readable `name` (which the frontend's
+        # sensor.helix_cultivate_{key} lookups don't match for most sensors —
+        # e.g. "Lung Room Temperature" slugifies to a different string than
+        # the "lung_temp" key). Setting entity_id before the entity is added
+        # is what entity_platform reads to derive its suggested object_id;
+        # note this only takes effect for entities newly created in the
+        # registry — see the v1.3 migration in __init__.py for entities that
+        # already exist under the old, name-derived entity_id.
+        self.entity_id = f"sensor.{DOMAIN}_{description.key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator._entry.entry_id)},
             "name": "Helix Cultivate",

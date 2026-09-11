@@ -1689,6 +1689,12 @@ function _bindHwPicker(shadowRoot, hostEl, hwKeys, extraFieldsGetter = null) {
         hostEl._hwFormBuilt = false;
         hostEl._pendingDevices = {};
         hostEl._render();
+        // Tell the root panel its cached _hwMap is now stale — it re-fetches
+        // get_config_summary and pushes fresh `data` (including hw_map) back
+        // down, instead of this tab re-rendering from the old cached values.
+        hostEl.dispatchEvent(new CustomEvent('hw-map-saved', {
+          bubbles: true, composed: true,
+        }));
       } catch (e) {
         if (statusEl) statusEl.textContent = 'Error saving — see console.';
         console.warn('Helix Cultivate: hardware save failed', e);
@@ -3106,6 +3112,14 @@ class HelixPanel extends HTMLElement {
         this._localOverrides = { [key]: value };
       }
       this._update();
+    });
+
+    // Listen for hardware-mapping saves bubbled from any zone's gear-icon
+    // picker (Growspace/Conditioning/Drying) — _hwMap is only ever populated
+    // by _fetchConfigSummary(), so a save elsewhere needs to trigger a
+    // re-fetch here rather than leaving it stale until a hard page refresh.
+    this.shadowRoot.addEventListener('hw-map-saved', () => {
+      this._fetchConfigSummary();
     });
   }
 

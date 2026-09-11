@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.components.frontend import add_extra_js_url, async_register_built_in_panel
 from homeassistant.components.http import StaticPathConfig
+from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN, CONFIG_VERSION, CONFIG_MINOR_VERSION
 from .coordinator import HelixCoordinator
@@ -70,6 +71,17 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
     entries continue controlling the same physical hardware after the fix.
     The zone1_backup_heater entity ID is cleared (no zone2 counterpart exists)
     and must be reconfigured by the user via Settings after upgrade.
+
+    v1.3 migration: sensor entity_ids used to be derived from each sensor's
+    human-readable `name` (e.g. sensor.helix_cultivate_lung_room_temperature),
+    which rarely matched the entity_id the frontend guesses from the sensor's
+    stable key (e.g. sensor.helix_cultivate_lung_temp) — see HelixSensor in
+    sensor.py. Pinning entity_id going forward only affects entities created
+    fresh; entity_registry.async_get_or_create() keeps an existing entity's
+    entity_id untouched when it already has a registry row for the same
+    unique_id, so upgrading installs would otherwise keep the mismatched,
+    "—"-forever entity_ids permanently. Rename them explicitly via the entity
+    registry (entity_id only — unique_id/history/statistics are unaffected).
     """
     from .const import (  # local import avoids circular at module level
         CONF_ZONE1_AC, CONF_ZONE2_AC,
@@ -153,6 +165,47 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                 "inversion. zone1_backup_heater entity cleared — please reconfigure "
                 "via Settings > Hardware Mapping.",
                 len(_ZONE_SWAP_PAIRS),
+            )
+
+        if current_minor < 3:
+            # v1.2 → v1.3: rename sensor entity_ids in place to match the
+            # stable object_id key (sensor.helix_cultivate_{key}) instead of
+            # whatever the pre-fix, name-derived slug happened to be. Only
+            # entity_id changes — unique_id, the registry row's internal id,
+            # and recorder history/statistics are preserved.
+            ent_reg = er.async_get(hass)
+            unique_id_prefix = f"{config_entry.entry_id}_"
+            renamed = 0
+            for entity_entry in list(
+                er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
+            ):
+                if (
+                    entity_entry.domain != "sensor"
+                    or entity_entry.platform != DOMAIN
+                    or not entity_entry.unique_id.startswith(unique_id_prefix)
+                ):
+                    continue
+                key = entity_entry.unique_id[len(unique_id_prefix):]
+                new_entity_id = f"sensor.{DOMAIN}_{key}"
+                if entity_entry.entity_id == new_entity_id:
+                    continue
+                if ent_reg.async_get(new_entity_id) is not None:
+                    _LOGGER.warning(
+                        "Helix Cultivate: skipped renaming %s to %s during v1.3 "
+                        "migration — target entity_id is already in use",
+                        entity_entry.entity_id,
+                        new_entity_id,
+                    )
+                    continue
+                ent_reg.async_update_entity(
+                    entity_entry.entity_id, new_entity_id=new_entity_id
+                )
+                renamed += 1
+            _LOGGER.warning(
+                "Helix Cultivate: migrated entry to v1.3 — renamed %d sensor "
+                "entity_id(s) to their stable key so dashboard cards find them "
+                "again; history and statistics were preserved for each rename.",
+                renamed,
             )
 
         hass.config_entries.async_update_entry(
