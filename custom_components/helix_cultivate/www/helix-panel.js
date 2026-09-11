@@ -69,6 +69,18 @@ function fRH(v) { return v != null ? `${fn(v, 0)}%` : '—'; }
 function fVPD(v) { return v != null ? `${fn(v, 2)} kPa` : '—'; }
 function fPct(v) { return v != null ? `${fn(v, 0)}%` : '—'; }
 
+// Mirrors coordinator.py's midnight-safe schedule math — used only for the
+// read-only "Lights on HH:MM -> off HH:MM" preview; the coordinator is the
+// actual authority on the applied schedule.
+function _deriveOffTime(onTimeStr, hours) {
+  const parts = String(onTimeStr || '06:00').split(':');
+  const onMinutes = (parseInt(parts[0], 10) || 0) * 60 + (parseInt(parts[1], 10) || 0);
+  const totalMinutes = ((onMinutes + Math.round(Number(hours) * 60)) % (24 * 60) + 24 * 60) % (24 * 60);
+  const oh = String(Math.floor(totalMinutes / 60)).padStart(2, '0');
+  const om = String(totalMinutes % 60).padStart(2, '0');
+  return `${oh}:${om}`;
+}
+
 function vpdColour(vpd, target) {
   if (vpd == null || target == null) return 'var(--secondary-text-color,#9a9ab0)';
   const d = Math.abs(vpd - target);
@@ -874,6 +886,27 @@ customElements.define('helix-tab-telemetry', HelixTabTelemetry);
 // Tab: Plant Cycle Engine  <helix-tab-cycle>
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Mirrors const.py LIGHT_TYPE_OPTIONS/LIGHT_TYPE_LABELS.
+const LIGHT_TYPE_LABELS_JS = {
+  led: 'LED',
+  full_spectrum_led: 'Full Spectrum LED',
+  hid_ballast: 'HID / Ballast',
+  supplemental: 'Supplemental',
+};
+const LIGHT_TYPE_OPTIONS_JS = Object.keys(LIGHT_TYPE_LABELS_JS);
+
+// Mirrors const.py PHOTOPERIOD_FLOWER_STAGES — used client-side only to
+// derive the read-only "which schedule applies" preview; the coordinator is
+// the actual authority on stage-group mapping.
+const PHOTOPERIOD_FLOWER_STAGES_JS = new Set(['stretch', 'peak_flower', 'ripening']);
+
+const RAMP_PRESET_LABELS_JS = {
+  gentle: 'Gentle (~30 min)',
+  standard: 'Standard (~15 min)',
+  fast: 'Fast (~5 min)',
+  custom: 'Custom',
+};
+
 const STAGE_META = {
   germination: { label:'Germination',      icon:'🌰' },
   seedling:    { label:'Seedling',         icon:'🌱' },
@@ -1521,6 +1554,7 @@ const ZONE2_HW_KEYS = [
   { key: 'zone2_heater',                 label: 'Zone 2 Heater',          domains: ['switch', 'climate'] },
   { key: 'zone2_humidifier',             label: 'Zone 2 Humidifier',      domains: ['switch', 'climate'] },
   { key: 'zone2_dehumidifier',           label: 'Zone 2 Dehumidifier',    domains: ['switch', 'climate'] },
+  { key: 'zone2_grow_light',             label: 'Grow Light',             domains: ['light', 'switch'] },
 ];
 
 const ZONE1_HW_KEYS = [
@@ -1721,13 +1755,83 @@ function _bindGearBtn(shadowRoot, hostEl) {
 }
 
 class HelixTabGrowspace extends HTMLElement {
-  constructor() { super(); this.attachShadow({ mode: 'open' }); this._isEditingHardware = false; this._hwFormBuilt = false; }
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._isEditingHardware = false;
+    this._hwFormBuilt = false;
+    // Lighting & Growth Schedule drafts — survive the re-render triggered by
+    // clicking growth-mode/ramp-preset (which restructures the form) until
+    // an explicit Save commits them or fresh coordinator data arrives.
+    this._growthModeDraft = null;
+    this._rampPresetDraft = null;
+  }
 
   set hass(h) { this._hass = h; }
   set data(d) { this._data = d; this._render(); }
 
   _svc(domain, service, data) {
     if (this._hass) this._hass.callService(domain, service, data);
+  }
+
+  // Reads every visible Lighting & Growth Schedule field straight from the
+  // DOM and saves them in one explicit batch — same pattern as Zone 2
+  // dimensions / stage targets. Only the currently-visible group's fields
+  // (Autoflower or Photoperiod) are sent; the backend upserts individual
+  // keys, so the hidden group's previously-saved values are left untouched.
+  async _saveLightingScheduleFromDom() {
+    const q = (id) => this.shadowRoot.querySelector(id);
+    const growthMode = this._growthModeDraft || (this._data || {}).growth_mode || 'photoperiod';
+    const fields = { growth_mode: growthMode };
+
+    if (growthMode === 'autoflower') {
+      fields.af_light_hours = parseFloat(q('#af-hours').value);
+      fields.af_lights_on_time = q('#af-on-time').value;
+    } else {
+      fields.pp_veg_hours = parseFloat(q('#pp-veg-hours').value);
+      fields.pp_veg_lights_on_time = q('#pp-veg-on-time').value;
+      fields.pp_flower_hours = parseFloat(q('#pp-flower-hours').value);
+      fields.pp_flower_lights_on_time = q('#pp-flower-on-time').value;
+    }
+
+    const rampEnabledEl = q('#ramp-enabled-toggle');
+    if (rampEnabledEl) fields.ramp_enabled = rampEnabledEl.checked;
+    const rampPresetEl = q('#ramp-preset-select');
+    if (rampPresetEl) fields.ramp_preset = rampPresetEl.value;
+
+    // Custom ramp duration reuses the existing sunrise_ramp_min number
+    // entity rather than a new settings field — live push, immediate.
+    const customMinEl = q('#ramp-custom-min');
+    if (customMinEl) {
+      this._svc('number', 'set_value', {
+        entity_id: 'number.helix_cultivate_sunrise_ramp_min',
+        value: parseFloat(customMinEl.value),
+      });
+    }
+
+    const entryId = (this._data || {}).entry_id;
+    const statusEl = q('#lighting-save-status');
+    if (!this._hass || !entryId) {
+      if (statusEl) statusEl.textContent = 'Error: no config entry found.';
+      return;
+    }
+    if (statusEl) statusEl.textContent = 'Saving…';
+    try {
+      await this._hass.callWS({
+        type: 'helix_cultivate/update_settings_fields',
+        entry_id: entryId,
+        fields,
+      });
+      // Deliberately no _render() here — see _saveStageTargetsFromDom for
+      // why: the next coordinator data push (not this WS round trip) is
+      // what should refresh these fields, avoiding a visual snap-back.
+      this._growthModeDraft = null;
+      this._rampPresetDraft = null;
+      if (statusEl) statusEl.textContent = '✅ Saved';
+    } catch (e) {
+      console.error('Helix Cultivate: lighting schedule save failed', e);
+      if (statusEl) statusEl.textContent = '❌ Save failed — see console';
+    }
   }
 
   _fanCard(tier, label, icon) {
@@ -1784,7 +1888,17 @@ class HelixTabGrowspace extends HTMLElement {
         ${_hwLayerToggleRow('mid_canopy_sensor_enabled', 'Mid Canopy Sensor', d.mid_canopy_sensor_enabled !== false)}
         ${_hwLayerToggleRow('mid_canopy_fan_enabled', 'Mid Canopy Fan', d.mid_canopy_fan_enabled !== false)}
         ${_hwLayerToggleRow('lower_canopy_sensor_enabled', 'Lower Canopy Sensor', d.lower_canopy_sensor_enabled !== false)}
-        ${_hwLayerToggleRow('lower_canopy_fan_enabled', 'Lower Canopy Fan', d.lower_canopy_fan_enabled !== false)}`;
+        ${_hwLayerToggleRow('lower_canopy_fan_enabled', 'Lower Canopy Fan', d.lower_canopy_fan_enabled !== false)}
+        <div class="sec">Grow Light Fixture Type</div>
+        <select id="hw-light-type-select" style="width:100%;padding:8px;border-radius:8px;
+          border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
+          ${LIGHT_TYPE_OPTIONS_JS.map(opt => `<option value="${opt}" ${
+            (d.zone2_light_type || 'led') === opt ? 'selected' : ''
+          }>${LIGHT_TYPE_LABELS_JS[opt]}</option>`).join('')}
+        </select>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
+          Drives the default leaf-temperature offset and HID/ballast hot-restrike lockout.
+        </div>`;
 
       this.shadowRoot.innerHTML = `<style>${BASE_CSS}:host{display:block;}</style>`
         + _renderHwPicker(
@@ -1798,6 +1912,16 @@ class HelixTabGrowspace extends HTMLElement {
         });
         return fields;
       });
+      // Light type is a live select entity — persists immediately on
+      // change, independent of the hardware-mapping Save button above.
+      const lightTypeSel = this.shadowRoot.querySelector('#hw-light-type-select');
+      if (lightTypeSel) {
+        lightTypeSel.addEventListener('change', e => {
+          this._svc('select', 'select_option', {
+            entity_id: 'select.helix_cultivate_light_type', option: e.target.value,
+          });
+        });
+      }
       this._hwFormBuilt = true;
       return;
     }
@@ -1846,6 +1970,119 @@ class HelixTabGrowspace extends HTMLElement {
       lowerFanOn ? this._fanCard('lower','Lower Canopy','⬇') : '',
     ].join('');
 
+    // ── Lighting & Growth Schedule (Phase 1.5) ──────────────────────────────
+    const growLightId = (d.hw_map || {}).zone2_grow_light || null;
+    const isDimmable = !!growLightId && growLightId.startsWith('light.');
+    const growthMode = (this._growthModeDraft || d.growth_mode) === 'autoflower' ? 'autoflower' : 'photoperiod';
+    const rampPresetActive = this._rampPresetDraft || d.ramp_preset || 'standard';
+
+    // B6: live on/off status reflects the entity's ACTUAL state, not the
+    // schedule's intended state — stays honest if something's gone wrong.
+    let lightStatusHtml = '<span class="metric-val" style="color:var(--hx-text2)">Not mapped</span>';
+    if (growLightId && this._hass && this._hass.states[growLightId]) {
+      const lightIsOn = this._hass.states[growLightId].state === 'on';
+      lightStatusHtml = lightIsOn
+        ? '<span class="metric-val" style="color:var(--hx-amber)">🌞 Lights On</span>'
+        : '<span class="metric-val" style="color:var(--hx-text2)">🌙 Dark Period</span>';
+    }
+
+    const scheduleFieldsHtml = growthMode === 'autoflower' ? `
+      <div class="sec">Constant Schedule (applies across the entire grow)</div>
+      <div class="slider-row">
+        <span class="slider-lbl">Light Hours</span>
+        <input type="range" id="af-hours" min="0" max="24" step="0.5" value="${fn(d.af_light_hours, 1)}"/>
+        <span class="slider-val" id="af-hours-val">${fn(d.af_light_hours, 1)}h</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Lights On At</span>
+        <input type="time" id="af-on-time" value="${d.af_lights_on_time}"
+          style="padding:5px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Derived Off Time</span>
+        <span class="metric-val" id="af-off-time-display">${_deriveOffTime(d.af_lights_on_time, d.af_light_hours)}</span>
+      </div>
+    ` : `
+      <div class="sec">Vegetative Schedule — Germination → Late Veg</div>
+      <div class="slider-row">
+        <span class="slider-lbl">Light Hours</span>
+        <input type="range" id="pp-veg-hours" min="0" max="24" step="0.5" value="${fn(d.pp_veg_hours, 1)}"/>
+        <span class="slider-val" id="pp-veg-hours-val">${fn(d.pp_veg_hours, 1)}h</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Lights On At</span>
+        <input type="time" id="pp-veg-on-time" value="${d.pp_veg_lights_on_time}"
+          style="padding:5px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Derived Off Time</span>
+        <span class="metric-val" id="pp-veg-off-time-display">${_deriveOffTime(d.pp_veg_lights_on_time, d.pp_veg_hours)}</span>
+      </div>
+      <div class="sec">Flowering Schedule — Stretch → Ripening</div>
+      <div class="slider-row">
+        <span class="slider-lbl">Light Hours</span>
+        <input type="range" id="pp-flower-hours" min="0" max="24" step="0.5" value="${fn(d.pp_flower_hours, 1)}"/>
+        <span class="slider-val" id="pp-flower-hours-val">${fn(d.pp_flower_hours, 1)}h</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Lights On At</span>
+        <input type="time" id="pp-flower-on-time" value="${d.pp_flower_lights_on_time}"
+          style="padding:5px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Derived Off Time</span>
+        <span class="metric-val" id="pp-flower-off-time-display">${_deriveOffTime(d.pp_flower_lights_on_time, d.pp_flower_hours)}</span>
+      </div>
+    `;
+
+    const rampSectionHtml = isDimmable ? `
+      <select id="ramp-preset-select" style="width:100%;padding:7px;border-radius:8px;margin-top:6px;
+        border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)" ${d.ramp_enabled ? '' : 'disabled'}>
+        ${Object.keys(RAMP_PRESET_LABELS_JS).map(p => `<option value="${p}" ${rampPresetActive === p ? 'selected' : ''}>${RAMP_PRESET_LABELS_JS[p]}</option>`).join('')}
+      </select>
+      ${rampPresetActive === 'custom' ? `
+        <div class="slider-row" style="margin-top:6px">
+          <span class="slider-lbl">Custom Minutes</span>
+          <input type="range" id="ramp-custom-min" min="1" max="60" step="1" value="${d.sunrise_ramp_min ?? 20}" ${d.ramp_enabled ? '' : 'disabled'}/>
+          <span class="slider-val" id="ramp-custom-min-val">${d.sunrise_ramp_min ?? 20} min</span>
+        </div>` : ''}
+    ` : `<div style="font-size:.72rem;color:var(--hx-text2);margin-top:4px">
+        Switch-domain lights can't dim — ramp is automatically disabled.
+      </div>`;
+
+    const lightingCardHtml = `
+      <div class="card">
+        <div class="card-title">💡 Lighting &amp; Growth Schedule</div>
+        <div class="metric-row" style="margin-bottom:8px">
+          <span class="metric-label">Grow Light</span>
+          ${lightStatusHtml}
+        </div>
+        <div class="hx-period-toggle" style="display:flex;gap:6px;margin-bottom:12px">
+          <button class="growth-mode-btn ${growthMode === 'autoflower' ? 'active' : ''}" data-mode="autoflower"
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${growthMode === 'autoflower' ? 'var(--hx-blue,#209cee)' : 'none'};color:${growthMode === 'autoflower' ? '#fff' : 'var(--hx-text)'};font-weight:600">🌻 Autoflower</button>
+          <button class="growth-mode-btn ${growthMode === 'photoperiod' ? 'active' : ''}" data-mode="photoperiod"
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${growthMode === 'photoperiod' ? 'var(--hx-blue,#209cee)' : 'none'};color:${growthMode === 'photoperiod' ? '#fff' : 'var(--hx-text)'};font-weight:600">🌗 Photoperiod</button>
+        </div>
+        ${scheduleFieldsHtml}
+        <div class="sec">Sunrise / Sunset Dimming Ramp</div>
+        <div class="toggle-row">
+          <span class="toggle-lbl">Enable Ramp</span>
+          <label class="sw">
+            <input type="checkbox" id="ramp-enabled-toggle" ${d.ramp_enabled ? 'checked' : ''} ${isDimmable ? '' : 'disabled'}/>
+            <span class="sw-track"></span>
+            <span class="sw-thumb"></span>
+          </label>
+        </div>
+        ${rampSectionHtml}
+        <div style="display:flex;align-items:center;gap:10px;margin-top:12px">
+          <button id="save-lighting-btn" style="padding:9px 16px;border-radius:8px;border:none;
+            background:var(--hx-blue,#209cee);color:#fff;font-weight:600;cursor:pointer">💾 Save Lighting Schedule</button>
+          <span id="lighting-save-status" style="font-size:.75rem;color:var(--hx-text2)"></span>
+        </div>
+      </div>`;
+
     this.shadowRoot.innerHTML = `
       <style>${BASE_CSS}:host{display:block;}</style>
       <!-- Live readings -->
@@ -1886,6 +2123,7 @@ class HelixTabGrowspace extends HTMLElement {
           <span class="slider-val" id="light-sp-val">${fPct(lightP)}</span>
         </div>
       </div>
+      ${lightingCardHtml}
       <!-- Fan matrix -->
       <div class="sec">🌀 Circulation Fan Matrix</div>
       <div class="g3">
@@ -1935,6 +2173,80 @@ class HelixTabGrowspace extends HTMLElement {
         });
       });
     });
+
+    // ── Lighting & Growth Schedule bindings ─────────────────────────────────
+
+    // Growth mode toggle — structurally mutually exclusive (two buttons,
+    // one active class) rather than independent checkboxes, so "both" or
+    // "neither" selected is impossible. Re-renders to swap the field group;
+    // tracked as a draft so the choice survives that re-render until Saved.
+    this.shadowRoot.querySelectorAll('.growth-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this._growthModeDraft = btn.dataset.mode;
+        this._render();
+      });
+    });
+
+    // Live hour-slider labels + derived off-time previews
+    const hourFields = [
+      ['#af-hours', '#af-hours-val', '#af-on-time', '#af-off-time-display'],
+      ['#pp-veg-hours', '#pp-veg-hours-val', '#pp-veg-on-time', '#pp-veg-off-time-display'],
+      ['#pp-flower-hours', '#pp-flower-hours-val', '#pp-flower-on-time', '#pp-flower-off-time-display'],
+    ];
+    for (const [hoursId, valId, onTimeId, offDisplayId] of hourFields) {
+      const hoursEl = this.shadowRoot.querySelector(hoursId);
+      const valEl = this.shadowRoot.querySelector(valId);
+      const onTimeEl = this.shadowRoot.querySelector(onTimeId);
+      const offDisplayEl = this.shadowRoot.querySelector(offDisplayId);
+      if (!hoursEl) continue;
+      const refreshOff = () => {
+        if (offDisplayEl && onTimeEl) {
+          offDisplayEl.textContent = _deriveOffTime(onTimeEl.value, parseFloat(hoursEl.value));
+        }
+      };
+      hoursEl.addEventListener('input', e => {
+        if (valEl) valEl.textContent = `${fn(parseFloat(e.target.value), 1)}h`;
+        refreshOff();
+      });
+      if (onTimeEl) onTimeEl.addEventListener('input', refreshOff);
+    }
+
+    // Ramp enabled toggle — simple enable/disable of sibling controls, no
+    // re-render needed (nothing restructures, just becomes usable/greyed).
+    const rampEnabledToggle = this.shadowRoot.querySelector('#ramp-enabled-toggle');
+    if (rampEnabledToggle) {
+      rampEnabledToggle.addEventListener('change', e => {
+        const enabled = e.target.checked;
+        const presetSel = this.shadowRoot.querySelector('#ramp-preset-select');
+        if (presetSel) presetSel.disabled = !enabled;
+        const customMin = this.shadowRoot.querySelector('#ramp-custom-min');
+        if (customMin) customMin.disabled = !enabled;
+      });
+    }
+
+    // Ramp preset — "custom" reveals the custom-minutes slider, a structural
+    // change, so re-render (tracked as a draft, same reasoning as growth mode).
+    const rampPresetSelect = this.shadowRoot.querySelector('#ramp-preset-select');
+    if (rampPresetSelect) {
+      rampPresetSelect.addEventListener('change', e => {
+        this._rampPresetDraft = e.target.value;
+        this._render();
+      });
+    }
+    const rampCustomMin = this.shadowRoot.querySelector('#ramp-custom-min');
+    const rampCustomMinVal = this.shadowRoot.querySelector('#ramp-custom-min-val');
+    if (rampCustomMin) {
+      rampCustomMin.addEventListener('input', e => {
+        if (rampCustomMinVal) rampCustomMinVal.textContent = `${e.target.value} min`;
+      });
+    }
+
+    // Explicit Save — reads every visible lighting field straight from the
+    // DOM in one batch, exactly like Zone 2 dimensions / stage targets.
+    const saveLightingBtn = this.shadowRoot.querySelector('#save-lighting-btn');
+    if (saveLightingBtn) {
+      saveLightingBtn.addEventListener('click', () => this._saveLightingScheduleFromDom());
+    }
 
     _bindGearBtn(this.shadowRoot, this);
   }
@@ -2844,17 +3156,20 @@ class HelixPanel extends HTMLElement {
     const cycleComplete = this._attr('grow_stage', 'sensor', 'cycle_complete') || false;
     const stageDurationsPlanned = this._attr('grow_stage', 'sensor', 'stage_durations_planned') || {};
 
-    // Outdoor weather
+    // Outdoor weather — temp/RH come from the coordinator (which applies the
+    // local weather station override, same precedence as a canopy sensor
+    // tier, server-side) rather than being re-derived here. Condition is
+    // still read directly off the forecast/weather entity's own state.
+    // Forecast temperature isn't shown: the `forecast` state attribute this
+    // used to read was removed from HA core (see climate_engine.py's
+    // _fetch_weather_forecast, which now uses the get_forecasts service for
+    // the exhaust feedforward calc — surfacing it here too would need a
+    // second, separate service round trip from the frontend).
     const weatherId = this._attr('exhaust_speed', 'sensor', 'outdoor_weather_entity');
-    let outdoorTemp = null, outdoorRH = null, outdoorCond = null, outdoorForecast = null;
-    if (weatherId && h.states[weatherId]) {
-      const ws = h.states[weatherId];
-      outdoorTemp = ws.attributes.temperature ?? null;
-      outdoorRH   = ws.attributes.humidity    ?? null;
-      outdoorCond = ws.state                   ?? null;
-      const fc    = ws.attributes.forecast    || [];
-      outdoorForecast = fc.length ? (fc[0].temperature ?? null) : null;
-    }
+    const outdoorTemp = this._attr('exhaust_speed', 'sensor', 'outdoor_temp_c') ?? null;
+    const outdoorRH   = this._attr('exhaust_speed', 'sensor', 'outdoor_rh_pct') ?? null;
+    const outdoorCond = (weatherId && h.states[weatherId]) ? h.states[weatherId].state : null;
+    const outdoorForecast = null;
 
     return {
       // Topology & modules
@@ -2983,6 +3298,26 @@ class HelixPanel extends HTMLElement {
       canopy_temp_spread_c: this._attr('exhaust_speed', 'sensor', 'canopy_temp_spread_c') ?? null,
       canopy_rh_spread_pct: this._attr('exhaust_speed', 'sensor', 'canopy_rh_spread_pct') ?? null,
       canopy_uniformity_insight: this._attr('exhaust_speed', 'sensor', 'canopy_uniformity_insight') ?? null,
+
+      // Outdoor conditions (local weather station override applied server-side)
+      outdoor_weather_entity:       this._attr('exhaust_speed', 'sensor', 'outdoor_weather_entity') ?? null,
+      local_weather_station_entity: this._attr('exhaust_speed', 'sensor', 'local_weather_station_entity') ?? null,
+      outdoor_temp_c_live: this._attr('exhaust_speed', 'sensor', 'outdoor_temp_c') ?? null,
+      outdoor_rh_pct_live: this._attr('exhaust_speed', 'sensor', 'outdoor_rh_pct') ?? null,
+
+      // Lighting & DLI engine (Phase 1.5)
+      zone2_light_type:  this._attr('exhaust_speed', 'sensor', 'zone2_light_type')  ?? 'led',
+      light_applied_pct: this._attr('exhaust_speed', 'sensor', 'light_applied_pct') ?? 0,
+      growth_mode:            this._attr('exhaust_speed', 'sensor', 'growth_mode')            ?? 'photoperiod',
+      af_light_hours:         this._attr('exhaust_speed', 'sensor', 'af_light_hours')         ?? 18,
+      af_lights_on_time:      this._attr('exhaust_speed', 'sensor', 'af_lights_on_time')      ?? '06:00',
+      pp_veg_hours:           this._attr('exhaust_speed', 'sensor', 'pp_veg_hours')           ?? 18,
+      pp_veg_lights_on_time:  this._attr('exhaust_speed', 'sensor', 'pp_veg_lights_on_time')  ?? '06:00',
+      pp_flower_hours:        this._attr('exhaust_speed', 'sensor', 'pp_flower_hours')        ?? 12,
+      pp_flower_lights_on_time: this._attr('exhaust_speed', 'sensor', 'pp_flower_lights_on_time') ?? '06:00',
+      ramp_enabled: this._attr('exhaust_speed', 'sensor', 'ramp_enabled') ?? true,
+      ramp_preset:  this._attr('exhaust_speed', 'sensor', 'ramp_preset')  ?? 'standard',
+      light_wattage_w: this._attr('exhaust_speed', 'sensor', 'light_wattage_w') ?? 600,
 
       // Energy / tariff
       tariff_mode:          this._attr('exhaust_speed', 'sensor', 'tariff_mode')          ?? 'anytime',

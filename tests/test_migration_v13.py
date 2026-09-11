@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import custom_components.helix_cultivate as helix_init
-from custom_components.helix_cultivate.const import DOMAIN
+from custom_components.helix_cultivate.const import CONFIG_MINOR_VERSION, DOMAIN
 
 
 class _FakeRegistryEntry:
@@ -108,7 +108,7 @@ async def test_v13_migration_renames_mismatched_sensor_entity_ids(monkeypatch, f
     # Config entry bumped to the current version/minor version.
     fake_hass.config_entries.async_update_entry.assert_called_once()
     call_kwargs = fake_hass.config_entries.async_update_entry.call_args.kwargs
-    assert call_kwargs["minor_version"] == 3
+    assert call_kwargs["minor_version"] == CONFIG_MINOR_VERSION
 
 
 @pytest.mark.asyncio
@@ -141,13 +141,42 @@ async def test_v13_migration_skips_when_target_entity_id_taken(monkeypatch, fake
 
 @pytest.mark.asyncio
 async def test_migration_from_current_version_is_a_noop_rename(monkeypatch, fake_hass):
-    """An entry already at v1.3 (current_minor == CONFIG_MINOR_VERSION) skips
-    the v1.3 branch entirely — no renaming should be attempted."""
-    entry = _make_config_entry(minor_version=3)
-    fake_registry = _FakeEntityRegistry([])
+    """An entry already fully migrated (current_minor == CONFIG_MINOR_VERSION)
+    must not touch the entity registry at all — every version-gated branch,
+    sensor rename (v1.3) and select rename (v1.5) alike, is skipped."""
+    from custom_components.helix_cultivate.const import CONFIG_MINOR_VERSION
+
+    entry = _make_config_entry(minor_version=CONFIG_MINOR_VERSION)
     calls = []
-    monkeypatch.setattr(helix_init.er, "async_get", lambda hass: (calls.append(1), fake_registry)[1])
+    monkeypatch.setattr(helix_init.er, "async_get", lambda hass: (calls.append(1), None)[1])
 
     await helix_init.async_migrate_entry(fake_hass, entry)
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_v13_boundary_sensor_branch_skipped_but_v15_select_branch_still_runs(
+    monkeypatch, fake_hass
+):
+    """An entry at exactly minor_version=3 has already had its sensors
+    renamed (v1.3 done) but still needs the v1.5 select rename — confirms
+    the two branches are independently gated, not bundled."""
+    entry = _make_config_entry(minor_version=3)
+    select_entry = _FakeRegistryEntry(
+        "select.helix_cultivate_grow_light_type", f"{entry.entry_id}_light_type",
+        domain="select",
+    )
+    fake_registry = _FakeEntityRegistry([select_entry])
+
+    monkeypatch.setattr(helix_init.er, "async_get", lambda hass: fake_registry)
+    monkeypatch.setattr(
+        helix_init.er,
+        "async_entries_for_config_entry",
+        lambda registry, entry_id: list(registry._by_entity_id.values()),
+    )
+
+    await helix_init.async_migrate_entry(fake_hass, entry)
+
+    assert fake_registry.async_get("select.helix_cultivate_light_type") is not None
+    assert fake_registry.async_get("select.helix_cultivate_grow_light_type") is None

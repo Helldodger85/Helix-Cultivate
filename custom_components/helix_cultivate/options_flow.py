@@ -45,14 +45,14 @@ from .const import (
     CONF_EXHAUST_MIN_PCT,
     CONF_FAN_CONTROL_MODE,
     CONF_GROW_CAMERA,
-    CONF_GROW_LIGHT,
+    CONF_ZONE2_GROW_LIGHT,
     CONF_HEATER_CUTOFF_C,
     CONF_LEAF_TEMP_OFFSET_C,
     CONF_NOTIFY_TARGET,
     CONF_TIMELAPSE_CAPTURE_TIME,
     DEFAULT_TIMELAPSE_CAPTURE_TIME,
     CONF_LIGHT_DIMMABLE,
-    CONF_LIGHT_TYPE,
+    CONF_ZONE2_LIGHT_TYPE,
     CONF_LOWER_CANOPY_HUMIDITY_SENSOR,
     CONF_LOWER_CANOPY_TEMP_SENSOR,
     CONF_LOWER_FANS,
@@ -68,6 +68,7 @@ from .const import (
     CONF_MID_HUMIDITY_OFFSET,
     CONF_MID_TEMP_OFFSET,
     CONF_OUTDOOR_WEATHER_ENTITY,
+    CONF_LOCAL_WEATHER_STATION_ENTITY,
     CONF_PRIMARY_HUMIDITY_OFFSET,
     CONF_PRIMARY_HUMIDITY_SENSOR,
     CONF_PRIMARY_TEMP_OFFSET,
@@ -358,6 +359,7 @@ _ZONE2_ENTITY_KEYS: tuple[str, ...] = (
     CONF_ZONE2_HUMIDIFIER,
     CONF_ZONE2_DEHUMIDIFIER,
     CONF_OUTDOOR_WEATHER_ENTITY,
+    CONF_LOCAL_WEATHER_STATION_ENTITY,
     CONF_UPPER_CANOPY_TEMP_SENSOR,
     CONF_UPPER_CANOPY_HUMIDITY_SENSOR,
     CONF_MID_CANOPY_TEMP_SENSOR,
@@ -379,7 +381,7 @@ _DRYING_ENTITY_KEYS: tuple[str, ...] = (
 )
 
 _LIGHTING_ENTITY_KEYS: tuple[str, ...] = (
-    CONF_GROW_LIGHT,
+    CONF_ZONE2_GROW_LIGHT,
     CONF_DLI_SENSOR,
     CONF_GROW_CAMERA,
 )
@@ -654,6 +656,11 @@ class HelixOptionsFlow(config_entries.OptionsFlow):
                 # ── Outdoor weather entity (for feedforward MPC) ──────────────
                 _opt_entity(CONF_OUTDOOR_WEATHER_ENTITY, c(CONF_OUTDOOR_WEATHER_ENTITY)):
                     _weather_sel(),
+                # ── Optional local weather station — ground-truth override for
+                #    CURRENT conditions only; the entity above still drives
+                #    forecast/outlook regardless of whether this is set. ──────
+                _opt_entity(CONF_LOCAL_WEATHER_STATION_ENTITY, c(CONF_LOCAL_WEATHER_STATION_ENTITY)):
+                    _weather_sel(),
             }
         )
 
@@ -892,11 +899,11 @@ class HelixOptionsFlow(config_entries.OptionsFlow):
         c = self._c
         schema = vol.Schema(
             {
-                _opt_entity(CONF_GROW_LIGHT, c(CONF_GROW_LIGHT)):
+                _opt_entity(CONF_ZONE2_GROW_LIGHT, c(CONF_ZONE2_GROW_LIGHT)):
                     _light_sel(),
                 vol.Optional(
-                    CONF_LIGHT_TYPE,
-                    default=c(CONF_LIGHT_TYPE, LIGHT_LED),
+                    CONF_ZONE2_LIGHT_TYPE,
+                    default=c(CONF_ZONE2_LIGHT_TYPE, LIGHT_LED),
                 ): _select_sel(LIGHT_TYPE_OPTIONS),
                 vol.Optional(
                     CONF_LIGHT_DIMMABLE,

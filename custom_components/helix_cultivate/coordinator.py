@@ -35,7 +35,8 @@ from .const import (
     CONF_EXHAUST_FAN,
     CONF_EXHAUST_MIN_PCT,
     CONF_GROW_CAMERA,
-    CONF_GROW_LIGHT,
+    CONF_ZONE2_GROW_LIGHT,
+    CONF_ZONE2_LIGHT_TYPE,
     CONF_HARVEST_VALUE_PER_OZ,
     CONF_LEAF_TEMP_OFFSET_C,
     CONF_LOWER_CANOPY_HUMIDITY_SENSOR,
@@ -108,6 +109,42 @@ from .const import (
     SENSOR_MEDIAN_BUFFER_SIZE,
     STAGE_SEQUENCE,
     TOPOLOGY_COORDINATED,
+    # ── Lighting & DLI engine (Phase 1.5) ─────────────────────────────────────
+    CONF_GROWTH_MODE,
+    GROWTH_MODE_AUTOFLOWER,
+    GROWTH_MODE_PHOTOPERIOD,
+    DEFAULT_GROWTH_MODE,
+    CONF_AF_LIGHT_HOURS,
+    DEFAULT_AF_LIGHT_HOURS,
+    CONF_AF_LIGHTS_ON_TIME,
+    DEFAULT_AF_LIGHTS_ON_TIME,
+    CONF_PP_VEG_HOURS,
+    DEFAULT_PP_VEG_HOURS,
+    CONF_PP_VEG_LIGHTS_ON_TIME,
+    DEFAULT_PP_VEG_LIGHTS_ON_TIME,
+    CONF_PP_FLOWER_HOURS,
+    DEFAULT_PP_FLOWER_HOURS,
+    CONF_PP_FLOWER_LIGHTS_ON_TIME,
+    DEFAULT_PP_FLOWER_LIGHTS_ON_TIME,
+    PHOTOPERIOD_VEG_STAGES,
+    PHOTOPERIOD_FLOWER_STAGES,
+    CONF_RAMP_ENABLED,
+    DEFAULT_RAMP_ENABLED,
+    CONF_RAMP_PRESET,
+    DEFAULT_RAMP_PRESET,
+    RAMP_PRESET_CUSTOM,
+    RAMP_PRESET_MINUTES,
+    LIGHT_HID,
+    LIGHT_LED,
+    FIXTURE_LEAF_OFFSET_DEFAULTS,
+    FIXTURE_EFFICACY_UMOL_PER_J,
+    DEFAULT_HID_RESTRIKE_LOCKOUT_MIN,
+    CONF_LIGHT_WATTAGE_W,
+    DEFAULT_LIGHT_WATTAGE_W,
+    CONF_LIGHT_EFFICACY_UMOL_PER_J,
+    STAGE_DRYING,
+    CONF_SUNRISE_RAMP_MIN,
+    DEFAULT_SUNRISE_RAMP_MIN,
 )
 from .stage_manager import StageManager
 
@@ -134,6 +171,18 @@ def _median_of_three(buf: deque) -> Optional[float]:
         return None
     sorted_vals = sorted(values)
     return sorted_vals[len(sorted_vals) // 2]
+
+
+def _parse_hhmm(value: Any, fallback: str) -> dtime:
+    """Parse an "HH:MM" string into a time object, falling back to a known-
+    good default string on any malformed input rather than raising."""
+    for candidate in (value, fallback):
+        try:
+            hour_str, minute_str = str(candidate).split(":", 1)
+            return dtime(int(hour_str), int(minute_str))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return dtime(6, 0)
 
 
 class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -177,6 +226,11 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── Lights-off purge tracking ─────────────────────────────────────────
         self._lights_off_purge_until: Optional[datetime] = None
+        # Previous-tick lights-on state, used by ClimateEngine._control_exhaust()
+        # to detect the on->off transition that starts the dehumidification
+        # purge window. Distinct from the time-lapse snapshot's own date-based
+        # tracking (_last_snapshot_date) — do not conflate the two again.
+        self._lights_state_prev: Optional[bool] = None
 
         # ── Energy session start ──────────────────────────────────────────────
         self._session_start: datetime = dt_util.utcnow()
@@ -229,6 +283,20 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.temp_setpoint_manual_override: bool = False
         self.vpd_target_manual_override: bool = False
         self.rh_setpoint_manual_override: bool = False
+
+        # ── Light schedule engine (Phase 1.5) ───────────────────────────────────
+        # Actual last-applied grow-light brightness (0-100), distinct from
+        # light_intensity_pct (the stage's configured ceiling when fully on)
+        # — this is ceiling × the schedule's on/ramp/off multiplier, used by
+        # the DLI estimation fallback so ramp windows integrate against real
+        # applied brightness rather than a binary on/off assumption.
+        self._light_applied_pct: float = 0.0
+        # Continuous off-duration tracking for the HID/ballast hot-restrike
+        # lockout — set the moment the entity is observed off (by us or
+        # anyone else), cleared the moment it's observed on. Reused
+        # anti-short-cycle-style dwell timer, see _apply_grow_light_schedule.
+        self._light_off_since: Optional[datetime] = None
+        self._hid_restrike_delay_logged: bool = False
 
     # ── Config helpers ────────────────────────────────────────────────────────
 
@@ -394,12 +462,32 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         enthalpy = 1.006 * temp_c + humidity_ratio * (2501.0 + 1.86 * temp_c)
         return enthalpy
 
+    # ── Fixture-aware leaf temperature offset ─────────────────────────────────
+
+    def effective_leaf_temp_offset_c(self) -> float:
+        """Return the leaf-temperature offset actually in effect.
+
+        A manually-persisted CONF_LEAF_TEMP_OFFSET_C (the user has touched
+        the number.helix_cultivate_leaf_temp_offset slider at least once, for
+        someone with a real leaf-clip sensor) always wins outright. Otherwise
+        derive a sensible default from the mapped fixture type
+        (zone2_light_type) — HID/ballast runs much hotter than modern LED, so
+        one global default doesn't fit every fixture. Falls back to the
+        historical flat default when no fixture type is set either.
+        """
+        if CONF_LEAF_TEMP_OFFSET_C in self._entry.options:
+            return float(self._entry.options[CONF_LEAF_TEMP_OFFSET_C])
+        light_type = self._get(CONF_ZONE2_LIGHT_TYPE)
+        return float(
+            FIXTURE_LEAF_OFFSET_DEFAULTS.get(light_type, DEFAULT_LEAF_TEMP_OFFSET_C)
+        )
+
     # ── Leaf VPD calculation ──────────────────────────────────────────────────
 
     def _calc_leaf_vpd(self, temp_c: float, rh_pct: float) -> float:
-        """Calculate Leaf VPD [kPa] using configured leaf temperature offset."""
+        """Calculate Leaf VPD [kPa] using the effective leaf temperature offset."""
         import math
-        offset = float(self._get(CONF_LEAF_TEMP_OFFSET_C, DEFAULT_LEAF_TEMP_OFFSET_C))
+        offset = self.effective_leaf_temp_offset_c()
         t_leaf = temp_c + offset
         svp_leaf = 0.6108 * math.exp(17.27 * t_leaf / (t_leaf + 237.3))
         svp_air = 0.6108 * math.exp(17.27 * temp_c / (temp_c + 237.3))
@@ -411,22 +499,227 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _lights_on(self) -> bool:
         """Return True if grow light entity is currently on."""
-        light_id: Optional[str] = self._get(CONF_GROW_LIGHT)
+        light_id: Optional[str] = self._get(CONF_ZONE2_GROW_LIGHT)
         if not light_id:
             return False
         state = self.hass.states.get(light_id)
         return state is not None and state.state in ("on",)
 
+    # ── Light schedule engine (Phase 1.5) ─────────────────────────────────────
+    #
+    # Helix Cultivate is the sole authority for the grow-light schedule.
+    # Every method here is a pure function of (growth mode, current stage,
+    # configured hours/on-time/ramp) — nothing here ever depends on whether a
+    # DLI sensor is mapped, by design (B7: DLI presence must never gate
+    # scheduling, growth mode, ramp, or lockout).
+
+    def _light_schedule_params(self) -> tuple[float, dtime, str]:
+        """Return (hours, on_time, schedule_key) for the schedule that
+        applies RIGHT NOW, based on growth mode and the current stage.
+
+        Recomputed fresh every call — a stage transition (auto-advance or
+        manual) is reflected on the very next call with no interpolation,
+        which is what makes the Veg->Flower transition a single instant
+        switch rather than a gradual ramp (see _light_schedule_multiplier).
+        """
+        # Drying is a fixed dark period regardless of growth mode — it's a
+        # post-harvest curing stage, not a live-plant photoperiod response,
+        # so it overrides autoflower's constant schedule too. Checked before
+        # branching on growth mode so this can never be shadowed by it.
+        stage = self.stage_manager.current_stage
+        if stage == STAGE_DRYING:
+            return 0.0, dtime(0, 0), "drying"
+
+        mode = self._get(CONF_GROWTH_MODE, DEFAULT_GROWTH_MODE)
+
+        if mode == GROWTH_MODE_AUTOFLOWER:
+            hours = float(self._get(CONF_AF_LIGHT_HOURS, DEFAULT_AF_LIGHT_HOURS))
+            on_time = _parse_hhmm(
+                self._get(CONF_AF_LIGHTS_ON_TIME, DEFAULT_AF_LIGHTS_ON_TIME),
+                DEFAULT_AF_LIGHTS_ON_TIME,
+            )
+            return hours, on_time, "af"
+
+        if stage in PHOTOPERIOD_FLOWER_STAGES:
+            hours = float(self._get(CONF_PP_FLOWER_HOURS, DEFAULT_PP_FLOWER_HOURS))
+            on_time = _parse_hhmm(
+                self._get(CONF_PP_FLOWER_LIGHTS_ON_TIME, DEFAULT_PP_FLOWER_LIGHTS_ON_TIME),
+                DEFAULT_PP_FLOWER_LIGHTS_ON_TIME,
+            )
+            return hours, on_time, "pp_flower"
+
+        # PHOTOPERIOD_VEG_STAGES, or any future stage not yet categorised —
+        # veg is the safer default (longer photoperiod, not flower-triggering).
+        hours = float(self._get(CONF_PP_VEG_HOURS, DEFAULT_PP_VEG_HOURS))
+        on_time = _parse_hhmm(
+            self._get(CONF_PP_VEG_LIGHTS_ON_TIME, DEFAULT_PP_VEG_LIGHTS_ON_TIME),
+            DEFAULT_PP_VEG_LIGHTS_ON_TIME,
+        )
+        return hours, on_time, "pp_veg"
+
+    def _effective_ramp_minutes(self, light_id: Optional[str]) -> float:
+        """Return the sunrise/sunset ramp duration in minutes, or 0.0 if the
+        ramp is disabled or the mapped entity can't dim (switch domain)."""
+        if not bool(self._get(CONF_RAMP_ENABLED, DEFAULT_RAMP_ENABLED)):
+            return 0.0
+        domain = light_id.split(".")[0] if light_id else ""
+        if domain != "light":
+            return 0.0  # switch-domain fixtures can't dim — auto-disabled
+        preset = self._get(CONF_RAMP_PRESET, DEFAULT_RAMP_PRESET)
+        if preset == RAMP_PRESET_CUSTOM:
+            return float(self._get(CONF_SUNRISE_RAMP_MIN, DEFAULT_SUNRISE_RAMP_MIN))
+        return RAMP_PRESET_MINUTES.get(
+            preset, RAMP_PRESET_MINUTES[DEFAULT_RAMP_PRESET]
+        )
+
+    def _light_schedule_multiplier(self, light_id: Optional[str]) -> float:
+        """Return 0-100: how far through the on/ramp/off window "now" is.
+
+        100 = fully on, 0 = off (including the entire Drying stage — zero
+        hours, always 0). In between during a sunrise/sunset ramp window.
+        Multiplies against light_intensity_pct (the stage's brightness
+        ceiling) to get the actually-applied brightness.
+        """
+        hours, on_time, _ = self._light_schedule_params()
+        if hours <= 0:
+            return 0.0
+        if hours >= 24:
+            return 100.0
+
+        now_t = dt_util.now().time()
+        on_minutes = on_time.hour * 60 + on_time.minute
+        now_minutes = now_t.hour * 60 + now_t.minute
+        # Minutes elapsed since on_time, correctly wrapping past midnight —
+        # unlike the tariff windows' known limitation, a light schedule
+        # commonly does cross midnight depending on the chosen on-time.
+        elapsed = (now_minutes - on_minutes) % (24 * 60)
+        duration = hours * 60.0
+        if elapsed >= duration:
+            return 0.0
+
+        ramp_minutes = self._effective_ramp_minutes(light_id)
+        if ramp_minutes > 0:
+            if elapsed < ramp_minutes:
+                return round(100.0 * elapsed / ramp_minutes, 1)
+            remaining = duration - elapsed
+            if remaining < ramp_minutes:
+                return round(100.0 * remaining / ramp_minutes, 1)
+        return 100.0
+
+    async def _apply_grow_light_schedule(self, light_id: str, applied_pct: float) -> None:
+        """Push a schedule-computed brightness to the grow light entity.
+
+        Single choke point for every grow-light state change this loop
+        makes, so the HID/ballast hot-restrike lockout can never be
+        bypassed — applies to scheduled transitions and any other caller
+        that routes through here alike.
+        """
+        state = self.hass.states.get(light_id)
+        currently_on = state is not None and state.state == "on"
+
+        now = dt_util.utcnow()
+        if currently_on:
+            self._light_off_since = None
+        elif self._light_off_since is None:
+            self._light_off_since = now
+
+        wants_on = applied_pct > 0
+        is_hid = self._get(CONF_ZONE2_LIGHT_TYPE) == LIGHT_HID
+
+        if is_hid and wants_on and not currently_on and self._light_off_since is not None:
+            elapsed_min = (now - self._light_off_since).total_seconds() / 60.0
+            if elapsed_min < DEFAULT_HID_RESTRIKE_LOCKOUT_MIN:
+                if not self._hid_restrike_delay_logged:
+                    _LOGGER.warning(
+                        "Helix Cultivate: delaying HID/ballast restrike for %s — "
+                        "off for %.1f of %.0f required cool-down minutes. Will "
+                        "retry once the lockout clears.",
+                        light_id, elapsed_min, DEFAULT_HID_RESTRIKE_LOCKOUT_MIN,
+                    )
+                    self._hid_restrike_delay_logged = True
+                return
+        self._hid_restrike_delay_logged = False
+
+        domain = light_id.split(".")[0]
+        clamped = max(0.0, min(100.0, applied_pct))
+        try:
+            if domain == "light":
+                if clamped <= 0:
+                    await self.hass.services.async_call(
+                        "light", "turn_off", {"entity_id": light_id}
+                    )
+                else:
+                    brightness = int(round(clamped / 100.0 * 255))
+                    await self.hass.services.async_call(
+                        "light", "turn_on",
+                        {"entity_id": light_id, "brightness": brightness},
+                    )
+            elif domain == "switch":
+                await self.hass.services.async_call(
+                    "switch", "turn_on" if clamped >= 50 else "turn_off",
+                    {"entity_id": light_id},
+                )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "Helix Cultivate: failed to apply grow light schedule to %s: %s",
+                light_id, exc,
+            )
+            return
+
+        self._light_applied_pct = clamped
+
+    async def _control_light_schedule(self) -> None:
+        """Drive the grow-light on/off/ramp schedule for this tick."""
+        light_id: Optional[str] = self._get(CONF_ZONE2_GROW_LIGHT)
+        if not light_id:
+            self._light_applied_pct = 0.0
+            return
+        multiplier = self._light_schedule_multiplier(light_id)
+        applied_pct = round(self.light_intensity_pct * multiplier / 100.0, 1)
+        await self._apply_grow_light_schedule(light_id, applied_pct)
+
     # ── DLI accumulation ─────────────────────────────────────────────────────
 
+    def _estimate_ppfd(self) -> float:
+        """Estimate current PPFD [μmol/m²/s] from wattage × efficacy ×
+        dimming% ÷ canopy area — the DLI fallback used only when no physical
+        PAR/DLI sensor is mapped (see _accumulate_dli). Integrates against
+        the actual just-applied brightness (_light_applied_pct), so ramp
+        windows contribute proportionally rather than as binary on/off.
+        """
+        wattage = float(self._get(CONF_LIGHT_WATTAGE_W, DEFAULT_LIGHT_WATTAGE_W))
+        if wattage <= 0:
+            return 0.0
+        light_type = self._get(CONF_ZONE2_LIGHT_TYPE)
+        default_efficacy = FIXTURE_EFFICACY_UMOL_PER_J.get(
+            light_type, FIXTURE_EFFICACY_UMOL_PER_J[LIGHT_LED]
+        )
+        efficacy = float(self._get(CONF_LIGHT_EFFICACY_UMOL_PER_J, default_efficacy))
+        area_m2 = float(self._get("zone2_width_m", 1.2)) * float(self._get("zone2_depth_m", 1.2))
+        if area_m2 <= 0:
+            return 0.0
+        dimming_frac = max(0.0, min(1.0, self._light_applied_pct / 100.0))
+        if dimming_frac <= 0:
+            return 0.0
+        total_umol_per_s = wattage * efficacy * dimming_frac
+        return total_umol_per_s / area_m2
+
     def _accumulate_dli(self, interval_sec: float) -> None:
-        """Accumulate DLI from PAR sensor or skip gracefully if absent."""
+        """Accumulate DLI — always prefers a real PAR/DLI sensor when mapped;
+        never overrides one with the estimate. Falls back to _estimate_ppfd()
+        only when no sensor is mapped, so this feature works identically
+        with or without one (B7)."""
         dli_sensor_id: Optional[str] = self._get(CONF_DLI_SENSOR)
-        if not dli_sensor_id or not self._lights_on():
-            return
-        ppfd = self._read_sensor(dli_sensor_id)
-        if ppfd is None:
-            return
+        if dli_sensor_id:
+            if not self._lights_on():
+                return
+            ppfd = self._read_sensor(dli_sensor_id)
+            if ppfd is None:
+                return
+        else:
+            ppfd = self._estimate_ppfd()
+            if ppfd <= 0:
+                return
         increment = ppfd * interval_sec / 1_000_000.0
         if self.data:
             self.data[NS_ENERGY]["dli_today_mol"] = (
@@ -829,7 +1122,7 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 import math
 
                 t = sm_temp if sm_temp is not None else self.temp_setpoint
-                offset = float(self._get(CONF_LEAF_TEMP_OFFSET_C, DEFAULT_LEAF_TEMP_OFFSET_C))
+                offset = self.effective_leaf_temp_offset_c()
                 svp_leaf = 0.6108 * math.exp(17.27 * (t + offset) / (t + offset + 237.3))
                 svp_air = 0.6108 * math.exp(17.27 * t / (t + 237.3))
                 mid_vpd = (vpd_min + vpd_max) / 2.0
@@ -844,6 +1137,10 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         await self._maybe_trigger_snapshot()
+
+        # ── Light schedule (must run before DLI accumulation — the estimation
+        #    fallback below integrates against the brightness this just applied) ──
+        await self._control_light_schedule()
 
         # ── Accumulate energy ──────────────────────────────────────────────────
         self._accumulate_dli(COORDINATOR_UPDATE_INTERVAL.total_seconds())
@@ -957,6 +1254,12 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "canopy_temp_spread_c": self._canopy_temp_spread,
                 "canopy_rh_spread_pct": self._canopy_rh_spread,
                 "canopy_uniformity_insight": self._canopy_uniformity_insight,
+                # Outdoor conditions (local weather station override applied
+                # server-side if mapped — see climate_engine._outdoor_temp_c)
+                "outdoor_temp_c": climate_state.get("outdoor_temp_c"),
+                "outdoor_rh_pct": climate_state.get("outdoor_rh_pct"),
+                # Light schedule engine
+                "light_applied_pct": self._light_applied_pct,
             },
             NS_LIGHTING: {
                 "intensity_pct": self.light_intensity_pct,

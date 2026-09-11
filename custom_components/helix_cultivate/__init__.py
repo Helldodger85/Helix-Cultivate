@@ -46,6 +46,15 @@ VALID_SETTINGS_FIELD_KEYS: frozenset[str] = frozenset({
     "zone2_width_m", "zone2_depth_m", "zone2_height_m", "zone2_plant_count",
     "mid_canopy_sensor_enabled", "lower_canopy_sensor_enabled",
     "mid_canopy_fan_enabled", "lower_canopy_fan_enabled",
+    # Lighting & DLI engine (Phase 1.5) — growth mode/schedule/ramp settings,
+    # saved as a batch from the Grow Space card's Lighting & Growth Schedule
+    # form rather than as live HA number/select entities.
+    "growth_mode",
+    "af_light_hours", "af_lights_on_time",
+    "pp_veg_hours", "pp_veg_lights_on_time",
+    "pp_flower_hours", "pp_flower_lights_on_time",
+    "ramp_enabled", "ramp_preset",
+    "light_wattage_w",
 })
 
 PLATFORMS: list[Platform] = [
@@ -57,6 +66,48 @@ PLATFORMS: list[Platform] = [
 
 
 # ── Entry migration ───────────────────────────────────────────────────────────
+
+def _rename_domain_entities_to_stable_key(
+    hass: HomeAssistant, config_entry: ConfigEntry, domain: str
+) -> int:
+    """Rename every entity of `domain` on this config entry so its entity_id
+    matches sensor.{DOMAIN}_{key} / select.{DOMAIN}_{key} — i.e. the stable
+    entity_description key both HelixSensor and HelixSelect now pin
+    entity_id to directly, rather than whatever HA's name-derived slug
+    happened to produce before that fix. Skips (with a warning, not an
+    error) any rename whose target entity_id is already occupied. Only
+    entity_id changes — unique_id, the registry row's internal id, and
+    recorder history/statistics are preserved by entity_registry's
+    async_update_entity. Returns the number of entities actually renamed.
+    """
+    ent_reg = er.async_get(hass)
+    unique_id_prefix = f"{config_entry.entry_id}_"
+    renamed = 0
+    for entity_entry in list(
+        er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
+    ):
+        if (
+            entity_entry.domain != domain
+            or entity_entry.platform != DOMAIN
+            or not entity_entry.unique_id.startswith(unique_id_prefix)
+        ):
+            continue
+        key = entity_entry.unique_id[len(unique_id_prefix):]
+        new_entity_id = f"{domain}.{DOMAIN}_{key}"
+        if entity_entry.entity_id == new_entity_id:
+            continue
+        if ent_reg.async_get(new_entity_id) is not None:
+            _LOGGER.warning(
+                "Helix Cultivate: skipped renaming %s to %s — target "
+                "entity_id is already in use",
+                entity_entry.entity_id,
+                new_entity_id,
+            )
+            continue
+        ent_reg.async_update_entity(entity_entry.entity_id, new_entity_id=new_entity_id)
+        renamed += 1
+    return renamed
+
 
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Migrate config entry to the current schema version.
@@ -82,6 +133,14 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
     unique_id, so upgrading installs would otherwise keep the mismatched,
     "—"-forever entity_ids permanently. Rename them explicitly via the entity
     registry (entity_id only — unique_id/history/statistics are unaffected).
+
+    v1.4 migration: CONF_GROW_LIGHT/CONF_LIGHT_TYPE renamed to
+    CONF_ZONE2_GROW_LIGHT/CONF_ZONE2_LIGHT_TYPE for consistency with every
+    other Zone 2 hardware key. Existing values are copied to the new keys.
+
+    v1.5 migration: the same entity_id-pinning fix and rename as v1.3,
+    extended to select entities (HelixSelect in select.py) — several of
+    which have the identical name-vs-key slug mismatch sensors had.
     """
     from .const import (  # local import avoids circular at module level
         CONF_ZONE1_AC, CONF_ZONE2_AC,
@@ -173,38 +232,47 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
             # whatever the pre-fix, name-derived slug happened to be. Only
             # entity_id changes — unique_id, the registry row's internal id,
             # and recorder history/statistics are preserved.
-            ent_reg = er.async_get(hass)
-            unique_id_prefix = f"{config_entry.entry_id}_"
-            renamed = 0
-            for entity_entry in list(
-                er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
-            ):
-                if (
-                    entity_entry.domain != "sensor"
-                    or entity_entry.platform != DOMAIN
-                    or not entity_entry.unique_id.startswith(unique_id_prefix)
-                ):
-                    continue
-                key = entity_entry.unique_id[len(unique_id_prefix):]
-                new_entity_id = f"sensor.{DOMAIN}_{key}"
-                if entity_entry.entity_id == new_entity_id:
-                    continue
-                if ent_reg.async_get(new_entity_id) is not None:
-                    _LOGGER.warning(
-                        "Helix Cultivate: skipped renaming %s to %s during v1.3 "
-                        "migration — target entity_id is already in use",
-                        entity_entry.entity_id,
-                        new_entity_id,
-                    )
-                    continue
-                ent_reg.async_update_entity(
-                    entity_entry.entity_id, new_entity_id=new_entity_id
-                )
-                renamed += 1
+            renamed = _rename_domain_entities_to_stable_key(hass, config_entry, "sensor")
             _LOGGER.warning(
                 "Helix Cultivate: migrated entry to v1.3 — renamed %d sensor "
                 "entity_id(s) to their stable key so dashboard cards find them "
                 "again; history and statistics were preserved for each rename.",
+                renamed,
+            )
+
+        if current_minor < 4:
+            # v1.3 → v1.4: CONF_GROW_LIGHT/CONF_LIGHT_TYPE ("grow_light",
+            # "light_type") renamed to CONF_ZONE2_GROW_LIGHT/
+            # CONF_ZONE2_LIGHT_TYPE ("zone2_grow_light", "zone2_light_type")
+            # for consistency with every other Zone 2 hardware key. Copy any
+            # existing values across rather than dropping them — old keys are
+            # left in place (harmless, unread by current code) rather than
+            # deleted, since deleting is not needed for correctness here.
+            for old_key, new_key in (
+                ("grow_light", "zone2_grow_light"),
+                ("light_type", "zone2_light_type"),
+            ):
+                if old_key in new_data and new_key not in new_data:
+                    new_data[new_key] = new_data[old_key]
+                if old_key in new_opts and new_key not in new_opts:
+                    new_opts[new_key] = new_opts[old_key]
+            _LOGGER.info(
+                "Helix Cultivate: migrated entry to v1.4 — copied grow_light/"
+                "light_type values to their zone2-prefixed key names."
+            )
+
+        if current_minor < 5:
+            # v1.4 → v1.5: same entity_id-pinning fix as v1.3, extended to
+            # select entities — several (progression_mode, light_type,
+            # topology, per-tier fan control modes) have a `name` that
+            # doesn't slugify back to their key, so the frontend's
+            # select.helix_cultivate_{key} calls were silently hitting a
+            # nonexistent entity. See HelixSelect in select.py.
+            renamed = _rename_domain_entities_to_stable_key(hass, config_entry, "select")
+            _LOGGER.warning(
+                "Helix Cultivate: migrated entry to v1.5 — renamed %d select "
+                "entity_id(s) to their stable key; history and statistics "
+                "were preserved for each rename.",
                 renamed,
             )
 

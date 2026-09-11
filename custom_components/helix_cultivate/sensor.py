@@ -40,6 +40,33 @@ from .const import (
     SENSOR_UPPER_CANOPY_TEMP,
     SENSOR_UPPER_ENTHALPY,
     STAGE_LABELS,
+    # Outdoor conditions
+    CONF_OUTDOOR_WEATHER_ENTITY,
+    CONF_LOCAL_WEATHER_STATION_ENTITY,
+    # Lighting & DLI engine (Phase 1.5)
+    CONF_ZONE2_GROW_LIGHT,
+    CONF_ZONE2_LIGHT_TYPE,
+    LIGHT_LED,
+    CONF_GROWTH_MODE,
+    DEFAULT_GROWTH_MODE,
+    CONF_AF_LIGHT_HOURS,
+    DEFAULT_AF_LIGHT_HOURS,
+    CONF_AF_LIGHTS_ON_TIME,
+    DEFAULT_AF_LIGHTS_ON_TIME,
+    CONF_PP_VEG_HOURS,
+    DEFAULT_PP_VEG_HOURS,
+    CONF_PP_VEG_LIGHTS_ON_TIME,
+    DEFAULT_PP_VEG_LIGHTS_ON_TIME,
+    CONF_PP_FLOWER_HOURS,
+    DEFAULT_PP_FLOWER_HOURS,
+    CONF_PP_FLOWER_LIGHTS_ON_TIME,
+    DEFAULT_PP_FLOWER_LIGHTS_ON_TIME,
+    CONF_RAMP_ENABLED,
+    DEFAULT_RAMP_ENABLED,
+    CONF_RAMP_PRESET,
+    DEFAULT_RAMP_PRESET,
+    CONF_LIGHT_WATTAGE_W,
+    DEFAULT_LIGHT_WATTAGE_W,
 )
 from .coordinator import HelixCoordinator
 
@@ -321,6 +348,42 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             attrs["zone2_depth_m"] = self.coordinator._get("zone2_depth_m", 1.2)
             attrs["zone2_height_m"] = self.coordinator._get("zone2_height_m", 2.0)
             attrs["zone2_plant_count"] = self.coordinator._get("zone2_plant_count", 4)
+            # Outdoor conditions (local weather station override applied
+            # server-side if mapped)
+            attrs["outdoor_weather_entity"] = self.coordinator._get(CONF_OUTDOOR_WEATHER_ENTITY)
+            attrs["local_weather_station_entity"] = self.coordinator._get(
+                CONF_LOCAL_WEATHER_STATION_ENTITY
+            )
+            attrs["outdoor_temp_c"] = climate.get("outdoor_temp_c")
+            attrs["outdoor_rh_pct"] = climate.get("outdoor_rh_pct")
+            # Lighting & DLI engine (Phase 1.5)
+            attrs["zone2_grow_light"] = self.coordinator._get(CONF_ZONE2_GROW_LIGHT)
+            attrs["zone2_light_type"] = self.coordinator._get(CONF_ZONE2_LIGHT_TYPE, LIGHT_LED)
+            attrs["light_applied_pct"] = climate.get("light_applied_pct")
+            attrs["growth_mode"] = self.coordinator._get(CONF_GROWTH_MODE, DEFAULT_GROWTH_MODE)
+            attrs["af_light_hours"] = self.coordinator._get(
+                CONF_AF_LIGHT_HOURS, DEFAULT_AF_LIGHT_HOURS
+            )
+            attrs["af_lights_on_time"] = self.coordinator._get(
+                CONF_AF_LIGHTS_ON_TIME, DEFAULT_AF_LIGHTS_ON_TIME
+            )
+            attrs["pp_veg_hours"] = self.coordinator._get(
+                CONF_PP_VEG_HOURS, DEFAULT_PP_VEG_HOURS
+            )
+            attrs["pp_veg_lights_on_time"] = self.coordinator._get(
+                CONF_PP_VEG_LIGHTS_ON_TIME, DEFAULT_PP_VEG_LIGHTS_ON_TIME
+            )
+            attrs["pp_flower_hours"] = self.coordinator._get(
+                CONF_PP_FLOWER_HOURS, DEFAULT_PP_FLOWER_HOURS
+            )
+            attrs["pp_flower_lights_on_time"] = self.coordinator._get(
+                CONF_PP_FLOWER_LIGHTS_ON_TIME, DEFAULT_PP_FLOWER_LIGHTS_ON_TIME
+            )
+            attrs["ramp_enabled"] = self.coordinator._get(CONF_RAMP_ENABLED, DEFAULT_RAMP_ENABLED)
+            attrs["ramp_preset"] = self.coordinator._get(CONF_RAMP_PRESET, DEFAULT_RAMP_PRESET)
+            attrs["light_wattage_w"] = self.coordinator._get(
+                CONF_LIGHT_WATTAGE_W, DEFAULT_LIGHT_WATTAGE_W
+            )
 
         if key == "cycle_cost":
             attrs["cycle_kwh"] = (self.coordinator.data or {}).get(NS_ENERGY, {}).get("cycle_kwh", 0.0)

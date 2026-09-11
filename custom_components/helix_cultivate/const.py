@@ -7,7 +7,7 @@ from typing import Any
 # ── Integration identity ─────────────────────────────────────────────────────
 DOMAIN: str = "helix_cultivate"
 CONFIG_VERSION: int = 1
-CONFIG_MINOR_VERSION: int = 3
+CONFIG_MINOR_VERSION: int = 5
 
 # ── Coordinator ──────────────────────────────────────────────────────────────
 COORDINATOR_UPDATE_INTERVAL: timedelta = timedelta(seconds=30)
@@ -233,6 +233,102 @@ LIGHT_TYPE_LABELS: dict[str, str] = {
     LIGHT_SUPPLEMENTAL: "Supplemental",
 }
 
+# Default leaf-temperature offset per fixture type (°C, leaf below air temp).
+# Applied automatically based on zone2_light_type; overridden unconditionally
+# by a manually-persisted CONF_LEAF_TEMP_OFFSET_C (see
+# HelixCoordinator.effective_leaf_temp_offset_c).
+FIXTURE_LEAF_OFFSET_DEFAULTS: dict[str, float] = {
+    LIGHT_LED: -2.0,
+    LIGHT_FULL_SPECTRUM: -2.5,
+    LIGHT_HID: -4.0,
+    LIGHT_SUPPLEMENTAL: -1.0,
+}
+
+# Default photosynthetic efficacy per fixture type (μmol/J), used by the DLI
+# estimation fallback (B7) when no physical PAR/DLI sensor is mapped.
+FIXTURE_EFFICACY_UMOL_PER_J: dict[str, float] = {
+    LIGHT_LED: 2.7,
+    LIGHT_FULL_SPECTRUM: 2.5,
+    LIGHT_HID: 1.7,
+    LIGHT_SUPPLEMENTAL: 2.0,
+}
+
+# Minutes an HID/ballast fixture must stay off before it may be re-struck —
+# real HID arc tubes need to cool before they can reliably restrike. Reuses
+# the anti-short-cycle dwell-timer pattern (see _last_compressor_off).
+DEFAULT_HID_RESTRIKE_LOCKOUT_MIN: float = 15.0
+
+# ── Growth mode (autoflower vs. photoperiod) ─────────────────────────────────
+CONF_GROWTH_MODE: str = "growth_mode"
+GROWTH_MODE_AUTOFLOWER: str = "autoflower"
+GROWTH_MODE_PHOTOPERIOD: str = "photoperiod"
+GROWTH_MODE_OPTIONS: list[str] = [GROWTH_MODE_AUTOFLOWER, GROWTH_MODE_PHOTOPERIOD]
+GROWTH_MODE_LABELS: dict[str, str] = {
+    GROWTH_MODE_AUTOFLOWER: "Autoflower (constant schedule)",
+    GROWTH_MODE_PHOTOPERIOD: "Photoperiod (Veg / Flower schedules)",
+}
+DEFAULT_GROWTH_MODE: str = GROWTH_MODE_PHOTOPERIOD
+
+# Autoflower: one constant schedule for the entire grow, regardless of stage.
+CONF_AF_LIGHT_HOURS: str = "af_light_hours"
+DEFAULT_AF_LIGHT_HOURS: float = 18.0
+CONF_AF_LIGHTS_ON_TIME: str = "af_lights_on_time"
+DEFAULT_AF_LIGHTS_ON_TIME: str = "06:00"
+
+# Photoperiod: separate Vegetative and Flowering schedules. The stage-group
+# mapping below is fixed horticultural consensus, not user-configurable —
+# Stretch is the plant's response *after* the light flip, so it belongs to
+# the Flowering group. Users wanting a different mapping can still do so via
+# recipe export/import YAML.
+CONF_PP_VEG_HOURS: str = "pp_veg_hours"
+DEFAULT_PP_VEG_HOURS: float = 18.0
+CONF_PP_VEG_LIGHTS_ON_TIME: str = "pp_veg_lights_on_time"
+DEFAULT_PP_VEG_LIGHTS_ON_TIME: str = "06:00"
+
+CONF_PP_FLOWER_HOURS: str = "pp_flower_hours"
+DEFAULT_PP_FLOWER_HOURS: float = 12.0
+CONF_PP_FLOWER_LIGHTS_ON_TIME: str = "pp_flower_lights_on_time"
+DEFAULT_PP_FLOWER_LIGHTS_ON_TIME: str = "06:00"
+
+PHOTOPERIOD_VEG_STAGES: frozenset[str] = frozenset({
+    STAGE_GERMINATION, STAGE_SEEDLING, STAGE_EARLY_VEG, STAGE_LATE_VEG,
+})
+PHOTOPERIOD_FLOWER_STAGES: frozenset[str] = frozenset({
+    STAGE_STRETCH, STAGE_PEAK_FLOWER, STAGE_RIPENING,
+})
+
+# ── Sunrise/sunset dimming ramp ───────────────────────────────────────────────
+CONF_RAMP_ENABLED: str = "ramp_enabled"
+DEFAULT_RAMP_ENABLED: bool = True
+
+CONF_RAMP_PRESET: str = "ramp_preset"
+RAMP_PRESET_GENTLE: str = "gentle"
+RAMP_PRESET_STANDARD: str = "standard"
+RAMP_PRESET_FAST: str = "fast"
+RAMP_PRESET_CUSTOM: str = "custom"
+RAMP_PRESET_OPTIONS: list[str] = [
+    RAMP_PRESET_GENTLE, RAMP_PRESET_STANDARD, RAMP_PRESET_FAST, RAMP_PRESET_CUSTOM,
+]
+RAMP_PRESET_LABELS: dict[str, str] = {
+    RAMP_PRESET_GENTLE: "Gentle (~30 min)",
+    RAMP_PRESET_STANDARD: "Standard (~15 min)",
+    RAMP_PRESET_FAST: "Fast (~5 min)",
+    RAMP_PRESET_CUSTOM: "Custom",
+}
+# Fixed durations for the named presets; "custom" instead uses the existing
+# CONF_SUNRISE_RAMP_MIN number value.
+RAMP_PRESET_MINUTES: dict[str, float] = {
+    RAMP_PRESET_GENTLE: 30.0,
+    RAMP_PRESET_STANDARD: 15.0,
+    RAMP_PRESET_FAST: 5.0,
+}
+DEFAULT_RAMP_PRESET: str = RAMP_PRESET_STANDARD
+
+# ── DLI estimation fallback (used only when no CONF_DLI_SENSOR is mapped) ────
+CONF_LIGHT_WATTAGE_W: str = "light_wattage_w"
+DEFAULT_LIGHT_WATTAGE_W: float = 600.0
+CONF_LIGHT_EFFICACY_UMOL_PER_J: str = "light_efficacy_umol_per_j"
+
 # ── Drying zone fixed targets ────────────────────────────────────────────────
 DRYING_TARGET_TEMP_C: float = 15.5   # Fixed 60/60 drying profile target temp
 DRYING_TARGET_RH_PCT: float = 60.0   # Fixed 60/60 drying profile target RH
@@ -350,8 +446,16 @@ CONF_LOWER_CANOPY_SENSOR_ENABLED: str = "lower_canopy_sensor_enabled"
 CONF_MID_CANOPY_FAN_ENABLED: str = "mid_canopy_fan_enabled"
 CONF_LOWER_CANOPY_FAN_ENABLED: str = "lower_canopy_fan_enabled"
 
-# Optional outdoor weather entity for feedforward MPC
+# Optional outdoor weather entity for feedforward MPC. Global — configurable
+# and used regardless of topology (Zone 2/Primary Grow Space always exists).
 CONF_OUTDOOR_WEATHER_ENTITY: str = "outdoor_weather_entity"
+
+# Optional local weather station entity — a ground-truth override for
+# *current* conditions (temperature/humidity) only. The forecast entity
+# above still drives outlook/feedforward regardless of whether this is set;
+# same override precedence as a canopy sensor tier (prefer the more direct
+# local reading over the broader area forecast entity's "current" reading).
+CONF_LOCAL_WEATHER_STATION_ENTITY: str = "local_weather_station_entity"
 
 # Exhaust
 CONF_EXHAUST_FAN: str = "exhaust_fan"
@@ -410,8 +514,8 @@ CONF_BREEZE_ENABLED: str = "breeze_enabled"
 CONF_BREEZE_VARIANCE: str = "breeze_variance"
 
 # Lighting
-CONF_GROW_LIGHT: str = "grow_light"
-CONF_LIGHT_TYPE: str = "light_type"
+CONF_ZONE2_GROW_LIGHT: str = "zone2_grow_light"
+CONF_ZONE2_LIGHT_TYPE: str = "zone2_light_type"
 CONF_LIGHT_DIMMABLE: str = "light_dimmable"
 CONF_SUNRISE_RAMP_MIN: str = "sunrise_ramp_min"
 CONF_DLI_SENSOR: str = "dli_sensor"
@@ -590,10 +694,11 @@ ALL_VALID_ZONE_DEVICE_KEYS: frozenset[str] = frozenset({
     CONF_ZONE2_IS_REVERSE_CYCLE,
     CONF_ZONE2_HUMIDIFIER,
     CONF_ZONE2_DEHUMIDIFIER,
-    CONF_GROW_LIGHT,
+    CONF_ZONE2_GROW_LIGHT,
     CONF_DLI_SENSOR,
     CONF_GROW_CAMERA,
     CONF_OUTDOOR_WEATHER_ENTITY,
+    CONF_LOCAL_WEATHER_STATION_ENTITY,
     # Zone 1 — Conditioning Room
     CONF_LUNG_TEMP_SENSOR,
     CONF_LUNG_HUMIDITY_SENSOR,

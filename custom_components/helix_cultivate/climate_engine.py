@@ -33,7 +33,6 @@ from .const import (
     CONF_EXHAUST_FAN,
     CONF_EXHAUST_MIN_PCT,
     CONF_HEATER_CUTOFF_C,
-    CONF_LEAF_TEMP_OFFSET_C,
     CONF_LOWER_HUMIDITY_OFFSET,
     CONF_LOWER_TEMP_OFFSET,
     CONF_LUNG_HUMIDITY_OFFSET,
@@ -41,6 +40,8 @@ from .const import (
     CONF_MID_HUMIDITY_OFFSET,
     CONF_MID_TEMP_OFFSET,
     CONF_OUTDOOR_WEATHER_ENTITY,
+    CONF_LOCAL_WEATHER_STATION_ENTITY,
+    CONF_ZONE2_GROW_LIGHT,
     CONF_PRIMARY_HUMIDITY_OFFSET,
     CONF_PRIMARY_TEMP_OFFSET,
     CONF_SAFETY_HIGH_RH_PCT,
@@ -70,7 +71,6 @@ from .const import (
     DEFAULT_EXHAUST_MIN_PCT,
     DEFAULT_EXHAUST_SAFE_FLOOR_PCT,
     DEFAULT_HEATER_CUTOFF_C,
-    DEFAULT_LEAF_TEMP_OFFSET_C,
     DEFAULT_SAFETY_HIGH_RH_PCT,
     DEFAULT_SAFETY_HIGH_TEMP_C,
     DEFAULT_SAFETY_LOW_RH_PCT,
@@ -549,10 +549,37 @@ class ClimateEngine:
                 entity_id, pct, exc,
             )
 
-    # ── Outdoor temperature helper ────────────────────────────────────────────
+    # ── Outdoor conditions helpers ─────────────────────────────────────────────
+    #
+    # CONF_LOCAL_WEATHER_STATION_ENTITY is a ground-truth override for CURRENT
+    # conditions only — same override precedence as a canopy sensor tier
+    # (prefer the direct local reading over the broader-area weather/forecast
+    # entity's own "current" reading). The forecast entity always drives
+    # outlook/feedforward regardless of whether a local station is mapped —
+    # a local station has no forecast data of its own.
+
+    def _local_station_state(self) -> Optional[Any]:
+        station_id: Optional[str] = self._get(CONF_LOCAL_WEATHER_STATION_ENTITY)
+        if not station_id:
+            return None
+        return self._coord.hass.states.get(station_id)
 
     def _outdoor_temp_c(self) -> Optional[float]:
-        """Return the current outdoor temperature from the weather entity, or None."""
+        """Return the current outdoor temperature, or None.
+
+        Prefers the local weather station override when mapped and its
+        reading is available; falls back to the forecast weather entity's
+        own current-temperature attribute.
+        """
+        local = self._local_station_state()
+        if local is not None:
+            try:
+                temp = local.attributes.get("temperature")
+                if temp is not None:
+                    return float(temp)
+            except (TypeError, ValueError):
+                pass
+
         weather_id: Optional[str] = self._get(CONF_OUTDOOR_WEATHER_ENTITY)
         if not weather_id:
             return None
@@ -564,6 +591,56 @@ class ClimateEngine:
             return float(temp) if temp is not None else None
         except (TypeError, ValueError):
             return None
+
+    def _outdoor_rh_pct(self) -> Optional[float]:
+        """Return the current outdoor relative humidity, or None.
+
+        Same local-station-override precedence as _outdoor_temp_c().
+        """
+        local = self._local_station_state()
+        if local is not None:
+            try:
+                rh = local.attributes.get("humidity")
+                if rh is not None:
+                    return float(rh)
+            except (TypeError, ValueError):
+                pass
+
+        weather_id: Optional[str] = self._get(CONF_OUTDOOR_WEATHER_ENTITY)
+        if not weather_id:
+            return None
+        state = self._coord.hass.states.get(weather_id)
+        if state is None:
+            return None
+        try:
+            rh = state.attributes.get("humidity")
+            return float(rh) if rh is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def _fetch_weather_forecast(self, weather_id: str) -> list[dict[str, Any]]:
+        """Fetch forecast entries via the weather.get_forecasts service.
+
+        The old `forecast` state attribute this used to read was removed
+        from HA core (superseded by the get_forecasts service, which returns
+        a per-entity {"forecast": [...]} response — verified against the
+        weather component's current source rather than assumed). Tries
+        hourly resolution first for a tighter near-term feedforward signal,
+        falling back to daily when the entity doesn't support hourly.
+        """
+        for forecast_type in ("hourly", "daily"):
+            try:
+                result = await self._coord.hass.services.async_call(
+                    "weather", "get_forecasts",
+                    {"entity_id": weather_id, "type": forecast_type},
+                    blocking=True, return_response=True,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            forecast = (result or {}).get(weather_id, {}).get("forecast", [])
+            if forecast:
+                return forecast
+        return []
 
     # ── Thermal runaway guard ─────────────────────────────────────────────────
 
@@ -590,7 +667,7 @@ class ClimateEngine:
             threshold,
         )
 
-        grow_light = self._get("grow_light")
+        grow_light = self._get(CONF_ZONE2_GROW_LIGHT)
         await self._set_light_intensity(grow_light, 0.0)
         self._coord.light_intensity_pct = 0.0
 
@@ -724,36 +801,57 @@ class ClimateEngine:
 
     # ── Feedforward MPC via outdoor weather entity ────────────────────────────
 
-    def _feedforward_adjustment(self) -> float:
+    async def _feedforward_adjustment(self) -> float:
         """Return a feedforward exhaust adjustment based on outdoor forecast.
 
-        Returns 0.0 if no weather entity is configured (graceful bypass).
-        Returns +/- percentage points to add to the base exhaust signal.
+        Returns 0.0 if no weather entity is configured, or if the entity
+        doesn't return a usable forecast (graceful bypass either way).
+        Returns +/- percentage points to add to the base exhaust signal,
+        combining a temperature-shift term with a humidity-shift term (a
+        forecast humidity rise erodes dehumidification headroom, so exhaust
+        should start climbing ahead of it rather than reacting after the
+        fact).
         """
         weather_id: Optional[str] = self._get(CONF_OUTDOOR_WEATHER_ENTITY)
         if not weather_id:
             return 0.0
 
-        state = self._coord.hass.states.get(weather_id)
-        if state is None:
+        if self._coord.hass.states.get(weather_id) is None:
+            return 0.0
+
+        forecast = await self._fetch_weather_forecast(weather_id)
+        if not forecast:
             return 0.0
 
         try:
-            forecast = state.attributes.get("forecast", [])
-            if not forecast or len(forecast) < 2:
-                return 0.0
-            future_temp = float(forecast[0].get("temperature", 0))
-            current_temp = float(state.attributes.get("temperature", future_temp))
-            delta = future_temp - current_temp
+            future = forecast[0]
+            future_temp = float(future.get("temperature", 0))
+            current_temp = self._outdoor_temp_c()
+            if current_temp is None:
+                current_temp = future_temp
+            temp_delta = future_temp - current_temp
             # Scale: ±5°C forecast shift → ±10% exhaust pre-correction
-            correction = max(-15.0, min(15.0, delta * 2.0))
+            temp_correction = max(-15.0, min(15.0, temp_delta * 2.0))
+
+            humidity_correction = 0.0
+            future_humidity = future.get("humidity")
+            if future_humidity is not None:
+                current_humidity = self._outdoor_rh_pct()
+                if current_humidity is not None:
+                    humidity_delta = float(future_humidity) - current_humidity
+                    # Scale: ±10% RH forecast shift → ±5% exhaust pre-correction
+                    humidity_correction = max(-10.0, min(10.0, humidity_delta * 0.5))
+
+            correction = temp_correction + humidity_correction
             _LOGGER.debug(
-                "Helix Cultivate: feedforward MPC: outdoor delta=%.1f°C → exhaust correction=%.1f%%",
-                delta,
+                "Helix Cultivate: feedforward MPC: outdoor ΔT=%.1f°C ΔRH=%s%% → "
+                "exhaust correction=%.1f%%",
+                temp_delta,
+                f"{future_humidity}" if future_humidity is not None else "N/A",
                 correction,
             )
             return correction
-        except (TypeError, ValueError, KeyError):
+        except (TypeError, ValueError, KeyError, IndexError):
             return 0.0
 
     # ── Exhaust fan control ───────────────────────────────────────────────────
@@ -848,7 +946,7 @@ class ClimateEngine:
                     base_pct = min_pct
 
         # ── Feedforward MPC correction ─────────────────────────────────────────
-        ff_correction = self._feedforward_adjustment()
+        ff_correction = await self._feedforward_adjustment()
         final_pct = max(min_pct, min(100.0, base_pct + ff_correction))
 
         # ── Thermal purge floor — sits below the hard thermal runaway 100% cutoff
@@ -1392,7 +1490,7 @@ class ClimateEngine:
 
         if active_stage == STAGE_DRYING and is_unlocked:
             target_temp = self._coord.stage_manager.current_temp_anchor(is_day)
-            offset = float(self._get(CONF_LEAF_TEMP_OFFSET_C, DEFAULT_LEAF_TEMP_OFFSET_C))
+            offset = self._coord.effective_leaf_temp_offset_c()
             svp_leaf = 0.6108 * math.exp(
                 17.27 * (target_temp + offset) / (target_temp + offset + 237.3)
             )
@@ -1666,6 +1764,11 @@ class ClimateEngine:
         return {
             "exhaust_pct": exhaust_pct,
             "thermal_runaway": thermal_runaway,
+            # Outdoor conditions — local weather station override applied if
+            # mapped (see _outdoor_temp_c/_outdoor_rh_pct), exposed for the
+            # dashboard's Ambient/Outdoor card via sensor.py.
+            "outdoor_temp_c": self._outdoor_temp_c(),
+            "outdoor_rh_pct": self._outdoor_rh_pct(),
             # Zone 1
             "zone1_heater_on": zone1_heater_on,
             "zone1_ac_on": zone1_ac_on,

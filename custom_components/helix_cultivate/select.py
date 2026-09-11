@@ -146,8 +146,8 @@ SELECT_DESCRIPTIONS: tuple[HelixSelectDescription, ...] = (
         icon="mdi:lightbulb-cfl",
         options_list=LIGHT_TYPE_OPTIONS,
         label_map=LIGHT_TYPE_LABELS,
-        value_fn=lambda c: c._config.get("light_type", "led"),
-        set_fn=_persistent_setter("light_type"),
+        value_fn=lambda c: c._config.get("zone2_light_type", "led"),
+        set_fn=_persistent_setter("zone2_light_type"),
     ),
 )
 
@@ -178,6 +178,15 @@ class HelixSelect(CoordinatorEntity[HelixCoordinator], SelectEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{coordinator._entry.entry_id}_{description.key}"
+        # Pin entity_id to the stable description key rather than letting HA
+        # derive it from `name` — several of these (e.g. "Stage Progression
+        # Mode" -> progression_mode, "Grow Light Type" -> light_type) don't
+        # slugify back to their key, so the frontend's hardcoded
+        # select.helix_cultivate_{key} calls silently hit a nonexistent
+        # entity. See HelixSensor in sensor.py for the same fix + the v1.3
+        # migration in __init__.py for the equivalent one-time rename this
+        # needs for entities that already exist under the old entity_id.
+        self.entity_id = f"select.{DOMAIN}_{description.key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator._entry.entry_id)},
             "name": "Helix Cultivate",
