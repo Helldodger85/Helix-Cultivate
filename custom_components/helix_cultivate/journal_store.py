@@ -64,6 +64,13 @@ EMPTY_STORE: dict[str, Any] = {
     # close-out once compiled into a GIF. See coordinator.py's
     # _maybe_trigger_snapshot()/close_out_harvest().
     "timelapse_images": [],
+    # Archived energy totals from the most recent Energy & ROI tab Reset
+    # button click OR full harvest close-out, whichever happened last —
+    # {entry_id: {cycle_kwh, cycle_cost_usd, archived_at}}. Overwritten (not
+    # appended) each time, since only the single most recent archive is ever
+    # surfaced as "Previous Cycle". See coordinator.py's reset_energy_cycle()/
+    # close_out_harvest().
+    "previous_cycle_energy": {},
 }
 
 
@@ -267,6 +274,30 @@ class JournalStore:
         ]
         await self._save()
         return sorted(matching, key=lambda r: r["ts"])
+
+    # ── Previous-cycle energy archive (Energy & ROI Reset button) ─────────────
+
+    async def async_set_previous_cycle_energy(
+        self, entry_id: str, cycle_kwh: float, cycle_cost_usd: float
+    ) -> dict[str, Any]:
+        """Archive the just-ended cycle's energy totals as "Previous Cycle",
+        shown on the Energy & ROI tab until the next Reset or harvest
+        close-out. Overwrites any prior archive for this entry — only the
+        single most recent one is ever surfaced, old ones are not kept.
+        """
+        record: dict[str, Any] = {
+            "cycle_kwh": round(cycle_kwh, 3),
+            "cycle_cost_usd": round(cycle_cost_usd, 2),
+            "archived_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._data.setdefault("previous_cycle_energy", {})[entry_id] = record
+        await self._save()
+        return record
+
+    def get_previous_cycle_energy(self, entry_id: str) -> Optional[dict[str, Any]]:
+        """Return the archived Previous Cycle energy record for entry_id, or
+        None if neither a Reset nor a harvest close-out has ever happened."""
+        return self._data.get("previous_cycle_energy", {}).get(entry_id)
 
     @staticmethod
     def _build_timelapse_gif_sync(image_paths: list[str], out_path: str) -> bool:

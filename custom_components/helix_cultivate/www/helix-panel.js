@@ -569,7 +569,9 @@ class HelixSparklineCard extends HTMLElement {
             <div class="l">RH</div>
           </div>
           <div class="reading">
-            <div class="v" style="color:${vCol}">${fVPD(vpd)}</div>
+            ${d.vpd_no_canopy
+              ? `<div class="v" style="color:var(--hx-text2)" title="No plant canopy in this zone">N/A</div>`
+              : `<div class="v" style="color:${vCol}">${fVPD(vpd)}</div>`}
             <div class="l">VPD</div>
           </div>
         </div>
@@ -750,18 +752,18 @@ class HelixTabTelemetry extends HTMLElement {
         </div>
       </div>` : '';
 
-    // Zone glance cards
+    // Zone glance cards. `zone` is a JS property with no attribute
+    // reflection (see HelixSparklineCard's `set zone(z)`), so it can't be
+    // passed as a string-template attribute here — it's wired below via
+    // `.zone = ...`, the same way `.hass =`/`.data =` are assigned elsewhere.
     const z2Card = `
-      <helix-sparkline-card id="spark-tent" zone="🌱 ${d.zone2_name || 'Primary Grow Space'}">
-      </helix-sparkline-card>`;
+      <helix-sparkline-card id="spark-tent"></helix-sparkline-card>`;
 
     const z1Card = condEnabled ? `
-      <helix-sparkline-card id="spark-lung" zone="🌬 ${d.zone1_name || 'Conditioning Room'}">
-      </helix-sparkline-card>` : '';
+      <helix-sparkline-card id="spark-lung"></helix-sparkline-card>` : '';
 
     const dryCard = dryingEnabled ? `
-      <helix-sparkline-card id="spark-dry" zone="🍃 ${d.drying_zone_name || 'Drying Room'}">
-      </helix-sparkline-card>` : '';
+      <helix-sparkline-card id="spark-dry"></helix-sparkline-card>` : '';
 
     // Appliance override chips
     const applianceChips = `
@@ -835,6 +837,7 @@ class HelixTabTelemetry extends HTMLElement {
     const tentSpark = this.shadowRoot.querySelector('#spark-tent');
     if (tentSpark) {
       tentSpark.hass = this._hass;
+      tentSpark.zone = `🌱 ${d.zone2_name || 'Primary Grow Space'}`;
       tentSpark.data = {
         temp: d.upper_temp_c ?? d.mid_temp_c,
         rh: d.upper_rh_pct ?? d.mid_rh_pct,
@@ -851,10 +854,15 @@ class HelixTabTelemetry extends HTMLElement {
       const lungSpark = this.shadowRoot.querySelector('#spark-lung');
       if (lungSpark) {
         lungSpark.hass = this._hass;
+        lungSpark.zone = `🌬 ${d.zone1_name || 'Conditioning Room'}`;
         lungSpark.data = {
           temp: d.lung_temp_c,
           rh: d.lung_rh_pct,
           vpd: null,
+          // VPD is leaf-referenced and the Conditioning Room has no canopy —
+          // this is correct, existing behavior, not a bug. Flag it so the
+          // card can show a clear "N/A" instead of a bare, ambiguous dash.
+          vpd_no_canopy: true,
           vpd_target: vpdTarget,
           temp_entity_id: `sensor.helix_cultivate_lung_temp`,
           rh_entity_id: `sensor.helix_cultivate_lung_rh`,
@@ -866,6 +874,7 @@ class HelixTabTelemetry extends HTMLElement {
       const drySpark = this.shadowRoot.querySelector('#spark-dry');
       if (drySpark) {
         drySpark.hass = this._hass;
+        drySpark.zone = `🍃 ${d.drying_zone_name || 'Drying Room'}`;
         drySpark.data = {
           temp: d.drying_temp_c,
           rh: d.drying_rh_pct,
@@ -897,6 +906,18 @@ const LIGHT_TYPE_LABELS_JS = {
   quantum_board: 'Quantum Board',
 };
 const LIGHT_TYPE_OPTIONS_JS = Object.keys(LIGHT_TYPE_LABELS_JS);
+
+// Mirrors const.py TARIFF_OPTIONS/coordinator._current_tariff_rate()'s real
+// mode semantics — "anytime" (flat rate), "dual" (Peak window + Off-Peak
+// fallback), "triple" (Peak + Shoulder windows + Off-Peak fallback). Off-
+// Peak has no window of its own — it's whatever time isn't Peak (or
+// Shoulder, in Triple).
+const TARIFF_MODE_LABELS_JS = {
+  anytime: 'Anytime (flat rate)',
+  dual: 'Dual (Peak / Off-Peak)',
+  triple: 'Triple (Peak / Shoulder / Off-Peak)',
+};
+const TARIFF_MODE_OPTIONS_JS = Object.keys(TARIFF_MODE_LABELS_JS);
 
 // Mirrors const.py PHOTOPERIOD_FLOWER_STAGES — used client-side only to
 // derive the read-only "which schedule applies" preview; the coordinator is
@@ -1722,6 +1743,37 @@ const DRYING_HW_KEYS = [
   { key: 'drying_ac',              label: 'Drying AC',              domains: ['climate', 'switch'] },
   { key: 'drying_heater',          label: 'Drying Heater',          domains: ['switch', 'climate'] },
   { key: 'drying_light',           label: 'Inspection Light',       domains: ['light', 'switch'] },
+];
+
+// Energy & ROI — 4 EM sensor slots per zone. Each is a plain wattage sensor
+// (not an appliance to switch), so 'sensor' is the only valid domain.
+const ENERGY_ZONE2_EM_KEYS = [
+  { key: 'em_zone2_s1', label: 'Slot 1', domains: ['sensor'] },
+  { key: 'em_zone2_s2', label: 'Slot 2', domains: ['sensor'] },
+  { key: 'em_zone2_s3', label: 'Slot 3', domains: ['sensor'] },
+  { key: 'em_zone2_s4', label: 'Slot 4', domains: ['sensor'] },
+];
+const ENERGY_ZONE1_EM_KEYS = [
+  { key: 'em_zone1_s1', label: 'Slot 1', domains: ['sensor'] },
+  { key: 'em_zone1_s2', label: 'Slot 2', domains: ['sensor'] },
+  { key: 'em_zone1_s3', label: 'Slot 3', domains: ['sensor'] },
+  { key: 'em_zone1_s4', label: 'Slot 4', domains: ['sensor'] },
+];
+const ENERGY_DRYING_EM_KEYS = [
+  { key: 'em_drying_s1', label: 'Slot 1', domains: ['sensor'] },
+  { key: 'em_drying_s2', label: 'Slot 2', domains: ['sensor'] },
+  { key: 'em_drying_s3', label: 'Slot 3', domains: ['sensor'] },
+  { key: 'em_drying_s4', label: 'Slot 4', domains: ['sensor'] },
+];
+const ENERGY_GLOBAL_EM_KEYS = [
+  { key: 'em_global_s1', label: 'Slot 1', domains: ['sensor'] },
+  { key: 'em_global_s2', label: 'Slot 2', domains: ['sensor'] },
+  { key: 'em_global_s3', label: 'Slot 3', domains: ['sensor'] },
+  { key: 'em_global_s4', label: 'Slot 4', domains: ['sensor'] },
+];
+const ENERGY_ALL_EM_KEYS = [
+  ...ENERGY_ZONE2_EM_KEYS, ...ENERGY_ZONE1_EM_KEYS,
+  ...ENERGY_DRYING_EM_KEYS, ...ENERGY_GLOBAL_EM_KEYS,
 ];
 
 function _entitiesForDomains(hass, domains) {
@@ -2885,7 +2937,12 @@ class HelixTabSettings extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
-    this._section = 'modules'; // modules | zone2 | calibration | safety | drying
+    this._section = 'modules'; // modules | zone2 | calibration | safety | drying | energy
+    // Energy & ROI's gear-icon edit mode — the only section here that uses
+    // the hardware-mapping form pattern, so these flags only ever matter
+    // when this._section === 'energy'.
+    this._isEditingHardware = false;
+    this._hwFormBuilt = false;
   }
 
   set hass(h) { this._hass = h; }
@@ -3101,15 +3158,22 @@ class HelixTabSettings extends HTMLElement {
     const h = this._hass;
     const d = this._data || {};
 
+    const zone1On = d.em_zone1_enabled !== false;
+    const zone2On = d.em_zone2_enabled !== false;
+    const dryingOn = d.em_drying_enabled !== false;
+
+    // Disabled zones are fully absent from the live dashboard — not shown-
+    // disabled — same pattern as canopy sensor/fan tier toggles. Global has
+    // no toggle and is never in this list; it gets its own 2-card summary
+    // below instead of a raw 4-slot grid (2.4).
     const emZones = [
-      { label: '🌱 Primary Grow Space', keys: ['em_zone2_s1','em_zone2_s2','em_zone2_s3','em_zone2_s4'] },
-      { label: '🌬 Conditioning Room',  keys: ['em_zone1_s1','em_zone1_s2','em_zone1_s3','em_zone1_s4'] },
-      { label: '🍃 Drying Room',        keys: ['em_drying_s1','em_drying_s2','em_drying_s3','em_drying_s4'] },
-      { label: '🌐 Global / Infrastructure', keys: ['em_global_s1','em_global_s2','em_global_s3','em_global_s4'] },
+      { on: zone2On,  label: '🌱 Primary Grow Space', keys: ['em_zone2_s1','em_zone2_s2','em_zone2_s3','em_zone2_s4'] },
+      { on: zone1On,  label: '🌬 Conditioning Room',  keys: ['em_zone1_s1','em_zone1_s2','em_zone1_s3','em_zone1_s4'] },
+      { on: dryingOn, label: '🍃 Drying Room',        keys: ['em_drying_s1','em_drying_s2','em_drying_s3','em_drying_s4'] },
     ];
 
     let totalW = 0;
-    const emRows = emZones.map(zone => {
+    const emRows = emZones.filter(z => z.on).map(zone => {
       const cells = zone.keys.map(k => {
         const entityId = d[k] ?? null;
         let w = null;
@@ -3128,11 +3192,28 @@ class HelixTabSettings extends HTMLElement {
         </div>`;
     }).join('');
 
-    const tariffMode  = d.tariff_mode ?? 'anytime';
-    const rateDisplay = d.tariff_anytime_rate != null
+    // Global's own direct slots always contribute to Live Load, same as
+    // they always contribute to the aggregate total server-side.
+    ['em_global_s1','em_global_s2','em_global_s3','em_global_s4'].forEach(k => {
+      const entityId = d[k] ?? null;
+      if (entityId && h && h.states[entityId]) {
+        const raw = parseFloat(h.states[entityId].state);
+        if (!isNaN(raw)) totalW += raw;
+      }
+    });
+
+    const tariffModeLabel = TARIFF_MODE_LABELS_JS[d.tariff_mode] || TARIFF_MODE_LABELS_JS.anytime;
+    const rateDisplay = (d.tariff_mode ?? 'anytime') === 'anytime' && d.tariff_anytime_rate != null
       ? `<div><div style="font-size:.7rem;color:var(--hx-text2)">Rate (anytime)</div>
          <div style="font-size:.92rem;font-weight:700">$${fn(d.tariff_anytime_rate, 3)}/kWh</div></div>`
       : '';
+
+    const previousCycleHtml = (d.previous_cycle_kwh != null && d.previous_cycle_cost_usd != null)
+      ? `<div><div style="font-size:.7rem;color:var(--hx-text2)">Previous Cycle</div>
+          <div style="font-size:.92rem;font-weight:700">${fn(d.previous_cycle_kwh,1)} kWh · $${fn(d.previous_cycle_cost_usd,2)}</div></div>`
+      : `<div><div style="font-size:.7rem;color:var(--hx-text2)">Previous Cycle</div>
+          <div style="font-size:.85rem;color:var(--hx-text2)">No reset yet</div></div>`;
+
     const roiHtml = d.harvest_value_per_oz != null
       ? `<div style="margin-top:8px;padding:8px;background:rgba(72,199,142,.1);border-radius:8px;border:1px solid var(--hx-green)">
            💰 Harvest ROI Target: <b style="color:var(--hx-green)">$${fn(d.harvest_value_per_oz, 2)}/oz</b>
@@ -3141,11 +3222,11 @@ class HelixTabSettings extends HTMLElement {
 
     return `
       <div class="card">
-        <div class="card-title">⚡ Energy & ROI</div>
+        <div class="card-title" style="display:flex;align-items:center">⚡ Energy & ROI ${_gearBtnHtml()}</div>
         <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:14px;align-items:center">
           <div>
             <div style="font-size:.7rem;color:var(--hx-text2)">Tariff Mode</div>
-            <div style="font-size:.92rem;font-weight:700">${tariffMode.charAt(0).toUpperCase()+tariffMode.slice(1)}</div>
+            <div style="font-size:.92rem;font-weight:700">${tariffModeLabel}</div>
           </div>
           ${rateDisplay}
           <div>
@@ -3156,10 +3237,166 @@ class HelixTabSettings extends HTMLElement {
             <div style="font-size:.7rem;color:var(--hx-text2)">Cycle Cost</div>
             <div style="font-size:1.1rem;font-weight:800;color:var(--hx-green)">${d.cycle_cost ?? '—'}</div>
           </div>
+          ${previousCycleHtml}
         </div>
         ${emRows}
+        <div style="margin-bottom:10px">
+          <div class="card-title" style="font-size:.78rem;margin-bottom:4px">🌐 Global / Infrastructure</div>
+          <div class="g2">
+            <div class="stat-cell">
+              <div class="val" style="font-size:1.05rem">${fn(d.cycle_kwh ?? 0, 2)} kWh</div>
+              <div class="lbl">Total kWh Used</div>
+            </div>
+            <div class="stat-cell">
+              <div class="val" style="font-size:1.05rem">${d.cycle_cost ?? '—'}</div>
+              <div class="lbl">Total Cost ($)</div>
+            </div>
+          </div>
+        </div>
         ${roiHtml}
+        <div style="display:flex;align-items:center;gap:10px;margin-top:12px">
+          <button id="energy-reset-btn" style="padding:9px 16px;border-radius:8px;border:1px solid var(--hx-border);
+            background:none;color:var(--hx-text);font-weight:600;cursor:pointer">♻ Reset Cycle Totals</button>
+          <span id="energy-reset-status" style="font-size:.75rem;color:var(--hx-text2)"></span>
+        </div>
       </div>`;
+  }
+
+  // ── Energy & ROI gear-icon edit form ────────────────────────────────────
+  // Same hardware-mapping-form pattern as every other zone (_renderHwPicker/
+  // _bindHwPicker/_gearBtnHtml/_bindGearBtn) — hwKeys is passed empty here
+  // since the per-zone grouping (with its enable toggles interleaved) needs
+  // custom layout, so every picker row + toggle is built directly into
+  // extraHtml instead; _bindHwPicker still does the entity-picker wiring by
+  // matching .hw-entity-slot elements wherever they appear.
+  _renderEnergyEditForm() {
+    const d = this._data || {};
+    const hwMap = d.hw_map || {};
+    const zone1On = d.em_zone1_enabled !== false;
+    const zone2On = d.em_zone2_enabled !== false;
+    const dryingOn = d.em_drying_enabled !== false;
+    const tariffMode = TARIFF_MODE_OPTIONS_JS.includes(d.tariff_mode) ? d.tariff_mode : 'anytime';
+
+    const zoneGroup = (title, emKeys, toggleKey, checked) => `
+      <div class="sec">${title}</div>
+      ${_hwLayerToggleRow(toggleKey, 'Enable EM Monitoring', checked)}
+      ${emKeys.map(k => _hwPickerRow(k, hwMap[k.key] || '')).join('')}`;
+
+    const energyExtraHtml = `
+      ${zoneGroup('🌱 Primary Grow Space', ENERGY_ZONE2_EM_KEYS, 'em_zone2_enabled', zone2On)}
+      ${zoneGroup('🌬 Conditioning Room', ENERGY_ZONE1_EM_KEYS, 'em_zone1_enabled', zone1On)}
+      ${zoneGroup('🍃 Drying Room', ENERGY_DRYING_EM_KEYS, 'em_drying_enabled', dryingOn)}
+      <div class="sec">🌐 Global / Infrastructure</div>
+      <div style="font-size:.7rem;color:var(--hx-text2);margin-bottom:8px">
+        Always shown and always included in the total — for genuinely global-only
+        loads like a main incoming supply meter. No enable toggle.
+      </div>
+      ${ENERGY_GLOBAL_EM_KEYS.map(k => _hwPickerRow(k, hwMap[k.key] || '')).join('')}
+
+      <div class="sec">Tariff Mode</div>
+      <select id="energy-tariff-mode-select" style="width:100%;padding:8px;border-radius:8px;
+        border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
+        ${TARIFF_MODE_OPTIONS_JS.map(opt => `<option value="${opt}" ${tariffMode === opt ? 'selected' : ''}>${TARIFF_MODE_LABELS_JS[opt]}</option>`).join('')}
+      </select>
+
+      <div id="energy-tariff-anytime-fields" ${tariffMode === 'anytime' ? '' : 'hidden'}>
+        <div class="metric-row">
+          <span class="metric-label">Rate ($/kWh)</span>
+          <input type="number" id="energy-tariff-anytime-rate" min="0" step="0.001"
+            value="${d.tariff_anytime_rate ?? 0.28}" style="padding:5px;border-radius:6px;
+            border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+        </div>
+      </div>
+      <div id="energy-tariff-peak-fields" ${tariffMode === 'anytime' ? 'hidden' : ''}>
+        <div class="sec">Peak</div>
+        <div class="metric-row">
+          <span class="metric-label">Rate ($/kWh)</span>
+          <input type="number" id="energy-tariff-peak-rate" min="0" step="0.001"
+            value="${d.tariff_peak_rate ?? 0.45}" style="padding:5px;border-radius:6px;
+            border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Window</span>
+          <div style="display:flex;gap:6px">
+            <input type="time" id="energy-tariff-peak-start" value="${d.tariff_peak_start || '07:00'}"
+              style="padding:5px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+            <input type="time" id="energy-tariff-peak-end" value="${d.tariff_peak_end || '21:00'}"
+              style="padding:5px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+          </div>
+        </div>
+      </div>
+      <div id="energy-tariff-shoulder-fields" ${tariffMode === 'triple' ? '' : 'hidden'}>
+        <div class="sec">Shoulder</div>
+        <div class="metric-row">
+          <span class="metric-label">Rate ($/kWh)</span>
+          <input type="number" id="energy-tariff-shoulder-rate" min="0" step="0.001"
+            value="${d.tariff_shoulder_rate ?? 0.30}" style="padding:5px;border-radius:6px;
+            border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Window</span>
+          <div style="display:flex;gap:6px">
+            <input type="time" id="energy-tariff-shoulder-start" value="${d.tariff_shoulder_start || '07:00'}"
+              style="padding:5px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+            <input type="time" id="energy-tariff-shoulder-end" value="${d.tariff_shoulder_end || '10:00'}"
+              style="padding:5px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+          </div>
+        </div>
+      </div>
+      <div id="energy-tariff-offpeak-fields" ${tariffMode === 'anytime' ? 'hidden' : ''}>
+        <div class="sec">Off-Peak</div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-bottom:4px">
+          Applies to any time outside the window(s) above — no window of its own.
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Rate ($/kWh)</span>
+          <input type="number" id="energy-tariff-offpeak-rate" min="0" step="0.001"
+            value="${d.tariff_offpeak_rate ?? 0.15}" style="padding:5px;border-radius:6px;
+            border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+        </div>
+      </div>`;
+
+    return _renderHwPicker([], hwMap, this._hass, 'Energy & ROI', energyExtraHtml);
+  }
+
+  _bindEnergyEditForm() {
+    _bindHwPicker(this.shadowRoot, this, ENERGY_ALL_EM_KEYS, () => {
+      const fields = {};
+      this.shadowRoot.querySelectorAll('.hw-layer-toggle').forEach(el => {
+        fields[el.dataset.layer] = el.checked;
+      });
+      const q = (id) => this.shadowRoot.querySelector(id);
+      const modeSel = q('#energy-tariff-mode-select');
+      fields.tariff_mode = modeSel ? modeSel.value : 'anytime';
+      if (q('#energy-tariff-anytime-rate')) fields.tariff_anytime = parseFloat(q('#energy-tariff-anytime-rate').value);
+      if (q('#energy-tariff-peak-rate')) fields.tariff_peak = parseFloat(q('#energy-tariff-peak-rate').value);
+      if (q('#energy-tariff-peak-start')) fields.tariff_peak_start = q('#energy-tariff-peak-start').value;
+      if (q('#energy-tariff-peak-end')) fields.tariff_peak_end = q('#energy-tariff-peak-end').value;
+      if (q('#energy-tariff-shoulder-rate')) fields.tariff_shoulder = parseFloat(q('#energy-tariff-shoulder-rate').value);
+      if (q('#energy-tariff-shoulder-start')) fields.tariff_shoulder_start = q('#energy-tariff-shoulder-start').value;
+      if (q('#energy-tariff-shoulder-end')) fields.tariff_shoulder_end = q('#energy-tariff-shoulder-end').value;
+      if (q('#energy-tariff-offpeak-rate')) fields.tariff_offpeak = parseFloat(q('#energy-tariff-offpeak-rate').value);
+      return fields;
+    });
+
+    // Tariff mode show/hide — pure DOM toggle, no _render(), matching the
+    // Supplemental Lighting mode-toggle lesson: a rebuild would call
+    // _bindHwPicker again, which resets _pendingDevices and would wipe any
+    // in-progress entity-picker selections elsewhere in this same form.
+    const modeSel = this.shadowRoot.querySelector('#energy-tariff-mode-select');
+    if (modeSel) {
+      modeSel.addEventListener('change', () => {
+        const mode = modeSel.value;
+        const anytimeEl = this.shadowRoot.querySelector('#energy-tariff-anytime-fields');
+        const peakEl = this.shadowRoot.querySelector('#energy-tariff-peak-fields');
+        const shoulderEl = this.shadowRoot.querySelector('#energy-tariff-shoulder-fields');
+        const offpeakEl = this.shadowRoot.querySelector('#energy-tariff-offpeak-fields');
+        if (anytimeEl) anytimeEl.hidden = mode !== 'anytime';
+        if (peakEl) peakEl.hidden = mode === 'anytime';
+        if (shoulderEl) shoulderEl.hidden = mode !== 'triple';
+        if (offpeakEl) offpeakEl.hidden = mode === 'anytime';
+      });
+    }
   }
 
   _renderDryingSettings() {
@@ -3193,6 +3430,23 @@ class HelixTabSettings extends HTMLElement {
   }
 
   _render() {
+    // Energy & ROI's gear-icon edit mode is a full takeover of this tab,
+    // same as every other zone's gear-icon form — no section nav or other
+    // cards alongside it while editing.
+    if (this._isEditingHardware && this._section === 'energy') {
+      if (this._hwFormBuilt) {
+        // Form already open — a routine coordinator data push arrived
+        // mid-edit. Skip the destructive rebuild so in-progress entity-
+        // picker selections aren't torn down.
+        return;
+      }
+      this.shadowRoot.innerHTML = `<style>${BASE_CSS}:host{display:block;}</style>`
+        + this._renderEnergyEditForm();
+      this._bindEnergyEditForm();
+      this._hwFormBuilt = true;
+      return;
+    }
+
     const sectionContent = {
       modules:     this._renderModules(),
       zone2:       this._renderZone2(),
@@ -3364,6 +3618,32 @@ class HelixTabSettings extends HTMLElement {
     if (dropSl) {
       dropSl.addEventListener('input', e => { if (dropVl) dropVl.textContent = `${e.target.value} min`; });
     }
+
+    // Energy & ROI — gear icon and Reset button (only present when
+    // this._section === 'energy'; querySelector is a safe no-op otherwise).
+    _bindGearBtn(this.shadowRoot, this);
+    const resetBtn = this.shadowRoot.querySelector('#energy-reset-btn');
+    const resetStatus = this.shadowRoot.querySelector('#energy-reset-status');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', async () => {
+        if (!this._hass) return;
+        resetBtn.disabled = true;
+        if (resetStatus) resetStatus.textContent = 'Resetting…';
+        try {
+          await this._hass.callWS({ type: 'helix_cultivate/reset_energy_cycle' });
+          if (resetStatus) resetStatus.textContent = '✅ Reset — archived as Previous Cycle';
+          // Reuses the hardware-mapping refresh signal to trigger the root
+          // panel's get_config_summary re-fetch — that's what actually
+          // updates the cached Previous Cycle figure this tab reads.
+          this.dispatchEvent(new CustomEvent('hw-map-saved', { bubbles: true, composed: true }));
+        } catch (e) {
+          console.error('Helix Cultivate: energy cycle reset failed', e);
+          if (resetStatus) resetStatus.textContent = '❌ Reset failed — see console';
+        } finally {
+          resetBtn.disabled = false;
+        }
+      });
+    }
   }
   connectedCallback() { this._render(); }
 }
@@ -3383,6 +3663,7 @@ class HelixPanel extends HTMLElement {
     this._entryId = null;
     this._hwMap = {};
     this._isDryingUnlocked = false;
+    this._previousCycleEnergy = null;
   }
 
   async _fetchConfigSummary() {
@@ -3391,6 +3672,7 @@ class HelixPanel extends HTMLElement {
       this._entryId = result.entry_id;
       this._hwMap   = result.hardware || {};
       this._isDryingUnlocked = !!result.is_drying_unlocked;
+      this._previousCycleEnergy = result.previous_cycle_energy || null;
       this._update();
     } catch (e) {
       console.warn('Helix Cultivate: could not fetch config summary', e);
@@ -3497,6 +3779,7 @@ class HelixPanel extends HTMLElement {
       exhaust_pct:   this._sensorNum('exhaust_speed'),
       dli_today:     this._sensorNum('dli_today'),
       cycle_cost:    this._sensorStr('cycle_cost'),
+      cycle_kwh:     this._sensorNum('cycle_kwh'),
 
       // Zone 1 — Conditioning Room
       zone1_name:    this._attr('exhaust_speed', 'sensor', 'zone1_name') || 'Conditioning Room',
@@ -3638,6 +3921,10 @@ class HelixPanel extends HTMLElement {
       tariff_peak_rate:     this._attr('exhaust_speed', 'sensor', 'tariff_peak_rate')     ?? null,
       tariff_shoulder_rate: this._attr('exhaust_speed', 'sensor', 'tariff_shoulder_rate') ?? null,
       tariff_offpeak_rate:  this._attr('exhaust_speed', 'sensor', 'tariff_offpeak_rate')  ?? null,
+      tariff_peak_start:     this._attr('exhaust_speed', 'sensor', 'tariff_peak_start')     ?? '07:00',
+      tariff_peak_end:       this._attr('exhaust_speed', 'sensor', 'tariff_peak_end')       ?? '21:00',
+      tariff_shoulder_start: this._attr('exhaust_speed', 'sensor', 'tariff_shoulder_start') ?? '07:00',
+      tariff_shoulder_end:   this._attr('exhaust_speed', 'sensor', 'tariff_shoulder_end')   ?? '10:00',
       harvest_value_per_oz: this._attr('exhaust_speed', 'sensor', 'harvest_value_per_oz') ?? null,
       water_baseline_ec:    this._attr('exhaust_speed', 'sensor', 'water_baseline_ec')    ?? 0.4,
 
@@ -3658,6 +3945,16 @@ class HelixPanel extends HTMLElement {
       em_global_s2: this._attr('exhaust_speed', 'sensor', 'em_global_s2') ?? null,
       em_global_s3: this._attr('exhaust_speed', 'sensor', 'em_global_s3') ?? null,
       em_global_s4: this._attr('exhaust_speed', 'sensor', 'em_global_s4') ?? null,
+      em_zone1_enabled:  this._attr('exhaust_speed', 'sensor', 'em_zone1_enabled')  !== false,
+      em_zone2_enabled:  this._attr('exhaust_speed', 'sensor', 'em_zone2_enabled')  !== false,
+      em_drying_enabled: this._attr('exhaust_speed', 'sensor', 'em_drying_enabled') !== false,
+
+      // Previous Cycle (2.7) — from get_config_summary, refreshed via the
+      // same hw-map-saved event the Reset button dispatches; null until a
+      // Reset or harvest close-out has ever happened for this entry.
+      previous_cycle_kwh:        this._previousCycleEnergy?.cycle_kwh ?? null,
+      previous_cycle_cost_usd:   this._previousCycleEnergy?.cycle_cost_usd ?? null,
+      previous_cycle_archived_at: this._previousCycleEnergy?.archived_at ?? null,
 
       // Zone hardware mapping (gear-icon picker support)
       entry_id: this._entryId,

@@ -26,10 +26,12 @@ from .const import (
     CONF_DRYING_HUMIDITY_SENSOR,
     CONF_DRYING_TEMP_SENSOR,
     CONF_ELECTRICITY_RATE,
-    CONF_EM_DRYING_SENSORS,
-    CONF_EM_GLOBAL_SENSORS,
-    CONF_EM_ZONE1_SENSORS,
-    CONF_EM_ZONE2_SENSORS,
+    CONF_EM_ZONE1_S1, CONF_EM_ZONE1_S2, CONF_EM_ZONE1_S3, CONF_EM_ZONE1_S4,
+    CONF_EM_ZONE2_S1, CONF_EM_ZONE2_S2, CONF_EM_ZONE2_S3, CONF_EM_ZONE2_S4,
+    CONF_EM_DRYING_S1, CONF_EM_DRYING_S2, CONF_EM_DRYING_S3, CONF_EM_DRYING_S4,
+    CONF_EM_GLOBAL_S1, CONF_EM_GLOBAL_S2, CONF_EM_GLOBAL_S3, CONF_EM_GLOBAL_S4,
+    CONF_EM_ZONE1_ENABLED, CONF_EM_ZONE2_ENABLED, CONF_EM_DRYING_ENABLED,
+    DEFAULT_EM_ZONE_ENABLED,
     CONF_ENABLE_CONDITIONING_ROOM,
     CONF_ENABLE_DRYING_ENVIRONMENT,
     CONF_EXHAUST_FAN,
@@ -278,8 +280,23 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── Energy session start ──────────────────────────────────────────────
         self._session_start: datetime = dt_util.utcnow()
+        # self._cycle_kwh/_cycle_cost are the aggregated totals actually
+        # displayed (Global's 2 summary cards) — sum of every currently-
+        # enabled zone's own accumulator below, plus Global's own direct EM
+        # slots, recomputed each tick in _accumulate_energy(). The per-zone
+        # accumulators keep counting even while a zone is disabled, so
+        # re-enabling it resumes with its true accumulated total rather than
+        # a gap — only the aggregate's *inclusion* of it is gated.
         self._cycle_kwh: float = 0.0
         self._cycle_cost: float = 0.0
+        self._zone1_cycle_kwh: float = 0.0
+        self._zone2_cycle_kwh: float = 0.0
+        self._drying_cycle_kwh: float = 0.0
+        self._global_cycle_kwh: float = 0.0
+        self._zone1_cycle_cost: float = 0.0
+        self._zone2_cycle_cost: float = 0.0
+        self._drying_cycle_cost: float = 0.0
+        self._global_cycle_cost: float = 0.0
         self._last_energy_tick: Optional[datetime] = None
 
         # ── VPD trend history (timestamp, vpd) tuples — 6 × 30s = 3min window ──
@@ -957,26 +974,25 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # ── Energy accumulation ───────────────────────────────────────────────────
 
-    def _read_em_watts(self) -> float:
-        """Sum instantaneous watt readings from all configured energy-monitor
-        sensors across the zone1, zone2, drying, and global collapsed sensor
-        lists. Returns 0.0 when no sensors are configured or all readings are
+    def _zone_em_watts(self, slot_keys: tuple[str, str, str, str]) -> float:
+        """Sum instantaneous watt readings from one zone's 4 EM sensor slots.
+
+        Reads the individual em_*_s1..s4 keys directly (not the collapsed
+        em_*_sensors list the Options Flow also writes) — the gear-icon
+        hardware-mapping form only ever writes the individual keys via
+        update_zone_devices, so reading them directly keeps both entry paths
+        (initial Options Flow setup and later gear-icon edits) consistent.
+        Returns 0.0 when no sensors are configured or all readings are
         unavailable.
         """
         total = 0.0
-        for list_key in (
-            CONF_EM_ZONE1_SENSORS,
-            CONF_EM_ZONE2_SENSORS,
-            CONF_EM_DRYING_SENSORS,
-            CONF_EM_GLOBAL_SENSORS,
-        ):
-            entity_ids = self._get(list_key) or []
-            for entity_id in entity_ids:
-                if not entity_id:
-                    continue
-                watts = self._safe_read_watts(entity_id)
-                if watts is not None:
-                    total += watts
+        for key in slot_keys:
+            entity_id = self._get(key)
+            if not entity_id:
+                continue
+            watts = self._safe_read_watts(entity_id)
+            if watts is not None:
+                total += watts
         return total
 
     def _safe_read_watts(self, entity_id: str) -> Optional[float]:
@@ -1037,25 +1053,113 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return float(self._get(CONF_TARIFF_OFFPEAK, DEFAULT_TARIFF_OFFPEAK))
 
     def _accumulate_energy(self, interval_sec: float) -> None:
-        """Accumulate cycle kWh via Riemann sum of EM sensor watts, then
-        update cycle cost from the currently-active tariff rate.
+        """Accumulate each zone's own cycle kWh/cost via Riemann sum of that
+        zone's EM sensor watts at the currently-active tariff rate, then
+        recompute the aggregate totals actually displayed (Global's 2
+        summary cards) as the sum of every currently-enabled zone's own
+        accumulator plus Global's own direct EM slots (2.3) — never double-
+        counted, since each zone's watts are read from that zone's own 4
+        slots only.
+
+        Cost is accumulated incrementally at each interval's own rate
+        (kwh_this_tick * rate_this_tick), not recomputed from scratch as
+        total_kwh * current_rate — the latter would retroactively re-price
+        every previously-accumulated kWh at whatever rate happens to be
+        active *now*, which is only harmless under a flat "anytime" rate and
+        silently wrong the moment time-of-use pricing is active.
 
         On the first tick since coordinator startup (or since a cycle reset),
         `_last_energy_tick` is None — the interval is skipped to avoid an
         artificially large accumulation from an undefined elapsed duration.
         """
         now = dt_util.utcnow()
+        rate = self._current_tariff_rate()
+
         if self._last_energy_tick is not None:
             elapsed_h = (now - self._last_energy_tick).total_seconds() / 3600.0
-            watts = self._read_em_watts()
-            self._cycle_kwh += (watts * elapsed_h) / 1000.0
+
+            zone1_kwh = (self._zone_em_watts(
+                (CONF_EM_ZONE1_S1, CONF_EM_ZONE1_S2, CONF_EM_ZONE1_S3, CONF_EM_ZONE1_S4)
+            ) * elapsed_h) / 1000.0
+            zone2_kwh = (self._zone_em_watts(
+                (CONF_EM_ZONE2_S1, CONF_EM_ZONE2_S2, CONF_EM_ZONE2_S3, CONF_EM_ZONE2_S4)
+            ) * elapsed_h) / 1000.0
+            drying_kwh = (self._zone_em_watts(
+                (CONF_EM_DRYING_S1, CONF_EM_DRYING_S2, CONF_EM_DRYING_S3, CONF_EM_DRYING_S4)
+            ) * elapsed_h) / 1000.0
+            global_kwh = (self._zone_em_watts(
+                (CONF_EM_GLOBAL_S1, CONF_EM_GLOBAL_S2, CONF_EM_GLOBAL_S3, CONF_EM_GLOBAL_S4)
+            ) * elapsed_h) / 1000.0
+
+            self._zone1_cycle_kwh += zone1_kwh
+            self._zone2_cycle_kwh += zone2_kwh
+            self._drying_cycle_kwh += drying_kwh
+            self._global_cycle_kwh += global_kwh
+
+            self._zone1_cycle_cost += zone1_kwh * rate
+            self._zone2_cycle_cost += zone2_kwh * rate
+            self._drying_cycle_cost += drying_kwh * rate
+            self._global_cycle_cost += global_kwh * rate
+
         self._last_energy_tick = now
 
-        rate = self._current_tariff_rate()
-        self._cycle_cost = self._cycle_kwh * rate
+        # Global/Infrastructure has no enable toggle — always included.
+        zone1_on = bool(self._get(CONF_EM_ZONE1_ENABLED, DEFAULT_EM_ZONE_ENABLED))
+        zone2_on = bool(self._get(CONF_EM_ZONE2_ENABLED, DEFAULT_EM_ZONE_ENABLED))
+        drying_on = bool(self._get(CONF_EM_DRYING_ENABLED, DEFAULT_EM_ZONE_ENABLED))
+
+        self._cycle_kwh = (
+            (self._zone1_cycle_kwh if zone1_on else 0.0)
+            + (self._zone2_cycle_kwh if zone2_on else 0.0)
+            + (self._drying_cycle_kwh if drying_on else 0.0)
+            + self._global_cycle_kwh
+        )
+        self._cycle_cost = (
+            (self._zone1_cycle_cost if zone1_on else 0.0)
+            + (self._zone2_cycle_cost if zone2_on else 0.0)
+            + (self._drying_cycle_cost if drying_on else 0.0)
+            + self._global_cycle_cost
+        )
         if self.data:
             self.data[NS_ENERGY]["cycle_cost_usd"] = self._cycle_cost
             self.data[NS_ENERGY]["cycle_kwh"] = self._cycle_kwh
+
+    async def reset_energy_cycle(self) -> dict[str, Any]:
+        """Energy & ROI tab's dedicated Reset button (2.6) — lighter-weight
+        than a full harvest close-out: archives the current aggregate totals
+        as Previous Cycle (2.7) via the journal store, then zeroes every
+        live accumulator (aggregate and per-zone) so the next tick starts
+        counting from zero. The archived data is never deleted.
+        """
+        archived_kwh = self._cycle_kwh
+        archived_cost = self._cycle_cost
+
+        record: dict[str, Any] = {
+            "cycle_kwh": round(archived_kwh, 3),
+            "cycle_cost_usd": round(archived_cost, 2),
+        }
+        journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
+        if journal is not None:
+            record = await journal.async_set_previous_cycle_energy(
+                self._entry.entry_id, archived_kwh, archived_cost
+            )
+
+        self._cycle_kwh = 0.0
+        self._cycle_cost = 0.0
+        self._zone1_cycle_kwh = 0.0
+        self._zone2_cycle_kwh = 0.0
+        self._drying_cycle_kwh = 0.0
+        self._global_cycle_kwh = 0.0
+        self._zone1_cycle_cost = 0.0
+        self._zone2_cycle_cost = 0.0
+        self._drying_cycle_cost = 0.0
+        self._global_cycle_cost = 0.0
+        self._last_energy_tick = None
+        if self.data:
+            self.data[NS_ENERGY]["cycle_kwh"] = 0.0
+            self.data[NS_ENERGY]["cycle_cost_usd"] = 0.0
+
+        return record
 
     # ── Appliance dropout watchdog ─────────────────────────────────────────────
 
@@ -1840,11 +1944,30 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             },
         )
 
-        # Reset cycle counters
+        # Archive this cycle's energy totals as Previous Cycle (2.7) — a full
+        # harvest close-out counts as "the last reset" for that display, same
+        # as the dedicated Reset button.
+        await journal.async_set_previous_cycle_energy(self._entry.entry_id, self._cycle_kwh, cost)
+
+        # Reset cycle counters. _cycle_cost must be reset explicitly here too
+        # (not just _cycle_kwh) — _accumulate_energy() now accumulates cost
+        # incrementally rather than recomputing it from _cycle_kwh each tick,
+        # so it no longer self-corrects to 0 just because _cycle_kwh did.
         self._cycle_kwh = 0.0
+        self._cycle_cost = 0.0
+        self._zone1_cycle_kwh = 0.0
+        self._zone2_cycle_kwh = 0.0
+        self._drying_cycle_kwh = 0.0
+        self._global_cycle_kwh = 0.0
+        self._zone1_cycle_cost = 0.0
+        self._zone2_cycle_cost = 0.0
+        self._drying_cycle_cost = 0.0
+        self._global_cycle_cost = 0.0
         self._last_energy_tick = None
         if self.data:
             self.data[NS_ENERGY]["dli_today_mol"] = 0.0
+            self.data[NS_ENERGY]["cycle_kwh"] = 0.0
+            self.data[NS_ENERGY]["cycle_cost_usd"] = 0.0
 
         # Reset stage machine
         self.stage_manager.reset_cycle()

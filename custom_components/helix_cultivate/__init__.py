@@ -29,6 +29,7 @@ WS_CMD_CLOSE_OUT_HARVEST: str = "helix_cultivate/close_out_harvest"
 WS_CMD_EXPORT_RECIPE: str = "helix_cultivate/export_recipe"
 WS_CMD_IMPORT_RECIPE: str = "helix_cultivate/import_recipe"
 WS_CMD_UPDATE_SETTINGS_FIELDS: str = "helix_cultivate/update_settings_fields"
+WS_CMD_RESET_ENERGY_CYCLE: str = "helix_cultivate/reset_energy_cycle"
 
 VALID_STAGE_TARGET_KEYS: frozenset[str] = frozenset({
     "day_temp_c", "night_temp_c",
@@ -65,6 +66,12 @@ VALID_SETTINGS_FIELD_KEYS: frozenset[str] = frozenset({
     # Drying-stage airflow strategy (Zone 2 and/or dedicated Drying Room)
     "drying_exhaust_min_pct", "drying_humidity_ceiling_pct",
     "drying_airflow_mode", "drying_cycle_on_min", "drying_cycle_off_min",
+    # Energy & ROI — per-zone monitoring toggles, tariff editing, ROI target.
+    # EM entity mappings themselves (em_zone1_s1 etc.) are hardware-mapping
+    # keys saved via update_zone_devices/ALL_VALID_ZONE_DEVICE_KEYS instead.
+    "em_zone1_enabled", "em_zone2_enabled", "em_drying_enabled",
+    "tariff_mode", "tariff_anytime", "tariff_peak", "tariff_shoulder", "tariff_offpeak",
+    "tariff_peak_start", "tariff_peak_end", "tariff_shoulder_start", "tariff_shoulder_end",
 })
 
 PLATFORMS: list[Platform] = [
@@ -401,6 +408,15 @@ async def ws_get_config_summary(
     hw_map: dict[str, Any] = {
         k: merged.get(k) for k in ALL_VALID_ZONE_DEVICE_KEYS if merged.get(k)
     }
+
+    # Previous-cycle Energy & ROI archive (2.7) — from the last Reset button
+    # click or the last full harvest close-out, whichever is more recent;
+    # None if neither has ever happened for this entry.
+    previous_cycle_energy: Optional[dict[str, Any]] = None
+    journal = hass.data.get(DOMAIN, {}).get("journal_store")
+    if journal is not None:
+        previous_cycle_energy = journal.get_previous_cycle_energy(entry.entry_id)
+
     connection.send_result(
         msg["id"],
         {
@@ -409,6 +425,7 @@ async def ws_get_config_summary(
             "is_drying_unlocked": bool(
                 merged.get(CONF_DRYING_CUSTOM_UNLOCKED, DEFAULT_DRYING_CUSTOM_UNLOCKED)
             ),
+            "previous_cycle_energy": previous_cycle_energy,
         },
     )
 
@@ -566,6 +583,39 @@ async def ws_close_out_harvest(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): WS_CMD_RESET_ENERGY_CYCLE,
+    }
+)
+@websocket_api.async_response
+async def ws_reset_energy_cycle(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Archive the current cycle's energy totals as Previous Cycle and zero
+    the live accumulators — a lighter-weight action than a full harvest
+    close-out (2.6), for growers who want to start a fresh cost tally
+    mid-cycle (e.g. after a mother-plant takes vs. what a full 12-week
+    flower run cost) without archiving stage durations/yield/etc.
+
+    Returns the archived previous-cycle record for the frontend.
+    """
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    record = await coordinator.reset_energy_cycle()
+    connection.send_result(msg["id"], {"previous_cycle_energy": record})
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): WS_CMD_EXPORT_RECIPE,
     }
 )
@@ -653,6 +703,7 @@ def _async_register_zone_device_ws_commands(hass: HomeAssistant) -> None:
         websocket_api.async_register_command(hass, ws_export_recipe)
         websocket_api.async_register_command(hass, ws_import_recipe)
         websocket_api.async_register_command(hass, ws_update_settings_fields)
+        websocket_api.async_register_command(hass, ws_reset_energy_cycle)
         hass.data.setdefault(DOMAIN, {})["_zone_ws_registered"] = True
         _LOGGER.info("Helix Cultivate: zone-device WebSocket commands registered")
     except Exception:  # noqa: BLE001

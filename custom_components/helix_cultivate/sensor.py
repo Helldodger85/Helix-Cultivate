@@ -91,6 +91,24 @@ from .const import (
     DEFAULT_DRYING_CYCLE_ON_MIN,
     CONF_DRYING_CYCLE_OFF_MIN,
     DEFAULT_DRYING_CYCLE_OFF_MIN,
+    # Energy & ROI — per-zone EM entity slots + enable toggles
+    CONF_EM_ZONE1_S1, CONF_EM_ZONE1_S2, CONF_EM_ZONE1_S3, CONF_EM_ZONE1_S4,
+    CONF_EM_ZONE2_S1, CONF_EM_ZONE2_S2, CONF_EM_ZONE2_S3, CONF_EM_ZONE2_S4,
+    CONF_EM_DRYING_S1, CONF_EM_DRYING_S2, CONF_EM_DRYING_S3, CONF_EM_DRYING_S4,
+    CONF_EM_GLOBAL_S1, CONF_EM_GLOBAL_S2, CONF_EM_GLOBAL_S3, CONF_EM_GLOBAL_S4,
+    CONF_EM_ZONE1_ENABLED, CONF_EM_ZONE2_ENABLED, CONF_EM_DRYING_ENABLED,
+    DEFAULT_EM_ZONE_ENABLED,
+    # Energy & ROI — tariff editing + harvest ROI target
+    CONF_TARIFF_MODE, DEFAULT_TARIFF_MODE,
+    CONF_TARIFF_ANYTIME, DEFAULT_TARIFF_ANYTIME,
+    CONF_TARIFF_PEAK, DEFAULT_TARIFF_PEAK,
+    CONF_TARIFF_SHOULDER, DEFAULT_TARIFF_SHOULDER,
+    CONF_TARIFF_OFFPEAK, DEFAULT_TARIFF_OFFPEAK,
+    CONF_TARIFF_PEAK_START, DEFAULT_TARIFF_PEAK_START,
+    CONF_TARIFF_PEAK_END, DEFAULT_TARIFF_PEAK_END,
+    CONF_TARIFF_SHOULDER_START, DEFAULT_TARIFF_SHOULDER_START,
+    CONF_TARIFF_SHOULDER_END, DEFAULT_TARIFF_SHOULDER_END,
+    CONF_HARVEST_VALUE_PER_OZ, DEFAULT_HARVEST_VALUE,
 )
 from .coordinator import HelixCoordinator
 
@@ -452,6 +470,63 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             attrs["drying_airflow_applied_pct"] = self.coordinator._drying_airflow_applied_pct
             attrs["drying_humidity_override_active"] = (
                 self.coordinator._drying_humidity_override_active
+            )
+            # Energy & ROI — per-zone EM entity mappings + enable toggles.
+            # Exposed here (in addition to hw_map, which the gear-icon form
+            # reads for Save/edit prefill) so the live dashboard grid can
+            # read each slot's entity id directly, same dual-exposure
+            # pattern as zone2_grow_light above.
+            attrs["em_zone1_s1"] = self.coordinator._get(CONF_EM_ZONE1_S1)
+            attrs["em_zone1_s2"] = self.coordinator._get(CONF_EM_ZONE1_S2)
+            attrs["em_zone1_s3"] = self.coordinator._get(CONF_EM_ZONE1_S3)
+            attrs["em_zone1_s4"] = self.coordinator._get(CONF_EM_ZONE1_S4)
+            attrs["em_zone2_s1"] = self.coordinator._get(CONF_EM_ZONE2_S1)
+            attrs["em_zone2_s2"] = self.coordinator._get(CONF_EM_ZONE2_S2)
+            attrs["em_zone2_s3"] = self.coordinator._get(CONF_EM_ZONE2_S3)
+            attrs["em_zone2_s4"] = self.coordinator._get(CONF_EM_ZONE2_S4)
+            attrs["em_drying_s1"] = self.coordinator._get(CONF_EM_DRYING_S1)
+            attrs["em_drying_s2"] = self.coordinator._get(CONF_EM_DRYING_S2)
+            attrs["em_drying_s3"] = self.coordinator._get(CONF_EM_DRYING_S3)
+            attrs["em_drying_s4"] = self.coordinator._get(CONF_EM_DRYING_S4)
+            attrs["em_global_s1"] = self.coordinator._get(CONF_EM_GLOBAL_S1)
+            attrs["em_global_s2"] = self.coordinator._get(CONF_EM_GLOBAL_S2)
+            attrs["em_global_s3"] = self.coordinator._get(CONF_EM_GLOBAL_S3)
+            attrs["em_global_s4"] = self.coordinator._get(CONF_EM_GLOBAL_S4)
+            attrs["em_zone1_enabled"] = self.coordinator._get(
+                CONF_EM_ZONE1_ENABLED, DEFAULT_EM_ZONE_ENABLED
+            )
+            attrs["em_zone2_enabled"] = self.coordinator._get(
+                CONF_EM_ZONE2_ENABLED, DEFAULT_EM_ZONE_ENABLED
+            )
+            attrs["em_drying_enabled"] = self.coordinator._get(
+                CONF_EM_DRYING_ENABLED, DEFAULT_EM_ZONE_ENABLED
+            )
+            # Energy & ROI — tariff editing + harvest ROI target
+            attrs["tariff_mode"] = self.coordinator._get(CONF_TARIFF_MODE, DEFAULT_TARIFF_MODE)
+            attrs["tariff_anytime_rate"] = self.coordinator._get(
+                CONF_TARIFF_ANYTIME, DEFAULT_TARIFF_ANYTIME
+            )
+            attrs["tariff_peak_rate"] = self.coordinator._get(CONF_TARIFF_PEAK, DEFAULT_TARIFF_PEAK)
+            attrs["tariff_shoulder_rate"] = self.coordinator._get(
+                CONF_TARIFF_SHOULDER, DEFAULT_TARIFF_SHOULDER
+            )
+            attrs["tariff_offpeak_rate"] = self.coordinator._get(
+                CONF_TARIFF_OFFPEAK, DEFAULT_TARIFF_OFFPEAK
+            )
+            attrs["tariff_peak_start"] = self.coordinator._get(
+                CONF_TARIFF_PEAK_START, DEFAULT_TARIFF_PEAK_START
+            )
+            attrs["tariff_peak_end"] = self.coordinator._get(
+                CONF_TARIFF_PEAK_END, DEFAULT_TARIFF_PEAK_END
+            )
+            attrs["tariff_shoulder_start"] = self.coordinator._get(
+                CONF_TARIFF_SHOULDER_START, DEFAULT_TARIFF_SHOULDER_START
+            )
+            attrs["tariff_shoulder_end"] = self.coordinator._get(
+                CONF_TARIFF_SHOULDER_END, DEFAULT_TARIFF_SHOULDER_END
+            )
+            attrs["harvest_value_per_oz"] = self.coordinator._get(
+                CONF_HARVEST_VALUE_PER_OZ, DEFAULT_HARVEST_VALUE
             )
 
         if key == "cycle_cost":

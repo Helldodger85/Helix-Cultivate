@@ -742,6 +742,15 @@ CONF_EM_ZONE2_SENSORS: str = "em_zone2_sensors"
 CONF_EM_DRYING_SENSORS: str = "em_drying_sensors"
 CONF_EM_GLOBAL_SENSORS: str = "em_global_sensors"
 
+# Per-zone EM monitoring enable/disable — default True so existing installs
+# see no change on upgrade. Global/Infrastructure has no toggle: it is
+# always shown and always included in the aggregate total, per its own
+# explicit requirement.
+CONF_EM_ZONE1_ENABLED: str = "em_zone1_enabled"
+CONF_EM_ZONE2_ENABLED: str = "em_zone2_enabled"
+CONF_EM_DRYING_ENABLED: str = "em_drying_enabled"
+DEFAULT_EM_ZONE_ENABLED: bool = True
+
 # ── Water / Nitrogen baseline ─────────────────────────────────────────────────
 CONF_WATER_BASELINE_EC: str = "water_baseline_ec"
 DEFAULT_WATER_BASELINE_EC: float = 0.0
@@ -807,4 +816,12 @@ ALL_VALID_ZONE_DEVICE_KEYS: frozenset[str] = frozenset({
     CONF_DRYING_IS_REVERSE_CYCLE,
     CONF_DRYING_HEATER,
     CONF_DRYING_LIGHT,
+    # Energy monitoring — 4 sensor slots per zone (individual keys, not the
+    # collapsed *_SENSORS lists the Options Flow also writes — the gear icon
+    # only ever reads/writes these, so coordinator._accumulate_energy() sums
+    # from them directly rather than the collapsed lists).
+    CONF_EM_ZONE1_S1, CONF_EM_ZONE1_S2, CONF_EM_ZONE1_S3, CONF_EM_ZONE1_S4,
+    CONF_EM_ZONE2_S1, CONF_EM_ZONE2_S2, CONF_EM_ZONE2_S3, CONF_EM_ZONE2_S4,
+    CONF_EM_DRYING_S1, CONF_EM_DRYING_S2, CONF_EM_DRYING_S3, CONF_EM_DRYING_S4,
+    CONF_EM_GLOBAL_S1, CONF_EM_GLOBAL_S2, CONF_EM_GLOBAL_S3, CONF_EM_GLOBAL_S4,
 })
