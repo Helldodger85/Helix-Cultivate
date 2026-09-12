@@ -67,6 +67,30 @@ from .const import (
     DEFAULT_RAMP_PRESET,
     CONF_LIGHT_WATTAGE_W,
     DEFAULT_LIGHT_WATTAGE_W,
+    # Supplemental Lighting (independent second light)
+    CONF_ZONE2_SUPPLEMENTAL_LIGHT,
+    CONF_SUPPLEMENTAL_LIGHT_TYPE,
+    CONF_SUPPLEMENTAL_MODE,
+    DEFAULT_SUPPLEMENTAL_MODE,
+    CONF_SUPPLEMENTAL_TARGET_STAGES,
+    CONF_SUPPLEMENTAL_ON_TIME,
+    DEFAULT_SUPPLEMENTAL_ON_TIME,
+    CONF_SUPPLEMENTAL_DURATION_HOURS,
+    DEFAULT_SUPPLEMENTAL_DURATION_HOURS,
+    # DLI target alerting
+    CONF_DLI_ALERT_THRESHOLD_PCT,
+    DEFAULT_DLI_ALERT_THRESHOLD_PCT,
+    # Drying-stage airflow strategy (Part 2)
+    CONF_DRYING_EXHAUST_MIN_PCT,
+    DEFAULT_DRYING_EXHAUST_MIN_PCT,
+    CONF_DRYING_HUMIDITY_CEILING_PCT,
+    DEFAULT_DRYING_HUMIDITY_CEILING_PCT,
+    CONF_DRYING_AIRFLOW_MODE,
+    DEFAULT_DRYING_AIRFLOW_MODE,
+    CONF_DRYING_CYCLE_ON_MIN,
+    DEFAULT_DRYING_CYCLE_ON_MIN,
+    CONF_DRYING_CYCLE_OFF_MIN,
+    DEFAULT_DRYING_CYCLE_OFF_MIN,
 )
 from .coordinator import HelixCoordinator
 
@@ -383,6 +407,51 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             attrs["ramp_preset"] = self.coordinator._get(CONF_RAMP_PRESET, DEFAULT_RAMP_PRESET)
             attrs["light_wattage_w"] = self.coordinator._get(
                 CONF_LIGHT_WATTAGE_W, DEFAULT_LIGHT_WATTAGE_W
+            )
+            # Supplemental Lighting (independent second light)
+            attrs["zone2_supplemental_light"] = self.coordinator._get(CONF_ZONE2_SUPPLEMENTAL_LIGHT)
+            attrs["supplemental_light_type"] = self.coordinator._get(
+                CONF_SUPPLEMENTAL_LIGHT_TYPE, LIGHT_LED
+            )
+            attrs["supplemental_mode"] = self.coordinator._get(
+                CONF_SUPPLEMENTAL_MODE, DEFAULT_SUPPLEMENTAL_MODE
+            )
+            attrs["supplemental_target_stages"] = self.coordinator._get(
+                CONF_SUPPLEMENTAL_TARGET_STAGES, []
+            )
+            attrs["supplemental_on_time"] = self.coordinator._get(
+                CONF_SUPPLEMENTAL_ON_TIME, DEFAULT_SUPPLEMENTAL_ON_TIME
+            )
+            attrs["supplemental_duration_hours"] = self.coordinator._get(
+                CONF_SUPPLEMENTAL_DURATION_HOURS, DEFAULT_SUPPLEMENTAL_DURATION_HOURS
+            )
+            attrs["supplemental_applied_pct"] = self.coordinator._supplemental_applied_pct
+            # DLI target alerting
+            attrs["dli_alert_threshold_pct"] = self.coordinator._get(
+                CONF_DLI_ALERT_THRESHOLD_PCT, DEFAULT_DLI_ALERT_THRESHOLD_PCT
+            )
+            attrs["target_dli_mol"] = self.coordinator.stage_manager._profile(
+                self.coordinator.stage_manager.current_stage
+            ).get("target_dli_mol", 0.0)
+            # Drying-stage airflow strategy (Part 2)
+            attrs["drying_exhaust_min_pct"] = self.coordinator._get(
+                CONF_DRYING_EXHAUST_MIN_PCT, DEFAULT_DRYING_EXHAUST_MIN_PCT
+            )
+            attrs["drying_humidity_ceiling_pct"] = self.coordinator._get(
+                CONF_DRYING_HUMIDITY_CEILING_PCT, DEFAULT_DRYING_HUMIDITY_CEILING_PCT
+            )
+            attrs["drying_airflow_mode"] = self.coordinator._get(
+                CONF_DRYING_AIRFLOW_MODE, DEFAULT_DRYING_AIRFLOW_MODE
+            )
+            attrs["drying_cycle_on_min"] = self.coordinator._get(
+                CONF_DRYING_CYCLE_ON_MIN, DEFAULT_DRYING_CYCLE_ON_MIN
+            )
+            attrs["drying_cycle_off_min"] = self.coordinator._get(
+                CONF_DRYING_CYCLE_OFF_MIN, DEFAULT_DRYING_CYCLE_OFF_MIN
+            )
+            attrs["drying_airflow_applied_pct"] = self.coordinator._drying_airflow_applied_pct
+            attrs["drying_humidity_override_active"] = (
+                self.coordinator._drying_humidity_override_active
             )
 
         if key == "cycle_cost":

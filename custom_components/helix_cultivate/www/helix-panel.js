@@ -886,12 +886,15 @@ customElements.define('helix-tab-telemetry', HelixTabTelemetry);
 // Tab: Plant Cycle Engine  <helix-tab-cycle>
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Mirrors const.py LIGHT_TYPE_OPTIONS/LIGHT_TYPE_LABELS.
+// Mirrors const.py LIGHT_TYPE_OPTIONS/LIGHT_TYPE_LABELS. "supplemental" was
+// removed as a Main Lighting fixture type — it's now the independent
+// Supplemental Lighting system (its own entity + CONF_SUPPLEMENTAL_LIGHT_TYPE,
+// which reuses this same options/labels pair for its own fixture-type field).
 const LIGHT_TYPE_LABELS_JS = {
   led: 'LED',
   full_spectrum_led: 'Full Spectrum LED',
   hid_ballast: 'HID / Ballast',
-  supplemental: 'Supplemental',
+  quantum_board: 'Quantum Board',
 };
 const LIGHT_TYPE_OPTIONS_JS = Object.keys(LIGHT_TYPE_LABELS_JS);
 
@@ -1104,6 +1107,15 @@ class HelixTabCycle extends HTMLElement {
   _render() {
     const d = this._data || {};
     const activeStage = d.grow_stage_slug || 'germination';
+    const dedicatedDryingRoom = d.enable_drying_environment === true;
+    // Never two editable surfaces for the same data: once a dedicated
+    // Drying Room exists, all Drying editing happens exclusively in
+    // helix-tab-drying. If the flag flips on post-setup while this tab
+    // still had Drying open for editing, fall back to the active stage
+    // immediately rather than silently re-showing a stale edit surface.
+    if (dedicatedDryingRoom && this._editingStage === 'drying') {
+      this._editingStage = null;
+    }
     const stage = this._editingStage || activeStage;
     const stageMeta = STAGE_META[stage] || STAGE_META.germination;
     const isActiveStage = stage === activeStage;
@@ -1114,6 +1126,20 @@ class HelixTabCycle extends HTMLElement {
     const period = this._editingPeriod;
     const isDay = period === 'day';
     const cycleComplete = d.cycle_complete === true;
+    // Single control surface (2.B1): once a dedicated Drying Room exists,
+    // this tab must never show an editable Drying profile — even when the
+    // grow has naturally progressed to the Drying stage and `stage` resolves
+    // here via `activeStage` rather than explicit navigation. The timeline
+    // filter above only blocks clicking into it; this catches the natural
+    // case too.
+    const dryingHiddenNotice = stage === 'drying' && dedicatedDryingRoom;
+    // Without a dedicated Drying Room, Drying is just another stage here —
+    // but per 2.A5/2.B1 it also needs the 60/60 lock/unlock toggle and the
+    // constant/cyclic airflow controls that would otherwise only live in
+    // helix-tab-drying, since there's nowhere else for the grower to set them.
+    const showDryingAirflowControls = stage === 'drying' && !dedicatedDryingRoom;
+    const isDryingUnlocked = !!d.is_drying_unlocked;
+    const dryingAirflowMode = d.drying_airflow_mode || 'constant';
 
     // ── Harvest close-out section (Phase 11D) ────────────────────────────────
     let harvestSectionHtml = '';
@@ -1190,7 +1216,13 @@ class HelixTabCycle extends HTMLElement {
     }
 
     // Stage timeline
-    const stages = Object.entries(STAGE_META);
+    // Drying is fully absent from the clickable timeline (not disabled) once
+    // a dedicated Drying Room exists — matching how disabled canopy tiers
+    // are handled elsewhere. Still shown when no dedicated room is
+    // configured, since there'd be nowhere else to edit it.
+    const stages = Object.entries(STAGE_META).filter(
+      ([key]) => key !== 'drying' || !dedicatedDryingRoom
+    );
     const currentIdx = stages.findIndex(([k]) => k === activeStage);
 
     const timelineItems = stages.map(([key, meta], idx) => {
@@ -1250,6 +1282,17 @@ class HelixTabCycle extends HTMLElement {
       </div>
       ${harvestSectionHtml}
       <!-- Day/Night stage profile editor -->
+      ${dryingHiddenNotice ? `
+      <div class="card">
+        <div class="card-title">📊 ${stageMeta.icon} ${stageMeta.label} Profile</div>
+        <div style="font-size:.8rem;color:var(--hx-text2);line-height:1.5;margin-bottom:10px">
+          This grow has a dedicated Drying Room configured, so the 60/60 cure profile is managed
+          entirely from the <strong style="color:var(--hx-text)">Drying</strong> tab instead of here.
+          Zone 2's own exhaust still switches to gentle-cyclic airflow for the duration of the dry
+          regardless of the dedicated room — its current status is shown below.
+        </div>
+        ${_dryingOverrideStatusHtml(d)}
+      </div>` : `
       <div class="card">
         <div class="card-title">📊 ${stageMeta.icon} ${stageMeta.label} Profile ${isActiveStage ? '' : '<span class="badge bg-amber" style="margin-left:6px;font-size:.65rem">preview</span>'}</div>
         <div class="hx-period-toggle" style="display:flex;gap:6px;margin-bottom:12px">
@@ -1308,7 +1351,49 @@ class HelixTabCycle extends HTMLElement {
             background:var(--hx-blue,#209cee);color:#fff;font-weight:600;cursor:pointer">💾 Save Stage Targets</button>
           <span id="stage-save-status" style="font-size:.75rem;color:var(--hx-text2)"></span>
         </div>
-      </div>
+        ${showDryingAirflowControls ? `
+        <hr/>
+        <div class="sec">60/60 Cure Profile</div>
+        ${isDryingUnlocked
+          ? `<div class="chip-row" style="margin-bottom:10px;align-items:center">
+              <span class="badge bg-amber">🔓 Custom Profile Active (using the VPD/Temp above)</span>
+              <button class="hx-relock-btn" style="margin-left:auto;padding:6px 10px;border-radius:8px;border:1px solid var(--hx-border,#333);background:none;color:var(--hx-text);cursor:pointer;font-size:.75rem">🔒 Re-lock to 60/60</button>
+            </div>`
+          : `<div class="chip-row" style="margin-bottom:10px;align-items:center">
+              <span class="badge bg-blue">🔒 Locked: Standard Cure Profile — 15.5°C / 60% RH</span>
+              <button class="hx-unlock-btn" style="margin-left:auto;padding:6px 10px;border-radius:8px;border:1px solid var(--hx-border,#333);background:none;color:var(--hx-text);cursor:pointer;font-size:.75rem">🔓 Unlock</button>
+            </div>`}
+        <div class="sec">Drying Airflow Mode</div>
+        <div class="hx-period-toggle" style="display:flex;gap:6px;margin-bottom:8px">
+          <button class="drying-airflow-btn ${dryingAirflowMode === 'constant' ? 'active' : ''}" data-mode="constant"
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${dryingAirflowMode === 'constant' ? 'var(--hx-blue,#209cee)' : 'none'};color:${dryingAirflowMode === 'constant' ? '#fff' : 'var(--hx-text)'};font-weight:600">Constant</button>
+          <button class="drying-airflow-btn ${dryingAirflowMode === 'cyclic' ? 'active' : ''}" data-mode="cyclic"
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${dryingAirflowMode === 'cyclic' ? 'var(--hx-blue,#209cee)' : 'none'};color:${dryingAirflowMode === 'cyclic' ? '#fff' : 'var(--hx-text)'};font-weight:600">Cyclic</button>
+        </div>
+        <div style="font-size:.72rem;color:var(--hx-text2);margin-bottom:10px">
+          Constant: gentle, steady airflow throughout the dry. Cyclic: alternates airflow on and off at set
+          intervals — some growers prefer this to prevent one consistent air current from drying part of the
+          canopy faster than the rest.
+        </div>
+        ${dryingAirflowMode === 'cyclic' ? `
+        <div class="g2">
+          <div>
+            <div class="sec">Cycle On (min)</div>
+            <input type="number" id="drying-cycle-on-input" min="1" step="1" value="${d.drying_cycle_on_min ?? 15}"
+              style="width:100%;padding:6px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+          </div>
+          <div>
+            <div class="sec">Cycle Off (min)</div>
+            <input type="number" id="drying-cycle-off-input" min="1" step="1" value="${d.drying_cycle_off_min ?? 15}"
+              style="width:100%;padding:6px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+          </div>
+        </div>` : ''}
+        <hr/>
+        ${_dryingOverrideStatusHtml(d)}
+        ` : ''}
+      </div>`}
       <!-- Progression mode -->
       <div class="card">
         <div class="card-title">⚙️ Progression Mode</div>
@@ -1377,6 +1462,9 @@ class HelixTabCycle extends HTMLElement {
       });
     });
 
+    // Everything below queries elements that only exist in the full profile
+    // editor card — skipped entirely when the Drying notice card replaced it.
+    if (!dryingHiddenNotice) {
     // Refresh the RH guide text live as the sliders move
     const refreshRhGuide = () => {
       const t = parseFloat(this.shadowRoot.querySelector('#temp-anchor-slider').value);
@@ -1452,6 +1540,55 @@ class HelixTabCycle extends HTMLElement {
       saveStageBtn.addEventListener('click', () => {
         this._saveStageTargetsFromDom(stage, isDay);
       });
+    }
+
+    // Drying-without-a-dedicated-room extras (2.A5 / 2.B1): 60/60 lock toggle
+    // and constant/cyclic airflow mode — only present when showDryingAirflowControls.
+    if (showDryingAirflowControls) {
+      const entryId = (this._data || {}).entry_id;
+      const unlockBtn = this.shadowRoot.querySelector('.hx-unlock-btn');
+      if (unlockBtn) unlockBtn.addEventListener('click', async () => {
+        if (!this._hass || !entryId) return;
+        try {
+          await this._hass.callWS({ type: 'helix_cultivate/toggle_drying_lock', entry_id: entryId, unlocked: true });
+          this._data = { ...this._data, is_drying_unlocked: true };
+          this._render();
+        } catch (e) { console.error('Helix Cultivate: drying lock toggle failed', e); }
+      });
+      const relockBtn = this.shadowRoot.querySelector('.hx-relock-btn');
+      if (relockBtn) relockBtn.addEventListener('click', async () => {
+        if (!this._hass || !entryId) return;
+        try {
+          await this._hass.callWS({ type: 'helix_cultivate/toggle_drying_lock', entry_id: entryId, unlocked: false });
+          this._data = { ...this._data, is_drying_unlocked: false };
+          this._render();
+        } catch (e) { console.error('Helix Cultivate: drying lock toggle failed', e); }
+      });
+
+      const saveDryingField = async (fields) => {
+        if (!this._hass || !entryId) return;
+        try {
+          await this._hass.callWS({ type: 'helix_cultivate/update_settings_fields', entry_id: entryId, fields });
+        } catch (e) { console.error('Helix Cultivate: drying airflow save failed', e); }
+      };
+
+      this.shadowRoot.querySelectorAll('.drying-airflow-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          saveDryingField({ drying_airflow_mode: btn.dataset.mode });
+          this._data = { ...this._data, drying_airflow_mode: btn.dataset.mode };
+          this._render();
+        });
+      });
+
+      const cycleOnEl = this.shadowRoot.querySelector('#drying-cycle-on-input');
+      if (cycleOnEl) cycleOnEl.addEventListener('change', e => {
+        saveDryingField({ drying_cycle_on_min: parseFloat(e.target.value) });
+      });
+      const cycleOffEl = this.shadowRoot.querySelector('#drying-cycle-off-input');
+      if (cycleOffEl) cycleOffEl.addEventListener('change', e => {
+        saveDryingField({ drying_cycle_off_min: parseFloat(e.target.value) });
+      });
+    }
     }
 
     // Progression toggle
@@ -1555,7 +1692,16 @@ const ZONE2_HW_KEYS = [
   { key: 'zone2_humidifier',             label: 'Zone 2 Humidifier',      domains: ['switch', 'climate'] },
   { key: 'zone2_dehumidifier',           label: 'Zone 2 Dehumidifier',    domains: ['switch', 'climate'] },
   { key: 'zone2_grow_light',             label: 'Grow Light',             domains: ['light', 'switch'] },
+  { key: 'dli_sensor',                   label: 'DLI / PAR Sensor',       domains: ['sensor'] },
 ];
+
+// Rendered in its own "Supplemental Lighting" sub-section (see
+// HelixTabGrowspace's hw-edit branch) rather than the flat ZONE2_HW_KEYS
+// list above, but still merged into the array passed to _bindHwPicker so
+// its entity picker gets the same domain filtering as every other slot.
+const ZONE2_SUPPLEMENTAL_HW_KEY = {
+  key: 'zone2_supplemental_light', label: 'Supplemental Light', domains: ['light', 'switch'],
+};
 
 const ZONE1_HW_KEYS = [
   { key: 'lung_temp_sensor',     label: 'Conditioning Room Temp',     domains: ['sensor'] },
@@ -1657,6 +1803,100 @@ function _hwLayerToggleRow(dataLayer, label, checked) {
     </div>`;
 }
 
+// ── Supplemental Lighting (independent second light) ──────────────────────
+// Its own clearly separate sub-section of the Primary Grow Space
+// hardware-mapping form — a distinct light from Main Lighting, with its own
+// entity, fixture type, and Synced/Targeted scheduling mode. Mode switching
+// uses plain DOM show/hide (never a form rebuild/_render()) specifically so
+// it can never reset in-progress entity-picker selections elsewhere in the
+// same gear-icon form the way a rebuild would.
+
+function _renderSupplementalLightingSection(d) {
+  const mode = d.supplemental_mode === 'targeted' ? 'targeted' : 'synced';
+  const targetStages = d.supplemental_target_stages || [];
+  const targetableStages = Object.keys(STAGE_META).filter(s => s !== 'drying');
+
+  return `
+    <div class="sec">💡 Supplemental Lighting</div>
+    <div style="font-size:.72rem;color:var(--hx-text2);margin-bottom:8px">
+      A second, independent light — for UV, far-red, or other targeted spectra.
+    </div>
+    ${_hwPickerRow(ZONE2_SUPPLEMENTAL_HW_KEY, (d.hw_map || {}).zone2_supplemental_light || '')}
+    <div class="sec">Supplemental Fixture Type</div>
+    <select id="hw-supplemental-light-type-select" style="width:100%;padding:8px;border-radius:8px;
+      border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
+      ${LIGHT_TYPE_OPTIONS_JS.map(opt => `<option value="${opt}" ${
+        (d.supplemental_light_type || 'led') === opt ? 'selected' : ''
+      }>${LIGHT_TYPE_LABELS_JS[opt]}</option>`).join('')}
+    </select>
+    <div style="font-size:.7rem;color:var(--hx-text2);margin:4px 0 10px">
+      If this fixture is HID/ballast class, the same hot-restrike lockout as Main Lighting applies to it.
+    </div>
+    <div class="sec">Supplemental Mode</div>
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <button class="supplemental-mode-btn ${mode === 'synced' ? 'active' : ''}" data-mode="synced"
+        style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+        background:${mode === 'synced' ? 'var(--hx-blue,#209cee)' : 'none'};color:${mode === 'synced' ? '#fff' : 'var(--hx-text)'};font-weight:600">Synced</button>
+      <button class="supplemental-mode-btn ${mode === 'targeted' ? 'active' : ''}" data-mode="targeted"
+        style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+        background:${mode === 'targeted' ? 'var(--hx-blue,#209cee)' : 'none'};color:${mode === 'targeted' ? '#fff' : 'var(--hx-text)'};font-weight:600">Targeted</button>
+    </div>
+    <div id="supplemental-mode-copy-synced" style="font-size:.7rem;color:var(--hx-text2);margin-bottom:10px" ${mode === 'synced' ? '' : 'hidden'}>
+      This light turns on and off together with your main grow light, on the same schedule automatically.
+    </div>
+    <div id="supplemental-mode-copy-targeted" style="font-size:.7rem;color:var(--hx-text2);margin-bottom:10px" ${mode === 'targeted' ? '' : 'hidden'}>
+      This light only runs during the growth stages you choose, on its own independent schedule — for example, adding UV specifically during late flower for a set number of hours per day.
+    </div>
+    <div id="supplemental-targeted-fields" ${mode === 'targeted' ? '' : 'hidden'}>
+      <div class="sec">Target Stages</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+        ${targetableStages.map(s => `
+          <label style="display:flex;align-items:center;gap:4px;font-size:.72rem;padding:4px 8px;
+            border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);cursor:pointer">
+            <input type="checkbox" class="supplemental-stage-cb" value="${s}" ${targetStages.includes(s) ? 'checked' : ''}/>
+            ${STAGE_META[s].icon} ${STAGE_META[s].label}
+          </label>`).join('')}
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">On At</span>
+        <input type="time" id="hw-supplemental-on-time" value="${d.supplemental_on_time || '12:00'}"
+          style="padding:5px;border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+      </div>
+      <div class="slider-row">
+        <span class="slider-lbl">Duration</span>
+        <input type="range" id="hw-supplemental-duration" min="0" max="12" step="0.5" value="${d.supplemental_duration_hours ?? 2}"/>
+        <span class="slider-val" id="hw-supplemental-duration-val">${fn(d.supplemental_duration_hours ?? 2, 1)}h</span>
+      </div>
+    </div>`;
+}
+
+function _bindSupplementalLightingSection(shadowRoot) {
+  shadowRoot.querySelectorAll('.supplemental-mode-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const chosen = btn.dataset.mode;
+      shadowRoot.querySelectorAll('.supplemental-mode-btn').forEach(b => {
+        const active = b.dataset.mode === chosen;
+        b.classList.toggle('active', active);
+        b.style.background = active ? 'var(--hx-blue,#209cee)' : 'none';
+        b.style.color = active ? '#fff' : 'var(--hx-text)';
+      });
+      const syncedCopy = shadowRoot.querySelector('#supplemental-mode-copy-synced');
+      const targetedCopy = shadowRoot.querySelector('#supplemental-mode-copy-targeted');
+      const targetedFields = shadowRoot.querySelector('#supplemental-targeted-fields');
+      if (syncedCopy) syncedCopy.hidden = chosen !== 'synced';
+      if (targetedCopy) targetedCopy.hidden = chosen !== 'targeted';
+      if (targetedFields) targetedFields.hidden = chosen !== 'targeted';
+    });
+  });
+  const durationEl = shadowRoot.querySelector('#hw-supplemental-duration');
+  const durationVal = shadowRoot.querySelector('#hw-supplemental-duration-val');
+  if (durationEl) {
+    durationEl.addEventListener('input', e => {
+      if (durationVal) durationVal.textContent = `${fn(parseFloat(e.target.value), 1)}h`;
+    });
+  }
+}
+
 function _renderHwPicker(hwKeys, hwMap, hass, title, extraHtml = '') {
   return `
     <div class="card">
@@ -1735,6 +1975,31 @@ function _bindHwPicker(shadowRoot, hostEl, hwKeys, extraFieldsGetter = null) {
       }
     });
   }
+}
+
+// Surfaces the currently-active drying airflow overrides (2.B2) — same idea
+// as the thermal-purge/VPD-assist-bias badges on the Telemetry tab, reused
+// here so growers can see at a glance whether gentle-cyclic, the dedicated
+// floor, or the humidity ceiling override is what's actually driving the
+// exhaust right now. Shared by HelixTabDrying and HelixTabCycle's Drying
+// stage card (non-dedicated-room case) so both surfaces stay consistent.
+function _dryingOverrideStatusHtml(d) {
+  const mode = d.drying_airflow_mode || 'constant';
+  const applied = d.drying_airflow_applied_pct ?? 0;
+  const floor = d.drying_exhaust_min_pct ?? 20;
+  const overrideActive = d.drying_humidity_override_active === true;
+  const ceiling = d.drying_humidity_ceiling_pct ?? 68;
+  return `
+    <div class="metric-row">
+      <span class="metric-label">Gentle-Cyclic Airflow</span>
+      <span class="metric-val">${fPct(applied)} (${mode === 'cyclic' ? 'cyclic' : 'constant'}, floor ${fPct(floor)})</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Humidity Ceiling Override</span>
+      <span class="metric-val">${overrideActive
+        ? `<span class="badge bg-red">⚠ Active — RH above ${fn(ceiling,0)}%</span>`
+        : `<span class="badge bg-gray">Off</span>`}</span>
+    </div>`;
 }
 
 function _gearBtnHtml() {
@@ -1898,18 +2163,29 @@ class HelixTabGrowspace extends HTMLElement {
         </select>
         <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
           Drives the default leaf-temperature offset and HID/ballast hot-restrike lockout.
-        </div>`;
+        </div>
+        ${_renderSupplementalLightingSection(d)}`;
 
       this.shadowRoot.innerHTML = `<style>${BASE_CSS}:host{display:block;}</style>`
         + _renderHwPicker(
             ZONE2_HW_KEYS, d.hw_map || {}, this._hass,
             d.zone2_name || 'Primary Grow Space', layerToggles
           );
-      _bindHwPicker(this.shadowRoot, this, ZONE2_HW_KEYS, () => {
+      _bindHwPicker(this.shadowRoot, this, [...ZONE2_HW_KEYS, ZONE2_SUPPLEMENTAL_HW_KEY], () => {
         const fields = {};
         this.shadowRoot.querySelectorAll('.hw-layer-toggle').forEach(el => {
           fields[el.dataset.layer] = el.checked;
         });
+        const supplementalTypeSel = this.shadowRoot.querySelector('#hw-supplemental-light-type-select');
+        if (supplementalTypeSel) fields.supplemental_light_type = supplementalTypeSel.value;
+        const modeEl = this.shadowRoot.querySelector('.supplemental-mode-btn.active');
+        fields.supplemental_mode = modeEl ? modeEl.dataset.mode : 'synced';
+        const stageChecks = this.shadowRoot.querySelectorAll('.supplemental-stage-cb:checked');
+        fields.supplemental_target_stages = Array.from(stageChecks).map(cb => cb.value);
+        const onTimeEl = this.shadowRoot.querySelector('#hw-supplemental-on-time');
+        if (onTimeEl) fields.supplemental_on_time = onTimeEl.value;
+        const durationEl = this.shadowRoot.querySelector('#hw-supplemental-duration');
+        if (durationEl) fields.supplemental_duration_hours = parseFloat(durationEl.value);
         return fields;
       });
       // Light type is a live select entity — persists immediately on
@@ -1922,6 +2198,7 @@ class HelixTabGrowspace extends HTMLElement {
           });
         });
       }
+      _bindSupplementalLightingSection(this.shadowRoot);
       this._hwFormBuilt = true;
       return;
     }
@@ -2050,6 +2327,15 @@ class HelixTabGrowspace extends HTMLElement {
         Switch-domain lights can't dim — ramp is automatically disabled.
       </div>`;
 
+    const dliToday = d.dli_today ?? 0;
+    const targetDli = d.target_dli_mol ?? 0;
+    const dliPct = targetDli > 0 ? Math.round((dliToday / targetDli) * 100) : null;
+    const dliIndicatorHtml = targetDli > 0 ? `
+      <div class="metric-row" style="margin-bottom:8px">
+        <span class="metric-label">Today's DLI</span>
+        <span class="metric-val">${fn(dliToday, 1)} / Target: ${fn(targetDli, 0)} mol (${dliPct}%)</span>
+      </div>` : '';
+
     const lightingCardHtml = `
       <div class="card">
         <div class="card-title">💡 Lighting &amp; Growth Schedule</div>
@@ -2057,6 +2343,7 @@ class HelixTabGrowspace extends HTMLElement {
           <span class="metric-label">Grow Light</span>
           ${lightStatusHtml}
         </div>
+        ${dliIndicatorHtml}
         <div class="hx-period-toggle" style="display:flex;gap:6px;margin-bottom:12px">
           <button class="growth-mode-btn ${growthMode === 'autoflower' ? 'active' : ''}" data-mode="autoflower"
             style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
@@ -2518,6 +2805,11 @@ class HelixTabDrying extends HTMLElement {
           <span class="metric-label">HVAC Mode</span>
           <span class="metric-val">${d.drying_hvac_mode || '—'}</span>
         </div>
+        <hr/>
+        <div style="font-size:.68rem;color:var(--hx-text2);margin-bottom:4px">
+          Zone 2's own exhaust (separate from this dedicated room's fixed 25%/40% airflow above):
+        </div>
+        ${_dryingOverrideStatusHtml(d)}
       </div>
       ${profileEditorHtml}
       <div class="card">
@@ -3318,6 +3610,27 @@ class HelixPanel extends HTMLElement {
       ramp_enabled: this._attr('exhaust_speed', 'sensor', 'ramp_enabled') ?? true,
       ramp_preset:  this._attr('exhaust_speed', 'sensor', 'ramp_preset')  ?? 'standard',
       light_wattage_w: this._attr('exhaust_speed', 'sensor', 'light_wattage_w') ?? 600,
+
+      // Supplemental Lighting (independent second light)
+      supplemental_light_type: this._attr('exhaust_speed', 'sensor', 'supplemental_light_type') ?? 'led',
+      supplemental_mode:       this._attr('exhaust_speed', 'sensor', 'supplemental_mode')       ?? 'synced',
+      supplemental_target_stages: this._attr('exhaust_speed', 'sensor', 'supplemental_target_stages') ?? [],
+      supplemental_on_time:    this._attr('exhaust_speed', 'sensor', 'supplemental_on_time')    ?? '12:00',
+      supplemental_duration_hours: this._attr('exhaust_speed', 'sensor', 'supplemental_duration_hours') ?? 2,
+      supplemental_applied_pct: this._attr('exhaust_speed', 'sensor', 'supplemental_applied_pct') ?? 0,
+
+      // DLI target alerting
+      target_dli_mol:          this._attr('exhaust_speed', 'sensor', 'target_dli_mol')          ?? 0,
+      dli_alert_threshold_pct: this._attr('exhaust_speed', 'sensor', 'dli_alert_threshold_pct') ?? 20,
+
+      // Drying-stage airflow strategy (Part 2)
+      drying_exhaust_min_pct:     this._attr('exhaust_speed', 'sensor', 'drying_exhaust_min_pct')     ?? 20,
+      drying_humidity_ceiling_pct: this._attr('exhaust_speed', 'sensor', 'drying_humidity_ceiling_pct') ?? 68,
+      drying_airflow_mode:        this._attr('exhaust_speed', 'sensor', 'drying_airflow_mode')        ?? 'constant',
+      drying_cycle_on_min:        this._attr('exhaust_speed', 'sensor', 'drying_cycle_on_min')        ?? 15,
+      drying_cycle_off_min:       this._attr('exhaust_speed', 'sensor', 'drying_cycle_off_min')       ?? 15,
+      drying_airflow_applied_pct: this._attr('exhaust_speed', 'sensor', 'drying_airflow_applied_pct') ?? 0,
+      drying_humidity_override_active: this._attr('exhaust_speed', 'sensor', 'drying_humidity_override_active') ?? false,
 
       // Energy / tariff
       tariff_mode:          this._attr('exhaust_speed', 'sensor', 'tariff_mode')          ?? 'anytime',

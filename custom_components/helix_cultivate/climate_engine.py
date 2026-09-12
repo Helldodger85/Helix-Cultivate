@@ -83,12 +83,27 @@ from .const import (
     DRYING_TARGET_TEMP_C,
     FAN_TIER_LOWER,
     FAN_TIER_MID,
+    FAN_TIER_UPPER,
     FEEDFORWARD_PRECONDITIONING_MIN,
     LIGHTS_OFF_PURGE_DURATION_MIN,
+    NS_CLIMATE,
     STAGE_DRYING,
     STRATIFICATION_RH_DELTA_PCT,
     STRATIFICATION_TEMP_DELTA_C,
     TOPOLOGY_COORDINATED,
+    # Zone 2 drying-stage airflow strategy (Part 2)
+    CONF_DRYING_EXHAUST_MIN_PCT,
+    DEFAULT_DRYING_EXHAUST_MIN_PCT,
+    CONF_DRYING_HUMIDITY_CEILING_PCT,
+    DEFAULT_DRYING_HUMIDITY_CEILING_PCT,
+    DRYING_HUMIDITY_CEILING_DWELL_MIN,
+    CONF_DRYING_AIRFLOW_MODE,
+    DEFAULT_DRYING_AIRFLOW_MODE,
+    DRYING_AIRFLOW_CYCLIC,
+    CONF_DRYING_CYCLE_ON_MIN,
+    DEFAULT_DRYING_CYCLE_ON_MIN,
+    CONF_DRYING_CYCLE_OFF_MIN,
+    DEFAULT_DRYING_CYCLE_OFF_MIN,
 )
 
 if TYPE_CHECKING:
@@ -879,6 +894,28 @@ class ClimateEngine:
             await self._set_fan_pct(exhaust_id, float(DEFAULT_EXHAUST_SAFE_FLOOR_PCT))
             return float(DEFAULT_EXHAUST_SAFE_FLOOR_PCT)
 
+        # ── Drying-stage gentle-cyclic override ─────────────────────────────────
+        # Must run BEFORE the lights-off purge branch below: a grow always
+        # transitions from Flowering (lights on) directly into Drying (lights
+        # off), so without this check ahead of the purge branch, every single
+        # drying cycle would spend its first LIGHTS_OFF_PURGE_DURATION_MIN
+        # minutes at aggressive +40% purge exhaust instead of gentle-cyclic.
+        # Applies to Zone 2's own exhaust_fan regardless of whether a separate
+        # dedicated Drying Room is also configured (see _control_drying_zone
+        # for that room's own, independent airflow). Drying should not chase
+        # VPD error with variable modulation even gently — cure quality
+        # depends on a steady, predictable airflow rate, not a responsive
+        # one, matching the same "no safe-but-suboptimal middle ground"
+        # reasoning as the instant photoperiod flip.
+        if self._coord.stage_manager.current_stage == STAGE_DRYING:
+            return await self._control_zone2_drying_airflow(exhaust_id)
+        else:
+            # Not drying (any more, or yet) — clear drying-only dwell/cycle
+            # state so a later drying stage starts each timer fresh rather
+            # than inheriting a stale in-progress window from a past cycle.
+            self._coord._drying_humidity_high_since = None
+            self._coord._drying_cycle_phase_since = None
+
         # ── Lights-off dehumidification purge ─────────────────────────────────
         purge_until = self._coord._lights_off_purge_until
         if purge_until is not None and dt_util.utcnow() < purge_until:
@@ -1453,6 +1490,107 @@ class ClimateEngine:
                 await self._set_switch(effective_backup_heater_id, False, role=f"{zone_label}_backup_heater")
 
         return rc_mode
+
+    # ── Zone 2 drying-stage airflow strategy ──────────────────────────────────
+    # Distinct from _control_drying_zone below (a separate, optional
+    # dedicated Drying Room with its own physical fans) — this always runs
+    # against Zone 2's own exhaust_fan and canopy circulation tiers whenever
+    # current_stage == STAGE_DRYING, dedicated room or not.
+
+    def _check_drying_humidity_ceiling(self) -> bool:
+        """Hard humidity-ceiling override — always wins, same "always wins"
+        pattern as thermal runaway. Reuses the dwell-timer pattern already
+        used for saturation/chronic-drift detection: a single noisy reading
+        must not force the override, only a sustained spike.
+        """
+        upper_rh = (self._coord.data or {}).get(NS_CLIMATE, {}).get("upper_rh_pct")
+        ceiling = float(
+            self._get(CONF_DRYING_HUMIDITY_CEILING_PCT, DEFAULT_DRYING_HUMIDITY_CEILING_PCT)
+        )
+        now = dt_util.utcnow()
+
+        if upper_rh is None or upper_rh <= ceiling:
+            self._coord._drying_humidity_high_since = None
+            return False
+
+        if self._coord._drying_humidity_high_since is None:
+            self._coord._drying_humidity_high_since = now
+            return False
+
+        elapsed_min = (now - self._coord._drying_humidity_high_since).total_seconds() / 60.0
+        return elapsed_min >= DRYING_HUMIDITY_CEILING_DWELL_MIN
+
+    def _drying_cyclic_pct(self, floor_pct: float) -> float:
+        """True intermittent on/off airflow for Cyclic mode — exhaust and
+        circulation alternate together on the same timing (tracked once,
+        here) so airflow is consistently on or off as a whole, never split
+        between the two.
+        """
+        coord = self._coord
+        on_min = float(self._get(CONF_DRYING_CYCLE_ON_MIN, DEFAULT_DRYING_CYCLE_ON_MIN))
+        off_min = float(self._get(CONF_DRYING_CYCLE_OFF_MIN, DEFAULT_DRYING_CYCLE_OFF_MIN))
+        now = dt_util.utcnow()
+
+        if coord._drying_cycle_phase_since is None:
+            coord._drying_cycle_phase_since = now
+            coord._drying_cycle_is_on = True
+
+        phase_duration = on_min if coord._drying_cycle_is_on else off_min
+        elapsed_min = (now - coord._drying_cycle_phase_since).total_seconds() / 60.0
+        if phase_duration > 0 and elapsed_min >= phase_duration:
+            coord._drying_cycle_is_on = not coord._drying_cycle_is_on
+            coord._drying_cycle_phase_since = now
+
+        return floor_pct if coord._drying_cycle_is_on else 0.0
+
+    async def _control_zone2_drying_airflow(self, exhaust_id: Optional[str]) -> float:
+        """Zone 2's own gentle drying-stage airflow strategy. Returns the
+        applied exhaust percentage."""
+        coord = self._coord
+        floor_pct = max(
+            DRYING_CYCLE_EXHAUST_PCT,
+            float(self._get(CONF_DRYING_EXHAUST_MIN_PCT, DEFAULT_DRYING_EXHAUST_MIN_PCT)),
+        )
+
+        override_engaged = self._check_drying_humidity_ceiling()
+        if override_engaged:
+            applied_pct = 100.0
+        elif self._get(CONF_DRYING_AIRFLOW_MODE, DEFAULT_DRYING_AIRFLOW_MODE) == DRYING_AIRFLOW_CYCLIC:
+            applied_pct = self._drying_cyclic_pct(floor_pct)
+        else:
+            applied_pct = floor_pct
+
+        if exhaust_id:
+            await self._set_fan_pct(exhaust_id, applied_pct)
+
+        # 2.A2: every currently-enabled circulation tier, not one generic
+        # fan slot — disabled tiers stay untouched.
+        for tier in (FAN_TIER_UPPER, FAN_TIER_MID, FAN_TIER_LOWER):
+            if coord._is_fan_tier_enabled(tier):
+                await coord._apply_fan_speed_to_tier(tier, applied_pct)
+
+        # Exposed for the dashboard (2.B2) — current gentle-cyclic %, and
+        # whether the humidity override is engaged right now.
+        coord._drying_airflow_applied_pct = applied_pct
+        coord._drying_humidity_override_active = override_engaged
+
+        if override_engaged and not coord._drying_humidity_override_alerted:
+            await coord._notify_critical(
+                title="Helix Cultivate — Drying Humidity Override",
+                message=(
+                    f"Drying RH has stayed above the "
+                    f"{self._get(CONF_DRYING_HUMIDITY_CEILING_PCT, DEFAULT_DRYING_HUMIDITY_CEILING_PCT):.0f}% "
+                    "ceiling for over "
+                    f"{DRYING_HUMIDITY_CEILING_DWELL_MIN:.0f} minutes — forcing exhaust "
+                    "to 100% to protect the cure from mold risk."
+                ),
+                level="critical",
+            )
+            coord._drying_humidity_override_alerted = True
+        elif not override_engaged:
+            coord._drying_humidity_override_alerted = False
+
+        return applied_pct
 
     # ── Drying zone control ───────────────────────────────────────────────────
 

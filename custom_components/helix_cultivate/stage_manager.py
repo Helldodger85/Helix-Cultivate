@@ -145,6 +145,14 @@ class StageManager:
                 "timestamp": dt_util.utcnow().isoformat(),
             },
         )
+        # Re-apply the light schedule immediately rather than waiting up to
+        # ~30s for the next coordinator tick. The tick-driven schedule (see
+        # coordinator.py's _control_light_schedule) already recomputes from
+        # the current stage on every tick and is therefore already correct
+        # within one tick of any transition — this closes that small window
+        # specifically because the Vegetative/Flowering boundary must be a
+        # single instant switch, not something that waits on the next poll.
+        self._hass.async_create_task(self._coord_ref._control_light_schedule())
 
     # ── Config update ─────────────────────────────────────────────────────────
 

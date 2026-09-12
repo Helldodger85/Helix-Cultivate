@@ -70,6 +70,18 @@ def mock_coord():
     coord._lights_state_prev = None
     coord._lights_on = MagicMock(return_value=True)
 
+    # ── drying-stage gentle-cyclic airflow state (Part 2.A) ─────────────────
+    coord._drying_humidity_high_since = None
+    coord._drying_humidity_override_alerted = False
+    coord._drying_cycle_phase_since = None
+    coord._drying_cycle_is_on = True
+    coord._drying_airflow_applied_pct = 0.0
+    coord._drying_humidity_override_active = False
+    # Real callables (not auto-mocks) so per-tier gentle drying actually
+    # exercises the tier-enabled gate rather than always looking "enabled".
+    coord._is_fan_tier_enabled = MagicMock(return_value=True)
+    coord._apply_fan_speed_to_tier = AsyncMock()
+
     # ── fire-once-per-episode notification guards ──────────────────────────
     # Real explicit bools (not left to MagicMock auto-vivification, which
     # would return a truthy child Mock and silently skip the "not yet

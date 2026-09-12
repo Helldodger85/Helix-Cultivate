@@ -145,6 +145,21 @@ from .const import (
     STAGE_DRYING,
     CONF_SUNRISE_RAMP_MIN,
     DEFAULT_SUNRISE_RAMP_MIN,
+    STAGE_LABELS,
+    # Supplemental Lighting (independent second light)
+    CONF_ZONE2_SUPPLEMENTAL_LIGHT,
+    CONF_SUPPLEMENTAL_LIGHT_TYPE,
+    CONF_SUPPLEMENTAL_MODE,
+    DEFAULT_SUPPLEMENTAL_MODE,
+    SUPPLEMENTAL_MODE_SYNCED,
+    CONF_SUPPLEMENTAL_TARGET_STAGES,
+    CONF_SUPPLEMENTAL_ON_TIME,
+    DEFAULT_SUPPLEMENTAL_ON_TIME,
+    CONF_SUPPLEMENTAL_DURATION_HOURS,
+    DEFAULT_SUPPLEMENTAL_DURATION_HOURS,
+    # DLI target alerting
+    CONF_DLI_ALERT_THRESHOLD_PCT,
+    DEFAULT_DLI_ALERT_THRESHOLD_PCT,
 )
 from .stage_manager import StageManager
 
@@ -183,6 +198,35 @@ def _parse_hhmm(value: Any, fallback: str) -> dtime:
         except (ValueError, TypeError, AttributeError):
             continue
     return dtime(6, 0)
+
+
+def _schedule_window_multiplier(
+    now_t: dtime, on_time: dtime, hours: float, ramp_minutes: float
+) -> float:
+    """Pure on/ramp/off window math: 0-100, how far through the window "now"
+    is. Standalone function (not a method on HelixCoordinator) specifically
+    so Supplemental Lighting's independent Targeted-mode schedule can reuse
+    the exact same midnight-safe math as the main light's
+    _light_schedule_multiplier without that already-working method being
+    touched at all — see HelixCoordinator._supplemental_targeted_pct.
+    """
+    if hours <= 0:
+        return 0.0
+    if hours >= 24:
+        return 100.0
+    on_minutes = on_time.hour * 60 + on_time.minute
+    now_minutes = now_t.hour * 60 + now_t.minute
+    elapsed = (now_minutes - on_minutes) % (24 * 60)
+    duration = hours * 60.0
+    if elapsed >= duration:
+        return 0.0
+    if ramp_minutes > 0:
+        if elapsed < ramp_minutes:
+            return round(100.0 * elapsed / ramp_minutes, 1)
+        remaining = duration - elapsed
+        if remaining < ramp_minutes:
+            return round(100.0 * remaining / ramp_minutes, 1)
+    return 100.0
 
 
 class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -297,6 +341,23 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # anti-short-cycle-style dwell timer, see _apply_grow_light_schedule.
         self._light_off_since: Optional[datetime] = None
         self._hid_restrike_delay_logged: bool = False
+
+        # ── Supplemental Lighting (independent second light) ───────────────────
+        self._supplemental_applied_pct: float = 0.0
+        self._supplemental_light_off_since: Optional[datetime] = None
+        self._supplemental_hid_restrike_delay_logged: bool = False
+
+        # ── Zone 2 drying-stage airflow strategy (Part 2) ───────────────────────
+        # Dwell timer for the hard humidity-ceiling override (2.A4).
+        self._drying_humidity_high_since: Optional[datetime] = None
+        self._drying_humidity_override_alerted: bool = False
+        # Cyclic-mode on/off phase tracking (2.A5) — exhaust and circulation
+        # alternate together on this single timer.
+        self._drying_cycle_phase_since: Optional[datetime] = None
+        self._drying_cycle_is_on: bool = True
+        # Exposed for the dashboard (2.B2).
+        self._drying_airflow_applied_pct: float = 0.0
+        self._drying_humidity_override_active: bool = False
 
     # ── Config helpers ────────────────────────────────────────────────────────
 
@@ -677,6 +738,174 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         multiplier = self._light_schedule_multiplier(light_id)
         applied_pct = round(self.light_intensity_pct * multiplier / 100.0, 1)
         await self._apply_grow_light_schedule(light_id, applied_pct)
+
+    # ── Supplemental Lighting (independent second light) ────────────────────
+    #
+    # A distinct light from the main grow light — UV, far-red, etc. — with
+    # its own entity mapping and its own scheduling mode. Deliberately does
+    # NOT feed into _estimate_ppfd()/DLI accumulation anywhere: supplemental
+    # fixtures' spectral characteristics don't fit the main-canopy efficacy
+    # assumptions, so including them would reduce estimate accuracy, not
+    # improve it. This is intentional — do not "fix" it later.
+
+    def _supplemental_targeted_pct(self) -> float:
+        """Targeted mode: fully independent schedule, decoupled from the
+        main light entirely. Returns 0 (actively held off, not just
+        "unmanaged") for any stage outside the configured target list, so a
+        manual toggle outside the designated window doesn't silently
+        persist uncorrected on the next tick.
+        """
+        target_stages = self._get(CONF_SUPPLEMENTAL_TARGET_STAGES, []) or []
+        if self.stage_manager.current_stage not in target_stages:
+            return 0.0
+
+        on_time = _parse_hhmm(
+            self._get(CONF_SUPPLEMENTAL_ON_TIME, DEFAULT_SUPPLEMENTAL_ON_TIME),
+            DEFAULT_SUPPLEMENTAL_ON_TIME,
+        )
+        duration_h = float(
+            self._get(CONF_SUPPLEMENTAL_DURATION_HOURS, DEFAULT_SUPPLEMENTAL_DURATION_HOURS)
+        )
+        supplemental_id = self._get(CONF_ZONE2_SUPPLEMENTAL_LIGHT)
+        ramp_minutes = self._effective_ramp_minutes(supplemental_id)
+        return _schedule_window_multiplier(dt_util.now().time(), on_time, duration_h, ramp_minutes)
+
+    async def _apply_supplemental_light_schedule(self, light_id: str, applied_pct: float) -> None:
+        """Push a schedule-computed brightness to the supplemental light
+        entity. Structurally identical to _apply_grow_light_schedule (same
+        HID hot-restrike lockout pattern) but with entirely separate state
+        (_supplemental_light_off_since etc.) — the main and supplemental
+        lights are independent physical fixtures that could each be HID or
+        not, with independent off-durations, so their lockouts must never
+        share state.
+        """
+        state = self.hass.states.get(light_id)
+        currently_on = state is not None and state.state == "on"
+
+        now = dt_util.utcnow()
+        if currently_on:
+            self._supplemental_light_off_since = None
+        elif self._supplemental_light_off_since is None:
+            self._supplemental_light_off_since = now
+
+        wants_on = applied_pct > 0
+        is_hid = self._get(CONF_SUPPLEMENTAL_LIGHT_TYPE) == LIGHT_HID
+
+        if (
+            is_hid and wants_on and not currently_on
+            and self._supplemental_light_off_since is not None
+        ):
+            elapsed_min = (now - self._supplemental_light_off_since).total_seconds() / 60.0
+            if elapsed_min < DEFAULT_HID_RESTRIKE_LOCKOUT_MIN:
+                if not self._supplemental_hid_restrike_delay_logged:
+                    _LOGGER.warning(
+                        "Helix Cultivate: delaying supplemental HID/ballast "
+                        "restrike for %s — off for %.1f of %.0f required "
+                        "cool-down minutes. Will retry once the lockout clears.",
+                        light_id, elapsed_min, DEFAULT_HID_RESTRIKE_LOCKOUT_MIN,
+                    )
+                    self._supplemental_hid_restrike_delay_logged = True
+                return
+        self._supplemental_hid_restrike_delay_logged = False
+
+        domain = light_id.split(".")[0]
+        clamped = max(0.0, min(100.0, applied_pct))
+        try:
+            if domain == "light":
+                if clamped <= 0:
+                    await self.hass.services.async_call(
+                        "light", "turn_off", {"entity_id": light_id}
+                    )
+                else:
+                    brightness = int(round(clamped / 100.0 * 255))
+                    await self.hass.services.async_call(
+                        "light", "turn_on",
+                        {"entity_id": light_id, "brightness": brightness},
+                    )
+            elif domain == "switch":
+                await self.hass.services.async_call(
+                    "switch", "turn_on" if clamped >= 50 else "turn_off",
+                    {"entity_id": light_id},
+                )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "Helix Cultivate: failed to apply supplemental light schedule "
+                "to %s: %s", light_id, exc,
+            )
+            return
+
+        self._supplemental_applied_pct = clamped
+
+    async def _control_supplemental_light(self) -> None:
+        """Drive the supplemental light for this tick — Synced (mirrors the
+        main light's schedule via the same, untouched
+        _light_schedule_multiplier) or Targeted (its own independent
+        stage-gated schedule).
+        """
+        light_id: Optional[str] = self._get(CONF_ZONE2_SUPPLEMENTAL_LIGHT)
+        if not light_id:
+            self._supplemental_applied_pct = 0.0
+            return
+
+        mode = self._get(CONF_SUPPLEMENTAL_MODE, DEFAULT_SUPPLEMENTAL_MODE)
+        if mode == SUPPLEMENTAL_MODE_SYNCED:
+            applied_pct = self._light_schedule_multiplier(light_id)
+        else:
+            applied_pct = self._supplemental_targeted_pct()
+
+        await self._apply_supplemental_light_schedule(light_id, applied_pct)
+
+    # ── DLI target alerting ──────────────────────────────────────────────────
+
+    async def _check_dli_target_and_reset(self) -> None:
+        """At the lights-off transition — the end of this photoperiod's "day"
+        for DLI purposes, not a calendar midnight, which would incorrectly
+        split an overnight-crossing photoperiod's DLI across two days —
+        compare the accumulated actual DLI against the active stage's
+        target and reset the accumulator for the next cycle.
+
+        The compared value is always the same one the DLI Today sensor
+        shows: a real PAR/DLI sensor's reading when mapped, otherwise
+        _estimate_ppfd()'s accumulation — never the supplemental light's
+        contribution either way (see the Supplemental Lighting section
+        above).
+        """
+        actual_dli = (self.data or {}).get(NS_ENERGY, {}).get("dli_today_mol", 0.0)
+        stage = self.stage_manager.current_stage
+        target_dli = float(self.stage_manager._profile(stage).get("target_dli_mol", 0.0))
+
+        if target_dli > 0:
+            deviation_pct = abs(actual_dli - target_dli) / target_dli * 100.0
+            threshold = float(
+                self._get(CONF_DLI_ALERT_THRESHOLD_PCT, DEFAULT_DLI_ALERT_THRESHOLD_PCT)
+            )
+            if deviation_pct > threshold:
+                direction = "below" if actual_dli < target_dli else "above"
+                self.hass.bus.async_fire(
+                    "helix_cultivate_dli_target_alert",
+                    {
+                        "entry_id": self._entry.entry_id,
+                        "stage": stage,
+                        "actual_dli_mol": round(actual_dli, 1),
+                        "target_dli_mol": target_dli,
+                        "deviation_pct": round(deviation_pct, 1),
+                    },
+                )
+                stage_label = STAGE_LABELS.get(stage, stage)
+                # Informational/advisory, not safety-critical — level="info"
+                # still raises a persistent_notification but skips the
+                # mobile push a "critical" level would trigger.
+                await self._notify_critical(
+                    title="Helix Cultivate — DLI Target",
+                    message=(
+                        f"Today's DLI was {actual_dli:.1f}/{target_dli:.0f} mol, "
+                        f"{deviation_pct:.0f}% {direction} target for {stage_label}."
+                    ),
+                    level="info",
+                )
+
+        if self.data:
+            self.data[NS_ENERGY]["dli_today_mol"] = 0.0
 
     # ── DLI accumulation ─────────────────────────────────────────────────────
 
@@ -1141,6 +1370,7 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ── Light schedule (must run before DLI accumulation — the estimation
         #    fallback below integrates against the brightness this just applied) ──
         await self._control_light_schedule()
+        await self._control_supplemental_light()
 
         # ── Accumulate energy ──────────────────────────────────────────────────
         self._accumulate_dli(COORDINATOR_UPDATE_INTERVAL.total_seconds())
@@ -1205,6 +1435,14 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Helix Cultivate: Breeze task for %s crashed — restarting", tier
                 )
                 self._start_breeze_task(tier)
+
+        # ── Lights-off day boundary: DLI target alert + reset ───────────────────
+        # Must run BEFORE _lights_state_prev is overwritten below — the
+        # transition check needs the OLD value (this tick's ClimateEngine.run()
+        # above already consumed it for lights-off purge detection).
+        if not lights_on_now and self._lights_state_prev is True:
+            await self._check_dli_target_and_reset()
+        self._lights_state_prev = lights_on_now
 
         # ── Assemble and return namespaced data ───────────────────────────────
         prev_energy = (self.data or {}).get(NS_ENERGY, {})

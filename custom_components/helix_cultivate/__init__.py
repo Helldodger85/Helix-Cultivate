@@ -35,6 +35,7 @@ VALID_STAGE_TARGET_KEYS: frozenset[str] = frozenset({
     "day_vpd_min", "day_vpd_max",
     "night_vpd_min", "night_vpd_max",
     "light_intensity_pct", "photoperiod_h", "fan_speed_pct",
+    "target_dli_mol",
 })
 
 # Static config-entry-backed settings fields with an explicit Save button in
@@ -55,6 +56,15 @@ VALID_SETTINGS_FIELD_KEYS: frozenset[str] = frozenset({
     "pp_flower_hours", "pp_flower_lights_on_time",
     "ramp_enabled", "ramp_preset",
     "light_wattage_w",
+    # Supplemental Lighting — independent second light, its own schedule.
+    "supplemental_light_type", "supplemental_mode",
+    "supplemental_target_stages", "supplemental_on_time",
+    "supplemental_duration_hours",
+    # DLI target alerting
+    "dli_alert_threshold_pct",
+    # Drying-stage airflow strategy (Zone 2 and/or dedicated Drying Room)
+    "drying_exhaust_min_pct", "drying_humidity_ceiling_pct",
+    "drying_airflow_mode", "drying_cycle_on_min", "drying_cycle_off_min",
 })
 
 PLATFORMS: list[Platform] = [
@@ -141,6 +151,10 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
     v1.5 migration: the same entity_id-pinning fix and rename as v1.3,
     extended to select entities (HelixSelect in select.py) — several of
     which have the identical name-vs-key slug mismatch sensors had.
+
+    v1.6 migration: "supplemental" removed from Main Lighting's fixture-type
+    options (it's now the independent Supplemental Lighting system) — any
+    existing zone2_light_type=="supplemental" moves to "led".
     """
     from .const import (  # local import avoids circular at module level
         CONF_ZONE1_AC, CONF_ZONE2_AC,
@@ -275,6 +289,32 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                 "were preserved for each rename.",
                 renamed,
             )
+
+        if current_minor < 6:
+            # v1.5 → v1.6: "supplemental" removed from Main Lighting's
+            # fixture-type options — it's now its own independent
+            # Supplemental Lighting system (CONF_ZONE2_SUPPLEMENTAL_LIGHT),
+            # not a zone2_light_type value. Any existing entry using it for
+            # the main light's fixture type moves to LED, the safest neutral
+            # default (moderate efficacy/leaf-offset, not the outlier HID
+            # values).
+            from .const import LIGHT_LED, LIGHT_SUPPLEMENTAL
+
+            migrated_supplemental = False
+            for opts_dict in (new_data, new_opts):
+                if opts_dict.get("zone2_light_type") == LIGHT_SUPPLEMENTAL:
+                    opts_dict["zone2_light_type"] = LIGHT_LED
+                    migrated_supplemental = True
+            if migrated_supplemental:
+                _LOGGER.warning(
+                    "Helix Cultivate: migrated entry to v1.6 — zone2_light_type "
+                    "was 'supplemental', which is no longer a valid Main "
+                    "Lighting fixture type; moved to 'led'. Configure a "
+                    "second light under Supplemental Lighting if that's what "
+                    "this entity actually is."
+                )
+            else:
+                _LOGGER.info("Helix Cultivate: migrated entry to v1.6 (no data changes)")
 
         hass.config_entries.async_update_entry(
             config_entry,

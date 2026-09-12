@@ -7,7 +7,7 @@ from typing import Any
 # ── Integration identity ─────────────────────────────────────────────────────
 DOMAIN: str = "helix_cultivate"
 CONFIG_VERSION: int = 1
-CONFIG_MINOR_VERSION: int = 5
+CONFIG_MINOR_VERSION: int = 6
 
 # ── Coordinator ──────────────────────────────────────────────────────────────
 COORDINATOR_UPDATE_INTERVAL: timedelta = timedelta(seconds=30)
@@ -149,56 +149,56 @@ STAGE_DAYNIGHT_DEFAULTS: dict[str, dict[str, Any]] = {
         "day_vpd_min": 0.35, "day_vpd_max": 0.50,
         "night_vpd_min": 0.30, "night_vpd_max": 0.45,
         "light_intensity_pct": 50, "photoperiod_h": 20.0,
-        "fan_speed_pct": 25,
+        "fan_speed_pct": 25, "target_dli_mol": 8.0,
     },
     STAGE_SEEDLING: {
         "day_temp_c": 23.5, "night_temp_c": 21.0,
         "day_vpd_min": 0.50, "day_vpd_max": 0.70,
         "night_vpd_min": 0.40, "night_vpd_max": 0.60,
         "light_intensity_pct": 60, "photoperiod_h": 20.0,
-        "fan_speed_pct": 30,
+        "fan_speed_pct": 30, "target_dli_mol": 12.0,
     },
     STAGE_EARLY_VEG: {
         "day_temp_c": 24.0, "night_temp_c": 20.0,
         "day_vpd_min": 0.60, "day_vpd_max": 0.90,
         "night_vpd_min": 0.45, "night_vpd_max": 0.65,
         "light_intensity_pct": 70, "photoperiod_h": 18.0,
-        "fan_speed_pct": 35,
+        "fan_speed_pct": 35, "target_dli_mol": 25.0,
     },
     STAGE_LATE_VEG: {
         "day_temp_c": 24.0, "night_temp_c": 20.0,
         "day_vpd_min": 0.80, "day_vpd_max": 1.05,
         "night_vpd_min": 0.60, "night_vpd_max": 0.80,
         "light_intensity_pct": 80, "photoperiod_h": 18.0,
-        "fan_speed_pct": 40,
+        "fan_speed_pct": 40, "target_dli_mol": 35.0,
     },
     STAGE_STRETCH: {
         "day_temp_c": 25.0, "night_temp_c": 21.0,
         "day_vpd_min": 0.90, "day_vpd_max": 1.15,
         "night_vpd_min": 0.70, "night_vpd_max": 0.90,
         "light_intensity_pct": 90, "photoperiod_h": 12.0,
-        "fan_speed_pct": 45,
+        "fan_speed_pct": 45, "target_dli_mol": 40.0,
     },
     STAGE_PEAK_FLOWER: {
         "day_temp_c": 26.0, "night_temp_c": 22.0,
         "day_vpd_min": 1.10, "day_vpd_max": 1.40,
         "night_vpd_min": 0.85, "night_vpd_max": 1.10,
         "light_intensity_pct": 100, "photoperiod_h": 12.0,
-        "fan_speed_pct": 50,
+        "fan_speed_pct": 50, "target_dli_mol": 45.0,
     },
     STAGE_RIPENING: {
         "day_temp_c": 24.0, "night_temp_c": 18.0,
         "day_vpd_min": 1.30, "day_vpd_max": 1.55,
         "night_vpd_min": 1.00, "night_vpd_max": 1.25,
         "light_intensity_pct": 85, "photoperiod_h": 12.0,
-        "fan_speed_pct": 45,
+        "fan_speed_pct": 45, "target_dli_mol": 38.0,
     },
     STAGE_DRYING: {
         "day_temp_c": 15.5, "night_temp_c": 15.5,
         "day_vpd_min": 1.05, "day_vpd_max": 1.15,
         "night_vpd_min": 1.05, "night_vpd_max": 1.15,
         "light_intensity_pct": 0, "photoperiod_h": 0.0,
-        "fan_speed_pct": 40,
+        "fan_speed_pct": 40, "target_dli_mol": 0.0,
     },
 }
 
@@ -217,40 +217,49 @@ PROG_LABELS: dict[str, str] = {
 LIGHT_LED: str = "led"
 LIGHT_FULL_SPECTRUM: str = "full_spectrum_led"
 LIGHT_HID: str = "hid_ballast"
+LIGHT_QUANTUM_BOARD: str = "quantum_board"
+# No longer a Main Lighting fixture type as of the Supplemental Lighting
+# system (const still defined so the v1.6 migration can reference it when
+# moving any existing zone2_light_type=="supplemental" value to LIGHT_LED).
 LIGHT_SUPPLEMENTAL: str = "supplemental"
 
 LIGHT_TYPE_OPTIONS: list[str] = [
     LIGHT_LED,
     LIGHT_FULL_SPECTRUM,
     LIGHT_HID,
-    LIGHT_SUPPLEMENTAL,
+    LIGHT_QUANTUM_BOARD,
 ]
 
 LIGHT_TYPE_LABELS: dict[str, str] = {
     LIGHT_LED: "LED",
     LIGHT_FULL_SPECTRUM: "Full Spectrum LED",
     LIGHT_HID: "HID / Ballast",
-    LIGHT_SUPPLEMENTAL: "Supplemental",
+    LIGHT_QUANTUM_BOARD: "Quantum Board",
 }
 
 # Default leaf-temperature offset per fixture type (°C, leaf below air temp).
 # Applied automatically based on zone2_light_type; overridden unconditionally
 # by a manually-persisted CONF_LEAF_TEMP_OFFSET_C (see
-# HelixCoordinator.effective_leaf_temp_offset_c).
+# HelixCoordinator.effective_leaf_temp_offset_c). Quantum board value is a
+# sensible starting default (slightly more negative than standard LED,
+# reflecting less radiant heat reaching the canopy), not a precisely
+# research-validated figure.
 FIXTURE_LEAF_OFFSET_DEFAULTS: dict[str, float] = {
     LIGHT_LED: -2.0,
     LIGHT_FULL_SPECTRUM: -2.5,
     LIGHT_HID: -4.0,
-    LIGHT_SUPPLEMENTAL: -1.0,
+    LIGHT_QUANTUM_BOARD: -2.2,
 }
 
 # Default photosynthetic efficacy per fixture type (μmol/J), used by the DLI
 # estimation fallback (B7) when no physical PAR/DLI sensor is mapped.
+# Quantum board runs slightly higher than standard LED, a sensible default
+# rather than a precisely research-validated figure.
 FIXTURE_EFFICACY_UMOL_PER_J: dict[str, float] = {
     LIGHT_LED: 2.7,
     LIGHT_FULL_SPECTRUM: 2.5,
     LIGHT_HID: 1.7,
-    LIGHT_SUPPLEMENTAL: 2.0,
+    LIGHT_QUANTUM_BOARD: 2.9,
 }
 
 # Minutes an HID/ballast fixture must stay off before it may be re-struck —
@@ -329,10 +338,89 @@ CONF_LIGHT_WATTAGE_W: str = "light_wattage_w"
 DEFAULT_LIGHT_WATTAGE_W: float = 600.0
 CONF_LIGHT_EFFICACY_UMOL_PER_J: str = "light_efficacy_umol_per_j"
 
+# ── DLI target alerting ───────────────────────────────────────────────────────
+# Compares the day's accumulated actual DLI (real sensor if mapped, else the
+# estimate above — never the supplemental light's contribution, see
+# CONF_ZONE2_SUPPLEMENTAL_LIGHT below) against the active stage's
+# target_dli_mol (STAGE_DAYNIGHT_DEFAULTS) at the lights-off transition.
+CONF_DLI_ALERT_THRESHOLD_PCT: str = "dli_alert_threshold_pct"
+DEFAULT_DLI_ALERT_THRESHOLD_PCT: float = 20.0
+
+# ── Supplemental Lighting (independent of Main Lighting above) ──────────────
+# A second, distinct light — UV, far-red, etc. — with its own entity mapping
+# and its own scheduling mode. Deliberately excluded from DLI estimation
+# (_estimate_ppfd only ever reflects the main grow light): supplemental
+# fixtures' spectral characteristics don't fit the main-canopy efficacy
+# assumptions, so folding them in would reduce estimate accuracy, not
+# improve it. This is intentional — do not "fix" it later.
+CONF_ZONE2_SUPPLEMENTAL_LIGHT: str = "zone2_supplemental_light"
+# Reuses LIGHT_TYPE_OPTIONS/LIGHT_TYPE_LABELS — a supplemental fixture can
+# legitimately be HID-class (e.g. an older UV bulb on a ballast), so the same
+# hot-restrike lockout must be able to apply to it.
+CONF_SUPPLEMENTAL_LIGHT_TYPE: str = "supplemental_light_type"
+
+CONF_SUPPLEMENTAL_MODE: str = "supplemental_mode"
+SUPPLEMENTAL_MODE_SYNCED: str = "synced"
+SUPPLEMENTAL_MODE_TARGETED: str = "targeted"
+SUPPLEMENTAL_MODE_OPTIONS: list[str] = [SUPPLEMENTAL_MODE_SYNCED, SUPPLEMENTAL_MODE_TARGETED]
+SUPPLEMENTAL_MODE_LABELS: dict[str, str] = {
+    SUPPLEMENTAL_MODE_SYNCED: "Synced with Main Light",
+    SUPPLEMENTAL_MODE_TARGETED: "Targeted (stage-specific schedule)",
+}
+DEFAULT_SUPPLEMENTAL_MODE: str = SUPPLEMENTAL_MODE_SYNCED
+
+# Targeted mode only — fully decoupled from the main light's schedule.
+# Empty stage list by default: nothing selected means the light stays off.
+CONF_SUPPLEMENTAL_TARGET_STAGES: str = "supplemental_target_stages"
+CONF_SUPPLEMENTAL_ON_TIME: str = "supplemental_on_time"
+DEFAULT_SUPPLEMENTAL_ON_TIME: str = "12:00"
+CONF_SUPPLEMENTAL_DURATION_HOURS: str = "supplemental_duration_hours"
+DEFAULT_SUPPLEMENTAL_DURATION_HOURS: float = 2.0
+
 # ── Drying zone fixed targets ────────────────────────────────────────────────
 DRYING_TARGET_TEMP_C: float = 15.5   # Fixed 60/60 drying profile target temp
 DRYING_TARGET_RH_PCT: float = 60.0   # Fixed 60/60 drying profile target RH
 DRYING_CYCLE_EXHAUST_PCT: float = 25.0  # Gentle cyclic exhaust for drying zone
+
+# ── Zone 2 drying-stage airflow strategy ─────────────────────────────────────
+# Applies to Zone 2's OWN exhaust/circulation whenever current_stage ==
+# STAGE_DRYING, regardless of whether a separate dedicated Drying Room is
+# also configured — Zone 2's airflow strategy during Drying must always be
+# gentle, never the normal VPD-driven bang-bang/PID logic (see
+# ClimateEngine._control_exhaust).
+CONF_DRYING_EXHAUST_MIN_PCT: str = "drying_exhaust_min_pct"
+# Higher than a typical grow-stage floor (DEFAULT_EXHAUST_MIN_PCT=10) — a
+# guaranteed baseline air exchange during cure is a mold-prevention measure,
+# not a comfort setting.
+DEFAULT_DRYING_EXHAUST_MIN_PCT: int = 20
+
+CONF_DRYING_HUMIDITY_CEILING_PCT: str = "drying_humidity_ceiling_pct"
+DEFAULT_DRYING_HUMIDITY_CEILING_PCT: float = 68.0
+# Minutes drying RH must sustain above the ceiling before the hard override
+# engages — reuses the same dwell-timer pattern as saturation/chronic-drift
+# detection, to avoid a single noisy reading forcing a false override.
+DRYING_HUMIDITY_CEILING_DWELL_MIN: float = 10.0
+
+CONF_DRYING_AIRFLOW_MODE: str = "drying_airflow_mode"
+DRYING_AIRFLOW_CONSTANT: str = "constant"
+DRYING_AIRFLOW_CYCLIC: str = "cyclic"
+DRYING_AIRFLOW_MODE_OPTIONS: list[str] = [DRYING_AIRFLOW_CONSTANT, DRYING_AIRFLOW_CYCLIC]
+DRYING_AIRFLOW_MODE_LABELS: dict[str, str] = {
+    DRYING_AIRFLOW_CONSTANT: "Constant — gentle, steady airflow throughout the dry",
+    DRYING_AIRFLOW_CYCLIC: (
+        "Cyclic — alternates airflow on and off at set intervals, some "
+        "growers prefer this to prevent one consistent air current from "
+        "drying part of the canopy faster than the rest"
+    ),
+}
+# Defaults to constant for every install so behavior never silently changes
+# for anyone already relying on the existing fixed-percentage approach.
+DEFAULT_DRYING_AIRFLOW_MODE: str = DRYING_AIRFLOW_CONSTANT
+
+CONF_DRYING_CYCLE_ON_MIN: str = "drying_cycle_on_min"
+DEFAULT_DRYING_CYCLE_ON_MIN: float = 15.0
+CONF_DRYING_CYCLE_OFF_MIN: str = "drying_cycle_off_min"
+DEFAULT_DRYING_CYCLE_OFF_MIN: float = 15.0
 
 # ── Safety defaults ───────────────────────────────────────────────────────────
 DEFAULT_HEATER_CUTOFF_C: float = 26.0
@@ -695,6 +783,7 @@ ALL_VALID_ZONE_DEVICE_KEYS: frozenset[str] = frozenset({
     CONF_ZONE2_HUMIDIFIER,
     CONF_ZONE2_DEHUMIDIFIER,
     CONF_ZONE2_GROW_LIGHT,
+    CONF_ZONE2_SUPPLEMENTAL_LIGHT,
     CONF_DLI_SENSOR,
     CONF_GROW_CAMERA,
     CONF_OUTDOOR_WEATHER_ENTITY,
