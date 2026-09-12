@@ -7,7 +7,7 @@ from typing import Any
 # ── Integration identity ─────────────────────────────────────────────────────
 DOMAIN: str = "helix_cultivate"
 CONFIG_VERSION: int = 1
-CONFIG_MINOR_VERSION: int = 7
+CONFIG_MINOR_VERSION: int = 8
 
 # ── Coordinator ──────────────────────────────────────────────────────────────
 COORDINATOR_UPDATE_INTERVAL: timedelta = timedelta(seconds=30)
@@ -689,6 +689,16 @@ NUMBER_LOWER_FAN_VARIANCE: str = "lower_fan_variance"
 NUMBER_LIGHT_INTENSITY: str = "light_intensity"
 NUMBER_SUNRISE_RAMP_MIN: str = "sunrise_ramp_min"
 NUMBER_ELECTRICITY_RATE: str = "electricity_rate"
+# Safety Interlocks (Part 1) — previously editable only via the Options
+# Flow wizard, with no live number entity to match heater_cutoff/
+# thermal_runaway's already-working pattern (initial value from Options
+# Flow at setup, ongoing tuning via the live entity afterward — both write
+# the same config key, so neither path conflicts with the other).
+NUMBER_SAFETY_HIGH_TEMP: str = "safety_high_temp"
+NUMBER_SAFETY_LOW_TEMP: str = "safety_low_temp"
+NUMBER_SAFETY_HIGH_RH: str = "safety_high_rh"
+NUMBER_SAFETY_LOW_RH: str = "safety_low_rh"
+NUMBER_SENSOR_DROPOUT_MIN: str = "sensor_dropout_min"
 
 SELECT_TOPOLOGY: str = "topology"
 SELECT_GROW_STAGE: str = "grow_stage"
@@ -811,6 +821,15 @@ ALL_VALID_ZONE_DEVICE_KEYS: frozenset[str] = frozenset({
     CONF_GROW_CAMERA,
     CONF_OUTDOOR_WEATHER_ENTITY,
     CONF_LOCAL_WEATHER_STATION_ENTITY,
+    # Canopy circulation fan mapping (Part 3) — each a list of up to 4 fan
+    # entity IDs (None for unset slots), same list already written by the
+    # native Options Flow's Fan Matrix step and consumed by
+    # coordinator._get_tier_fans()/_apply_fan_speed_to_tier(); previously
+    # absent from this whitelist, so the gear-icon hardware form had no way
+    # to write them at all.
+    CONF_UPPER_FANS,
+    CONF_MID_FANS,
+    CONF_LOWER_FANS,
     # Zone 1 — Conditioning Room
     CONF_LUNG_TEMP_SENSOR,
     CONF_LUNG_HUMIDITY_SENSOR,

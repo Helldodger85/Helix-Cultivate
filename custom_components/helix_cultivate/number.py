@@ -1,4 +1,4 @@
-"""Helix Cultivate — Number platform (17 number entities)."""
+"""Helix Cultivate — Number platform (22 number entities)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -17,6 +17,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CONF_SAFETY_HIGH_RH_PCT,
+    CONF_SAFETY_HIGH_TEMP_C,
+    CONF_SAFETY_LOW_RH_PCT,
+    CONF_SAFETY_LOW_TEMP_C,
+    CONF_SENSOR_DROPOUT_MIN,
     DEFAULT_ANTI_SHORT_CYCLE_MIN,
     DEFAULT_EXHAUST_MIN_PCT,
     DEFAULT_FAN_SPEED_PCT,
@@ -25,6 +30,11 @@ from .const import (
     DEFAULT_LEAF_TEMP_OFFSET_C,
     DEFAULT_LIGHT_INTENSITY_PCT,
     DEFAULT_RH_SETPOINT_PCT,
+    DEFAULT_SAFETY_HIGH_RH_PCT,
+    DEFAULT_SAFETY_HIGH_TEMP_C,
+    DEFAULT_SAFETY_LOW_RH_PCT,
+    DEFAULT_SAFETY_LOW_TEMP_C,
+    DEFAULT_SENSOR_DROPOUT_MIN_CFG,
     DEFAULT_SUNRISE_RAMP_MIN,
     DEFAULT_TEMP_SETPOINT_C,
     DEFAULT_THERMAL_RUNAWAY_C,
@@ -44,6 +54,11 @@ from .const import (
     NUMBER_MID_FAN_SPEED,
     NUMBER_MID_FAN_VARIANCE,
     NUMBER_RH_SETPOINT,
+    NUMBER_SAFETY_HIGH_RH,
+    NUMBER_SAFETY_HIGH_TEMP,
+    NUMBER_SAFETY_LOW_RH,
+    NUMBER_SAFETY_LOW_TEMP,
+    NUMBER_SENSOR_DROPOUT_MIN,
     NUMBER_SUNRISE_RAMP_MIN,
     NUMBER_TEMP_SETPOINT,
     NUMBER_THERMAL_RUNAWAY,
@@ -196,6 +211,74 @@ NUMBER_DESCRIPTIONS: tuple[HelixNumberDescription, ...] = (
         value_fn=lambda c: float(c._config.get("leaf_temp_offset_c", DEFAULT_LEAF_TEMP_OFFSET_C)),
         set_fn=_persistent_setter("leaf_temp_offset_c", float),
     ),
+    # Part 1 — previously editable only via the Options Flow wizard, with no
+    # live entity for the Settings > Safety tab's sliders to actually call;
+    # they rendered a value but had no listener wired at all.
+    HelixNumberDescription(
+        key=NUMBER_SAFETY_HIGH_TEMP,
+        name="Safety High Temp Cutoff",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=NumberDeviceClass.TEMPERATURE,
+        native_min_value=26.0,
+        native_max_value=40.0,
+        native_step=0.5,
+        mode=NumberMode.SLIDER,
+        icon="mdi:thermometer-high",
+        value_fn=lambda c: float(c._config.get(CONF_SAFETY_HIGH_TEMP_C, DEFAULT_SAFETY_HIGH_TEMP_C)),
+        set_fn=_persistent_setter(CONF_SAFETY_HIGH_TEMP_C, float),
+    ),
+    HelixNumberDescription(
+        key=NUMBER_SAFETY_LOW_TEMP,
+        name="Safety Low Temp Cutoff",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=NumberDeviceClass.TEMPERATURE,
+        native_min_value=5.0,
+        native_max_value=20.0,
+        native_step=0.5,
+        mode=NumberMode.SLIDER,
+        icon="mdi:thermometer-low",
+        value_fn=lambda c: float(c._config.get(CONF_SAFETY_LOW_TEMP_C, DEFAULT_SAFETY_LOW_TEMP_C)),
+        set_fn=_persistent_setter(CONF_SAFETY_LOW_TEMP_C, float),
+    ),
+    HelixNumberDescription(
+        key=NUMBER_SAFETY_HIGH_RH,
+        name="Safety High RH Cutoff",
+        native_unit_of_measurement="%",
+        device_class=NumberDeviceClass.HUMIDITY,
+        native_min_value=60.0,
+        native_max_value=95.0,
+        native_step=1.0,
+        mode=NumberMode.SLIDER,
+        icon="mdi:water-percent-alert",
+        value_fn=lambda c: float(c._config.get(CONF_SAFETY_HIGH_RH_PCT, DEFAULT_SAFETY_HIGH_RH_PCT)),
+        set_fn=_persistent_setter(CONF_SAFETY_HIGH_RH_PCT, float),
+    ),
+    HelixNumberDescription(
+        key=NUMBER_SAFETY_LOW_RH,
+        name="Safety Low RH Cutoff",
+        native_unit_of_measurement="%",
+        device_class=NumberDeviceClass.HUMIDITY,
+        native_min_value=15.0,
+        native_max_value=50.0,
+        native_step=1.0,
+        mode=NumberMode.SLIDER,
+        icon="mdi:water-percent-alert",
+        value_fn=lambda c: float(c._config.get(CONF_SAFETY_LOW_RH_PCT, DEFAULT_SAFETY_LOW_RH_PCT)),
+        set_fn=_persistent_setter(CONF_SAFETY_LOW_RH_PCT, float),
+    ),
+    HelixNumberDescription(
+        key=NUMBER_SENSOR_DROPOUT_MIN,
+        name="Sensor Dropout Timeout",
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+        device_class=NumberDeviceClass.DURATION,
+        native_min_value=5.0,
+        native_max_value=120.0,
+        native_step=1.0,
+        mode=NumberMode.SLIDER,
+        icon="mdi:timer-alert-outline",
+        value_fn=lambda c: float(c._config.get(CONF_SENSOR_DROPOUT_MIN, DEFAULT_SENSOR_DROPOUT_MIN_CFG)),
+        set_fn=_persistent_setter(CONF_SENSOR_DROPOUT_MIN, int),
+    ),
     # ── Fan speeds ────────────────────────────────────────────────────────────
     HelixNumberDescription(
         key=NUMBER_UPPER_FAN_SPEED,
@@ -203,7 +286,7 @@ NUMBER_DESCRIPTIONS: tuple[HelixNumberDescription, ...] = (
         native_unit_of_measurement="%",
         native_min_value=0.0,
         native_max_value=100.0,
-        native_step=1.0,
+        native_step=10.0,
         mode=NumberMode.SLIDER,
         icon="mdi:fan",
         value_fn=_fan_speed_getter(FAN_TIER_UPPER),
@@ -215,7 +298,7 @@ NUMBER_DESCRIPTIONS: tuple[HelixNumberDescription, ...] = (
         native_unit_of_measurement="%",
         native_min_value=0.0,
         native_max_value=100.0,
-        native_step=1.0,
+        native_step=10.0,
         mode=NumberMode.SLIDER,
         icon="mdi:fan",
         value_fn=_fan_speed_getter(FAN_TIER_MID),
@@ -227,7 +310,7 @@ NUMBER_DESCRIPTIONS: tuple[HelixNumberDescription, ...] = (
         native_unit_of_measurement="%",
         native_min_value=0.0,
         native_max_value=100.0,
-        native_step=1.0,
+        native_step=10.0,
         mode=NumberMode.SLIDER,
         icon="mdi:fan",
         value_fn=_fan_speed_getter(FAN_TIER_LOWER),
@@ -338,6 +421,11 @@ class HelixNumber(CoordinatorEntity[HelixCoordinator], NumberEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{coordinator._entry.entry_id}_{description.key}"
+        # Pin entity_id to the stable key (matches HelixSensor/HelixSelect) —
+        # `name` does not reliably slugify back to `key` (e.g. "temp_setpoint"
+        # vs "Temperature Setpoint"), and the frontend addresses these
+        # entities directly as number.helix_cultivate_{key}.
+        self.entity_id = f"number.{DOMAIN}_{description.key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator._entry.entry_id)},
             "name": "Helix Cultivate",

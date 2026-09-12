@@ -219,6 +219,8 @@ const BASE_CSS = `
   }
   .stat-cell .val { font-size: 1.05rem; font-weight: 700; }
   .stat-cell .lbl { font-size: 0.68rem; color: var(--hx-text2); margin-top: 2px; }
+  .stat-cell.disabled { opacity: 0.4; }
+  .stat-cell.disabled .val { color: var(--hx-text2); }
   /* ── Sliders ── */
   .slider-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
   .slider-lbl { font-size: 0.78rem; color: var(--hx-text2); min-width: 130px; }
@@ -2171,6 +2173,96 @@ function _hwLayerToggleRow(dataLayer, label, checked) {
     </div>`;
 }
 
+// ── Canopy circulation fan mapping (Part 3) ────────────────────────────────
+// Each tier stores up to 4 fan entity IDs as a single list
+// (upper_fans/mid_fans/lower_fans — matching CONF_UPPER_FANS etc., already
+// consumed by coordinator._get_tier_fans()/_apply_fan_speed_to_tier(), which
+// already drive every entity in the list simultaneously). The count selector
+// is pure local UI state — it just shows/hides slot rows via plain DOM
+// toggling (never a form rebuild, so in-progress picker selections in other
+// slots/sections are never disturbed) — and determines how many of the 4
+// slots are actually submitted on Save.
+const CANOPY_FAN_TIERS = [
+  { tier: 'upper', label: 'Upper Canopy', confKey: 'upper_fans' },
+  { tier: 'mid',   label: 'Mid Canopy',   confKey: 'mid_fans' },
+  { tier: 'lower', label: 'Lower Canopy', confKey: 'lower_fans' },
+];
+
+function _canopyFanTierSectionHtml(tier, label, currentFans) {
+  const fans = (currentFans || []).concat([null, null, null, null]).slice(0, 4);
+  const count = fans.filter(Boolean).length;
+  const rows = fans.map((val, i) => `
+    <div class="hw-row canopy-fan-slot-row" data-tier="${tier}" data-slot="${i}" ${i >= count ? 'hidden' : ''}
+      style="display:flex;flex-direction:column;gap:2px;margin-bottom:10px">
+      <label style="font-size:.75rem;color:var(--hx-text2)">Fan ${i + 1}</label>
+      <div class="canopy-fan-entity-slot" data-tier="${tier}" data-slot="${i}" data-current="${val || ''}"></div>
+    </div>`).join('');
+  return `
+    <div class="sec">${label} Fans</div>
+    <div class="metric-row" style="margin-bottom:8px">
+      <span class="metric-label">Fan Count</span>
+      <select class="canopy-fan-count-select" data-tier="${tier}" style="padding:6px;border-radius:6px;
+        border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
+        ${[0, 1, 2, 3, 4].map(n => `<option value="${n}" ${n === count ? 'selected' : ''}>${n}</option>`).join('')}
+      </select>
+    </div>
+    <div class="canopy-fan-slots" data-tier="${tier}">${rows}</div>`;
+}
+
+function _renderCanopyFanMappingSection(d) {
+  const hwMap = d.hw_map || {};
+  return `
+    <div class="sec">🌀 Circulation Fan Mapping</div>
+    <div style="font-size:.72rem;color:var(--hx-text2);margin-bottom:8px">
+      Map up to 4 fan entities per canopy tier — all are driven to the same
+      speed simultaneously (breeze variance and wind sweep apply per-tier,
+      not per-fan).
+    </div>
+    ${CANOPY_FAN_TIERS.map(t => _canopyFanTierSectionHtml(t.tier, t.label, hwMap[t.confKey])).join('')}`;
+}
+
+function _bindCanopyFanMappingSection(shadowRoot, hostEl) {
+  hostEl._canopyFanSlotValues = hostEl._canopyFanSlotValues || {};
+  CANOPY_FAN_TIERS.forEach(({ tier, confKey }) => {
+    const slotValues = shadowRoot.querySelectorAll(`.canopy-fan-entity-slot[data-tier="${tier}"]`);
+    const values = new Array(4).fill(null);
+    slotValues.forEach(slot => {
+      const idx = parseInt(slot.dataset.slot, 10);
+      values[idx] = slot.dataset.current || null;
+    });
+    hostEl._canopyFanSlotValues[tier] = values;
+
+    const countSel = shadowRoot.querySelector(`.canopy-fan-count-select[data-tier="${tier}"]`);
+    const currentCount = countSel ? parseInt(countSel.value, 10) : values.filter(Boolean).length;
+    hostEl._pendingDevices[confKey] = values.map((v, i) => (i < currentCount ? v : null));
+
+    slotValues.forEach(slot => {
+      const idx = parseInt(slot.dataset.slot, 10);
+      const currentVal = slot.dataset.current || '';
+      const keyDef = { key: `${tier}_fan_${idx + 1}`, label: `Fan ${idx + 1}`, domains: ['fan'] };
+      const picker = _entityPickerEl(keyDef, currentVal, hostEl._hass, (val) => {
+        hostEl._canopyFanSlotValues[tier][idx] = val;
+        const count = countSel ? parseInt(countSel.value, 10) : 4;
+        if (idx < count) hostEl._pendingDevices[confKey][idx] = val;
+      });
+      slot.appendChild(picker);
+    });
+
+    if (countSel) {
+      countSel.addEventListener('change', () => {
+        const count = parseInt(countSel.value, 10);
+        shadowRoot.querySelectorAll(`.canopy-fan-slot-row[data-tier="${tier}"]`).forEach(row => {
+          const idx = parseInt(row.dataset.slot, 10);
+          row.hidden = idx >= count;
+        });
+        hostEl._pendingDevices[confKey] = hostEl._canopyFanSlotValues[tier].map(
+          (v, i) => (i < count ? v : null)
+        );
+      });
+    }
+  });
+}
+
 // ── Supplemental Lighting (independent second light) ──────────────────────
 // Its own clearly separate sub-section of the Primary Grow Space
 // hardware-mapping form — a distinct light from Main Lighting, with its own
@@ -2481,7 +2573,7 @@ class HelixTabGrowspace extends HTMLElement {
         </div>
         <div class="slider-row">
           <span class="slider-lbl">Speed</span>
-          <input type="range" class="fan-speed" data-tier="${tier}" min="0" max="100" step="1"
+          <input type="range" class="fan-speed" data-tier="${tier}" min="0" max="100" step="10"
             value="${speed}" ${breeze ? 'disabled style="opacity:.4"' : ''}/>
           <span class="slider-val" id="spd-${tier}">${fPct(speed)}</span>
         </div>
@@ -2529,6 +2621,7 @@ class HelixTabGrowspace extends HTMLElement {
           to prevent microclimates and add stem-strengthening stress. Growing stages only;
           never active during Drying.
         </div>
+        ${_renderCanopyFanMappingSection(d)}
         <div class="sec">Grow Light Fixture Type</div>
         <select id="hw-light-type-select" style="width:100%;padding:8px;border-radius:8px;
           border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
@@ -2576,6 +2669,9 @@ class HelixTabGrowspace extends HTMLElement {
         if (dimSl) fields.light_high_temp_dim_c = parseFloat(dimSl.value);
         return fields;
       });
+      // Runs after _bindHwPicker (which resets _pendingDevices = {}) so the
+      // canopy fan lists it populates directly into _pendingDevices survive.
+      _bindCanopyFanMappingSection(this.shadowRoot, this);
       // Light type is a live select entity — persists immediately on
       // change, independent of the hardware-mapping Save button above.
       const lightTypeSel = this.shadowRoot.querySelector('#hw-light-type-select');
@@ -2619,15 +2715,21 @@ class HelixTabGrowspace extends HTMLElement {
     const midFanOn = d.mid_canopy_fan_enabled !== false;
     const lowerFanOn = d.lower_canopy_fan_enabled !== false;
 
+    // Part 2: a disabled Mid/Lower sensor tier renders an actual placeholder
+    // cell rather than an empty string — an empty string collapses in the
+    // CSS grid, so the next real cell auto-flows into the freed column and
+    // Lower ends up sitting where Mid should be. A placeholder keeps all
+    // three columns fixed (Upper/Mid/Lower) regardless of which tiers are
+    // enabled.
     const tempCells = [
       `<div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.upper_temp_c)}</div><div class="lbl">Upper °C</div></div>`,
-      midSensorOn ? `<div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.mid_temp_c)}</div><div class="lbl">Mid °C</div></div>` : '',
-      lowerSensorOn ? `<div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.lower_temp_c)}</div><div class="lbl">Lower °C</div></div>` : '',
+      midSensorOn ? `<div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.mid_temp_c)}</div><div class="lbl">Mid °C</div></div>` : `<div class="stat-cell disabled"><div class="val">—</div><div class="lbl">Mid °C</div></div>`,
+      lowerSensorOn ? `<div class="stat-cell"><div class="val" style="color:#ef4444">${fT(d.lower_temp_c)}</div><div class="lbl">Lower °C</div></div>` : `<div class="stat-cell disabled"><div class="val">—</div><div class="lbl">Lower °C</div></div>`,
     ].join('');
     const rhCells = [
       `<div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.upper_rh_pct)}</div><div class="lbl">Upper RH</div></div>`,
-      midSensorOn ? `<div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.mid_rh_pct)}</div><div class="lbl">Mid RH</div></div>` : '',
-      lowerSensorOn ? `<div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.lower_rh_pct)}</div><div class="lbl">Lower RH</div></div>` : '',
+      midSensorOn ? `<div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.mid_rh_pct)}</div><div class="lbl">Mid RH</div></div>` : `<div class="stat-cell disabled"><div class="val">—</div><div class="lbl">Mid RH</div></div>`,
+      lowerSensorOn ? `<div class="stat-cell"><div class="val" style="color:#209cee">${fRH(d.lower_rh_pct)}</div><div class="lbl">Lower RH</div></div>` : `<div class="stat-cell disabled"><div class="val">—</div><div class="lbl">Lower RH</div></div>`,
     ].join('');
 
     const uniformityHtml = (d.canopy_uniformity_insight)
@@ -2636,10 +2738,15 @@ class HelixTabGrowspace extends HTMLElement {
            <span class="metric-val" style="color:var(--hx-amber);font-size:.78rem;text-align:right">${d.canopy_uniformity_insight}</span>
          </div>` : '';
 
+    // Part 3.3: a tier with 0 mapped fans has nothing to control, so its
+    // card is fully absent from the matrix — distinct from Part 2's
+    // sensor-cell fix, which keeps an empty PLACEHOLDER for temp/RH
+    // specifically to preserve fixed grid columns. There's no equivalent
+    // fixed-position requirement for fan control cards.
     const fanCards = [
-      this._fanCard('upper','Upper Canopy','⬆'),
-      midFanOn ? this._fanCard('mid','Mid Canopy','⟺') : '',
-      lowerFanOn ? this._fanCard('lower','Lower Canopy','⬇') : '',
+      (d.upper_fan_count ?? 0) > 0 ? this._fanCard('upper','Upper Canopy','⬆') : '',
+      midFanOn && (d.mid_fan_count ?? 0) > 0 ? this._fanCard('mid','Mid Canopy','⟺') : '',
+      lowerFanOn && (d.lower_fan_count ?? 0) > 0 ? this._fanCard('lower','Lower Canopy','⬇') : '',
     ].join('');
 
     // ── Lighting & Growth Schedule (Phase 1.5) ──────────────────────────────
@@ -3984,28 +4091,37 @@ class HelixTabSettings extends HTMLElement {
       });
     }
 
-    // Safety sliders
+    // Safety sliders (Part 1) — each now has a live number entity (built to
+    // match the existing heater_cutoff/thermal_runaway pattern) to actually
+    // persist to; previously these only updated the on-screen label.
     const safetySliders = [
-      ['#safe-hi-temp', '#safe-hi-temp-val', fT],
-      ['#safe-lo-temp', '#safe-lo-temp-val', fT],
-      ['#safe-hi-rh',   '#safe-hi-rh-val',   fRH],
-      ['#safe-lo-rh',   '#safe-lo-rh-val',   fRH],
+      ['#safe-hi-temp', '#safe-hi-temp-val', fT,   'number.helix_cultivate_safety_high_temp'],
+      ['#safe-lo-temp', '#safe-lo-temp-val', fT,   'number.helix_cultivate_safety_low_temp'],
+      ['#safe-hi-rh',   '#safe-hi-rh-val',   fRH,  'number.helix_cultivate_safety_high_rh'],
+      ['#safe-lo-rh',   '#safe-lo-rh-val',   fRH,  'number.helix_cultivate_safety_low_rh'],
     ];
-    for (const [slId, valId, fmt] of safetySliders) {
+    for (const [slId, valId, fmt, entityId] of safetySliders) {
       const sl = this.shadowRoot.querySelector(slId);
       const vl = this.shadowRoot.querySelector(valId);
       if (!sl) continue;
       sl.addEventListener('input', e => { if (vl) vl.textContent = fmt(parseFloat(e.target.value)); });
+      sl.addEventListener('change', e => this._svc('number', 'set_value', {
+        entity_id: entityId, value: parseFloat(e.target.value)
+      }));
     }
     const dropSl = this.shadowRoot.querySelector('#dropout-min');
     const dropVl = this.shadowRoot.querySelector('#dropout-min-val');
     if (dropSl) {
       dropSl.addEventListener('input', e => { if (dropVl) dropVl.textContent = `${e.target.value} min`; });
+      dropSl.addEventListener('change', e => this._svc('number', 'set_value', {
+        entity_id: 'number.helix_cultivate_sensor_dropout_min', value: parseFloat(e.target.value)
+      }));
     }
 
-    // Dew point margin (Part 3) — unlike its sibling Safety sliders above
-    // (currently display-only, a pre-existing gap out of scope here), this
-    // one actually persists on change.
+    // Dew point margin — persists via the explicit-Save/update_settings_fields
+    // draft-config path rather than a live number entity (dew_point_margin_c
+    // is not one), which is why it's bound differently than the Safety
+    // sliders above.
     const dewSl = this.shadowRoot.querySelector('#dew-point-margin-slider');
     const dewVl = this.shadowRoot.querySelector('#dew-point-margin-val');
     if (dewSl) {
@@ -4222,19 +4338,21 @@ class HelixPanel extends HTMLElement {
       zone2_humid_on:       this._attr('exhaust_speed', 'sensor', 'zone2_humid_on')   || false,
       zone2_dehumid_on:     this._attr('exhaust_speed', 'sensor', 'zone2_dehumid_on') || false,
 
-      // Fan matrix
+      // Fan matrix — count (Part 3.3) reflects the actual number of mapped
+      // fan entities (upper_fans/mid_fans/lower_fans, written by the
+      // gear-icon Circulation Fan Mapping section), not a hardcoded 0.
       upper_fan_speed:    this._num('upper_fan_speed')    ?? 50,
       upper_fan_variance: this._num('upper_fan_variance') ?? 20,
       breeze_upper_enabled: this._sw('breeze_upper'),
-      upper_fan_count: 0,
+      upper_fan_count: (this._hwMap.upper_fans || []).filter(Boolean).length,
       mid_fan_speed:    this._num('mid_fan_speed')    ?? 50,
       mid_fan_variance: this._num('mid_fan_variance') ?? 20,
       breeze_mid_enabled: this._sw('breeze_mid'),
-      mid_fan_count: 0,
+      mid_fan_count: (this._hwMap.mid_fans || []).filter(Boolean).length,
       lower_fan_speed:    this._num('lower_fan_speed')    ?? 50,
       lower_fan_variance: this._num('lower_fan_variance') ?? 20,
       breeze_lower_enabled: this._sw('breeze_lower'),
-      lower_fan_count: 0,
+      lower_fan_count: (this._hwMap.lower_fans || []).filter(Boolean).length,
 
       // Switches
       smooth_glides: this._sw('smooth_glides'),

@@ -95,8 +95,8 @@ def _rename_domain_entities_to_stable_key(
     hass: HomeAssistant, config_entry: ConfigEntry, domain: str
 ) -> int:
     """Rename every entity of `domain` on this config entry so its entity_id
-    matches sensor.{DOMAIN}_{key} / select.{DOMAIN}_{key} — i.e. the stable
-    entity_description key both HelixSensor and HelixSelect now pin
+    matches {domain}.{DOMAIN}_{key} — i.e. the stable entity_description key
+    that HelixSensor, HelixSelect, HelixNumber, and HelixSwitch now all pin
     entity_id to directly, rather than whatever HA's name-derived slug
     happened to produce before that fix. Skips (with a warning, not an
     error) any rename whose target entity_id is already occupied. Only
@@ -350,6 +350,30 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                 "'active', preserving this entry's current stage and "
                 "day-count exactly as-is. Only new installs from this "
                 "version onward start in the new 'not_started' state."
+            )
+
+        if current_minor < 8:
+            # v1.7 → v1.8: same entity_id-pinning fix as v1.3 (sensor) and
+            # v1.5 (select), extended to number and switch — HelixNumber and
+            # HelixSwitch never pinned entity_id at all, so HA fell back to
+            # deriving it from `name`, which for most entries (e.g. key
+            # "temp_setpoint" vs name "Temperature Setpoint", key
+            # "breeze_upper" vs name "Upper Canopy Breeze Mode") does not
+            # slugify back to the key. Every number.set_value/switch.turn_on
+            # call in the frontend targets number.helix_cultivate_{key} /
+            # switch.helix_cultivate_{key} directly, so those calls were
+            # silently hitting nonexistent entities — this is the actual
+            # root cause behind sliders and toggles that appear to work but
+            # never take effect.
+            renamed_number = _rename_domain_entities_to_stable_key(hass, config_entry, "number")
+            renamed_switch = _rename_domain_entities_to_stable_key(hass, config_entry, "switch")
+            _LOGGER.warning(
+                "Helix Cultivate: migrated entry to v1.8 — renamed %d number "
+                "and %d switch entity_id(s) to their stable key so live "
+                "sliders/toggles reach the entity they display; history and "
+                "statistics were preserved for each rename.",
+                renamed_number,
+                renamed_switch,
             )
 
         hass.config_entries.async_update_entry(

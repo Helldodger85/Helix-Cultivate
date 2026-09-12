@@ -6,22 +6,58 @@ Helix Cultivate turns Home Assistant into a full climate controller for a grow t
 
 Built as a free alternative to commercial cultivation controllers, using the sensors, fans, heaters, and humidifiers you map yourself — no proprietary hardware required.
 
+> **Project status:** actively developed, pre-1.0 software. Features are genuinely functional and covered by an automated test suite, but the project is still finding and fixing real bugs release to release — see [Known Issues / Current Limitations](#known-issues--current-limitations) below before relying on it for anything safety-critical without independent hardware-level protection.
+
 ---
 
 ## Features
 
+### Climate control
 - **Day/night VPD-range control** — a full deadband corridor per growth stage, not just a single point target, so equipment isn't fighting itself trying to hold an exact number.
 - **Predictive climate management** — tracks the rate of change of VPD and pre-empts swings a few minutes ahead, rather than reacting only after a threshold is crossed.
+- **Dew point / condensation prediction** — forces exhaust to 100% and lung-room heating on when leaf temperature comes within a configurable margin of the calculated dew point, targeting the actual mechanism behind botrytis/powdery mildew risk rather than just a fixed humidity ceiling.
+- **Predictive pre-heating** — brings the room up to temperature ahead of a scheduled lights-off transition instead of reacting after the drop has already started.
+- **Multiple independent canopy sensor tiers** — Upper canopy is mandatory; Mid and Lower are independently toggleable, so a single-tier tent and a fully-instrumented multi-tier canopy are both first-class configurations.
+
+### Circulation
+- **Multi-fan-per-tier circulation mapping** — map up to 4 fan entities to each canopy tier (Upper/Mid/Lower) from the gear-icon hardware form; every mapped fan in a tier is driven to the same computed speed simultaneously.
+- **Breeze mode** — genuinely time-varying speed modulation per tier, cycling a configurable ± variance around the tier's base speed on an async interval, independently enabled/persisted per tier.
+- **Canopy wind sweep** — rotates a boosted speed among currently-enabled circulation tiers on a dwell timer instead of running them all at a static speed, mimicking natural gusting wind to reduce microclimates and add stem-strengthening stress. Automatically suspends a tier's own Breeze cycling while wind sweep is actively boosting that tier, then resumes it once released. Growing stages only — never active during Drying.
+- **High/low fan-control resolution modes** — continuous percentage, 10-step PWM, or bang-bang, selectable per install.
+
+### Lighting
+- **Growth Mode scheduling** — Photoperiod (Veg/Flower hour + lights-on-time pairs) or Autoflower (fixed daily hours), with an optional sunrise/sunset dimming ramp.
+- **DLI (Daily Light Integral) engine** — tracks accumulated light per day against a target, with configurable alert thresholds and a photoperiod-extension option.
+- **High-temperature graduated light dimming** — throttles light intensity as a soft step strictly below the hard thermal-runaway cutoff, rather than only having a single all-or-nothing cutoff.
+- **Supplemental Lighting** — a second, independent light (UV, far-red, or other targeted spectra) with its own fixture type and either Synced (follows Main Lighting) or Targeted (specific stages, its own schedule) mode.
+
+### Safety
+- **Configurable safety interlocks** — high/low temperature cutoffs, high/low humidity cutoffs, and a sensor-dropout failsafe timeout, each exposed as both an initial Options Flow field and a live, ongoing-tunable number entity.
+- **Thermal runaway / heater over-temp cutoffs** — hard "always wins" overrides that take priority over normal setpoint control.
+- **Sensor dropout detection** — falls back to a safe exhaust floor and suspends VPD control if the primary sensor goes stale beyond its configured timeout, with a Home Assistant Repairs entry surfaced for visibility.
+- **Anti-short-cycle protection** — a minimum dwell timer between compressor on/off transitions.
+
+### Drying
+- **Locked 60/60 drying profile by default** (15.5°C / 60% RH) — a safe, standard cure profile that stays locked until you explicitly unlock custom day/night targets.
+- **Selectable drying airflow strategy** — constant, gentle-cyclic (on/off dwell timers), or a dedicated minimum floor — with an explicit humidity-ceiling override that takes priority over whichever mode is active.
+
+### Cycle & stage management
 - **Full stage lifecycle** — Germination → Seedling → Early Veg → Late Veg → Stretch → Peak Flower → Ripening → Drying, each with its own day/night temperature anchor and VPD range.
-- **Locked 60/60 drying profile by default** — a safe, standard cure profile (15.5°C / 60% RH) that stays locked until you explicitly unlock custom targets.
+- **Explicit cycle lifecycle** — a cycle is either not-started or active; starting one and closing out a harvest are deliberate actions rather than an always-on implicit state.
+- **Stage-progression heads-up warnings** — flags when a stage is running unusually long against its planned duration.
+- **Recipe sharing** — export your tuned stage profiles as YAML and import someone else's.
+
+### Energy & monitoring
+- **Energy & ROI tracking** — live power draw, per-cycle energy cost against a configurable tariff (anytime/peak-shoulder-offpeak), and a harvest report with $/g yield efficiency, with a previous-cycle archive.
+- **Per-zone energy monitoring slots** — up to 4 wattage-sensor slots each for the Primary Grow Space, Conditioning Room, Drying Room, and a global/whole-system total.
+- **Weather-aware feedforward** — optionally factors outdoor temperature/humidity (local weather station override or a mapped weather entity forecast) into pre-conditioning.
+
+### Platform & UX
 - **Hardware-agnostic setup** — map any Home Assistant entity (sensor, switch, fan, climate) to a role directly from each zone's card via a gear-icon UI. No YAML editing required.
 - **Flexible topology** — run a Primary Grow Space alone (Standalone), or coordinate it with a Conditioning Room and dedicated Drying Room (Coordinated).
-- **Weather-aware feedforward** — optionally factors outdoor temperature/humidity forecasts into pre-conditioning.
-- **Energy & ROI tracking** — live power draw, per-cycle energy cost, and a harvest report with $/g yield efficiency.
-- **Recipe sharing** — export your tuned stage profiles as YAML and import someone else's.
-- **Diagnostics & Repairs** — built-in HA diagnostics download and proactive Repairs entries for common misconfiguration.
+- **Custom dashboard** — live VPD gauge, DLI tracker, sparkline history with target-range bands, a circulation fan matrix, and a companion glance card for any Lovelace dashboard.
+- **Diagnostics & Repairs** — built-in HA diagnostics download and proactive Repairs entries for common misconfiguration (e.g. sensor dropout).
 - **Journal & IPM logging** — nutrient entries, pest management events, and maintenance reminders in one place.
-- **Custom dashboard** — live VPD gauge, DLI tracker, sparkline history with target-range bands, and a companion glance card for any Lovelace dashboard.
 
 ## Installation
 
@@ -51,9 +87,16 @@ All hardware mapping happens afterward, per zone, using the **⚙ gear icon** on
 - At minimum: one temperature and one humidity sensor for your primary grow space
 - Everything else — fans, heaters, humidifiers, dehumidifiers, cameras, weather integration — is optional and can be added incrementally
 
-## Project status
+## Known Issues / Current Limitations
 
-Actively developed. Expect frequent changes while core features stabilize — back up your Home Assistant configuration before major updates, and check release notes for any required migration steps.
+This is actively-developed, pre-1.0 software. Real bugs — including at least one safety-relevant persistence issue and a systemic entity-addressing bug affecting several live dashboard controls — have been found and fixed across recent releases through direct, ongoing auditing, not because the codebase has reached a settled, fully-verified state. Treat every control on the dashboard as something to verify actually took effect (drag a slider, reload, confirm) rather than assumed-correct, especially after an update.
+
+Known, honestly-scoped caveats as of this release:
+
+- Frontend (dashboard panel) behavior — layout, dynamic hardware-mapping forms, and live control wiring — is verified through code review and syntax checking rather than an automated browser test suite; the automated test suite (`tests/`, run via `pytest`) covers backend logic only (coordinator, climate engine, config migrations, entity platforms).
+- The Breeze engine's random re-modulation interval (roughly 8-25 seconds) is on the shorter end of what feels like natural gusting for some fan hardware; there's no UI to tune this interval yet.
+
+Current and historical issues are tracked on [GitHub Issues](https://github.com/helix-cultivate/helix_cultivate/issues) — that's the authoritative list, not a static snapshot here that would inevitably go stale.
 
 ## Disclaimer
 

@@ -19,8 +19,6 @@ from homeassistant.util import dt as dt_util
 from .const import (
     BREEZE_INTERVAL_MAX_SEC,
     BREEZE_INTERVAL_MIN_SEC,
-    CONF_BREEZE_ENABLED,
-    CONF_BREEZE_VARIANCE,
     CONF_DLI_SENSOR,
     CONF_DRYING_CUSTOM_UNLOCKED,
     CONF_DRYING_HUMIDITY_SENSOR,
@@ -94,9 +92,11 @@ from .const import (
     DEFAULT_TIMELAPSE_CAPTURE_TIME,
     DEFAULT_EXHAUST_SAFE_FLOOR_PCT,
     DEFAULT_FAN_SPEED_PCT,
+    DEFAULT_FAN_VARIANCE_PCT,
     DEFAULT_HARVEST_VALUE,
     DEFAULT_LEAF_TEMP_OFFSET_C,
-    DEFAULT_SENSOR_DROPOUT_MIN,
+    CONF_SENSOR_DROPOUT_MIN,
+    DEFAULT_SENSOR_DROPOUT_MIN_CFG,
     DOMAIN,
     FAN_CONTROL_BANG_BANG,
     FAN_CONTROL_PWM_10STEP,
@@ -370,9 +370,14 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.light_intensity_pct: float = 100.0
         self.smooth_glides_enabled: bool = bool(self._config.get("smooth_glides", True))
         self.dli_extension_enabled: bool = False
-        self.breeze_upper_enabled: bool = bool(self._config.get(CONF_BREEZE_ENABLED, False))
-        self.breeze_mid_enabled: bool = bool(self._config.get(CONF_BREEZE_ENABLED, False))
-        self.breeze_lower_enabled: bool = bool(self._config.get(CONF_BREEZE_ENABLED, False))
+        # Part 4.1: each tier reads its own persisted breeze_{tier}_enabled key
+        # (matching the breeze_variance_{tier} convention already used for
+        # variance) — previously all three read the single shared
+        # CONF_BREEZE_ENABLED key, so enabling Breeze on one tier silently
+        # enabled it on all three at once.
+        self.breeze_upper_enabled: bool = self._read_persisted_breeze_enabled(FAN_TIER_UPPER)
+        self.breeze_mid_enabled: bool = self._read_persisted_breeze_enabled(FAN_TIER_MID)
+        self.breeze_lower_enabled: bool = self._read_persisted_breeze_enabled(FAN_TIER_LOWER)
         # ── Manual override flags (set by number entities, cleared on stage advance) ──
         self.temp_setpoint_manual_override: bool = False
         self.vpd_target_manual_override: bool = False
@@ -415,6 +420,10 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Retrieve a config value from the merged entry config."""
         return self._config.get(key, default)
 
+    def _read_persisted_breeze_enabled(self, tier: str) -> bool:
+        """Read this tier's own persisted breeze_{tier}_enabled key (Part 4.1)."""
+        return bool(self._config.get(f"breeze_{tier}_enabled", False))
+
     # ── Sensor median buffer ──────────────────────────────────────────────────
 
     def _read_sensor(self, entity_id: Optional[str]) -> Optional[float]:
@@ -436,16 +445,25 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ── Primary sensor dropout watchdog ──────────────────────────────────────
 
     def _check_sensor_dropout(self) -> bool:
-        """Return True if the primary temperature sensor has been stale > dropout threshold."""
+        """Return True if the primary temperature sensor has been stale > dropout threshold.
+
+        Part 1 safety fix: this previously always used the hardcoded
+        DEFAULT_SENSOR_DROPOUT_MIN constant regardless of what a grower had
+        configured (via the Options Flow, or now the live Dropout Timeout
+        number entity) — CONF_SENSOR_DROPOUT_MIN was persisted correctly but
+        silently never actually read here, so the dropout timeout was not
+        genuinely configurable at all.
+        """
         primary_temp_id: Optional[str] = self._get(CONF_PRIMARY_TEMP_SENSOR)
         if not primary_temp_id:
             return True
+        dropout_min = float(self._get(CONF_SENSOR_DROPOUT_MIN, DEFAULT_SENSOR_DROPOUT_MIN_CFG))
         state = self.hass.states.get(primary_temp_id)
         if state is None or state.state in ("unavailable", "unknown", ""):
             if self._primary_last_seen is None:
                 return True
             stale_secs = (dt_util.utcnow() - self._primary_last_seen).total_seconds()
-            return stale_secs > DEFAULT_SENSOR_DROPOUT_MIN * 60
+            return stale_secs > dropout_min * 60
         self._primary_last_seen = dt_util.utcnow()
         return False
 
@@ -1482,7 +1500,11 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             while True:
                 base = self._fan_speeds.get(tier, float(DEFAULT_FAN_SPEED_PCT))
-                variance = float(self._get(CONF_BREEZE_VARIANCE, 20))
+                # Part 4.2: per-tier variance — this previously read the single
+                # shared CONF_BREEZE_VARIANCE key for every tier, ignoring the
+                # already-existing, independently-editable Upper/Mid/Lower
+                # Breeze Variance number entities (breeze_variance_{tier}).
+                variance = float(self._get(f"breeze_variance_{tier}", DEFAULT_FAN_VARIANCE_PCT))
                 delta = random.uniform(-variance, variance)
                 target = max(0.0, min(100.0, base + delta))
                 await self._apply_fan_speed_to_tier(tier, target)
@@ -1549,6 +1571,31 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Helix Cultivate: failed to set fan %s to %.0f%%: %s",
                     entity_id, clamped, exc,
                 )
+
+    def _manage_breeze_tasks(self) -> None:
+        """Start/stop each tier's breeze loop to match its enabled state
+        (Part 4.1/4.2) — runs every tick, before _manage_wind_sweep, so wind
+        sweep (when active) can immediately stop whatever this just
+        (re)started for a tier it's about to take over instead of the two
+        fighting over the same fan. Once wind sweep releases a tier, this
+        naturally restarts its breeze task on the very next tick since it
+        re-evaluates "enabled but no live task" every time."""
+        for tier, enabled_attr in [
+            (FAN_TIER_UPPER, "breeze_upper_enabled"),
+            (FAN_TIER_MID, "breeze_mid_enabled"),
+            (FAN_TIER_LOWER, "breeze_lower_enabled"),
+        ]:
+            enabled = getattr(self, enabled_attr, False) and self._is_fan_tier_enabled(tier)
+            task = self._breeze_tasks.get(tier)
+            if enabled and (task is None or task.done()):
+                self._start_breeze_task(tier)
+            elif not enabled and task is not None and not task.done():
+                self._stop_breeze_task(tier)
+            if enabled and task is not None and task.done() and not task.cancelled():
+                _LOGGER.error(
+                    "Helix Cultivate: Breeze task for %s crashed — restarting", tier
+                )
+                self._start_breeze_task(tier)
 
     async def _manage_wind_sweep(self) -> None:
         """Canopy wind sweep (Part 3.2) — growing stages only. Rotates a
@@ -1746,22 +1793,7 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.error("Helix Cultivate: ClimateEngine.run() failed: %s", exc)
 
         # ── Manage breeze tasks ────────────────────────────────────────────────
-        for tier, enabled_attr in [
-            (FAN_TIER_UPPER, "breeze_upper_enabled"),
-            (FAN_TIER_MID, "breeze_mid_enabled"),
-            (FAN_TIER_LOWER, "breeze_lower_enabled"),
-        ]:
-            enabled = getattr(self, enabled_attr, False) and self._is_fan_tier_enabled(tier)
-            task = self._breeze_tasks.get(tier)
-            if enabled and (task is None or task.done()):
-                self._start_breeze_task(tier)
-            elif not enabled and task is not None and not task.done():
-                self._stop_breeze_task(tier)
-            if enabled and task is not None and task.done() and not task.cancelled():
-                _LOGGER.error(
-                    "Helix Cultivate: Breeze task for %s crashed — restarting", tier
-                )
-                self._start_breeze_task(tier)
+        self._manage_breeze_tasks()
 
         # ── Canopy wind sweep (Part 3.2) — runs after breeze-task management
         # so that, when active, it can stop any breeze task the block above
@@ -1857,11 +1889,12 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _raise_dropout_notification(self) -> None:
         """Raise a critical notification when sensor dropout is detected."""
+        dropout_min = float(self._get(CONF_SENSOR_DROPOUT_MIN, DEFAULT_SENSOR_DROPOUT_MIN_CFG))
         await self._notify_critical(
             title="Helix Cultivate — Sensor Alert",
             message=(
                 "The primary canopy temperature sensor is unavailable or has not updated "
-                f"for over {DEFAULT_SENSOR_DROPOUT_MIN} minutes. "
+                f"for over {dropout_min:.0f} minutes. "
                 "Exhaust is running at safe floor. VPD control is suspended."
             ),
             level="critical",

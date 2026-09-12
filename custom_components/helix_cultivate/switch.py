@@ -29,6 +29,12 @@ class HelixSwitchDescription(SwitchEntityDescription):
     """Extended switch description."""
 
     coordinator_attr: str = ""
+    # Part 4.1: when set, the config key this switch's state is persisted to
+    # (via queue_option_write) so it survives a coordinator/config-entry
+    # reload — previously async_turn_on/off only ever did an in-memory
+    # setattr on the coordinator, so the "true" intended state lived nowhere
+    # the coordinator could read back after a restart.
+    config_key: str = ""
 
 
 SWITCH_DESCRIPTIONS: tuple[HelixSwitchDescription, ...] = (
@@ -43,18 +49,21 @@ SWITCH_DESCRIPTIONS: tuple[HelixSwitchDescription, ...] = (
         name="Upper Canopy Breeze Mode",
         icon="mdi:weather-windy",
         coordinator_attr="breeze_upper_enabled",
+        config_key="breeze_upper_enabled",
     ),
     HelixSwitchDescription(
         key=SWITCH_BREEZE_MID,
         name="Mid Canopy Breeze Mode",
         icon="mdi:weather-windy",
         coordinator_attr="breeze_mid_enabled",
+        config_key="breeze_mid_enabled",
     ),
     HelixSwitchDescription(
         key=SWITCH_BREEZE_LOWER,
         name="Lower Canopy Breeze Mode",
         icon="mdi:weather-windy",
         coordinator_attr="breeze_lower_enabled",
+        config_key="breeze_lower_enabled",
     ),
     HelixSwitchDescription(
         key=SWITCH_DLI_EXTENSION,
@@ -98,6 +107,11 @@ class HelixSwitch(CoordinatorEntity[HelixCoordinator], SwitchEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{coordinator._entry.entry_id}_{description.key}"
+        # Pin entity_id to the stable key (matches HelixSensor/HelixSelect) —
+        # `name` does not reliably slugify back to `key` (e.g. "breeze_upper"
+        # vs "Upper Canopy Breeze Mode"), and the frontend addresses these
+        # entities directly as switch.helix_cultivate_{key}.
+        self.entity_id = f"switch.{DOMAIN}_{description.key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator._entry.entry_id)},
             "name": "Helix Cultivate",
@@ -116,6 +130,9 @@ class HelixSwitch(CoordinatorEntity[HelixCoordinator], SwitchEntity):
         """Turn on the switch — update coordinator attribute."""
         attr = self.entity_description.coordinator_attr
         setattr(self.coordinator, attr, True)
+        config_key = self.entity_description.config_key
+        if config_key:
+            self.coordinator.queue_option_write(config_key, True)
 
         # For breeze switches: start the breeze task
         tier = _BREEZE_TIER_MAP.get(self.entity_description.key)
@@ -128,6 +145,9 @@ class HelixSwitch(CoordinatorEntity[HelixCoordinator], SwitchEntity):
         """Turn off the switch — update coordinator attribute."""
         attr = self.entity_description.coordinator_attr
         setattr(self.coordinator, attr, False)
+        config_key = self.entity_description.config_key
+        if config_key:
+            self.coordinator.queue_option_write(config_key, False)
 
         # For breeze switches: stop the breeze task
         tier = _BREEZE_TIER_MAP.get(self.entity_description.key)

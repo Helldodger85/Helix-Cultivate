@@ -119,6 +119,12 @@ from .const import (
     CONF_DEW_POINT_MARGIN_C, DEFAULT_DEW_POINT_MARGIN_C,
     CONF_PREHEAT_LEAD_MIN, DEFAULT_PREHEAT_LEAD_MIN,
     CONF_STAGE_WARNING_LEAD_DAYS, DEFAULT_STAGE_WARNING_LEAD_DAYS,
+    # Part 1 — Safety tab sliders
+    CONF_SAFETY_HIGH_TEMP_C, DEFAULT_SAFETY_HIGH_TEMP_C,
+    CONF_SAFETY_LOW_TEMP_C, DEFAULT_SAFETY_LOW_TEMP_C,
+    CONF_SAFETY_HIGH_RH_PCT, DEFAULT_SAFETY_HIGH_RH_PCT,
+    CONF_SAFETY_LOW_RH_PCT, DEFAULT_SAFETY_LOW_RH_PCT,
+    CONF_SENSOR_DROPOUT_MIN, DEFAULT_SENSOR_DROPOUT_MIN_CFG,
 )
 from .coordinator import HelixCoordinator
 
@@ -562,6 +568,26 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             )
             attrs["preheat_lead_min"] = self.coordinator._get(
                 CONF_PREHEAT_LEAD_MIN, DEFAULT_PREHEAT_LEAD_MIN
+            )
+            # Part 1 — Safety tab sliders now write to real live number
+            # entities, but the panel's own dashboard reads its displayed
+            # values from these attributes (not the entity states directly),
+            # so without exposing them here a reload would always show the
+            # coded default regardless of what was actually persisted.
+            attrs["safety_high_temp_c"] = self.coordinator._get(
+                CONF_SAFETY_HIGH_TEMP_C, DEFAULT_SAFETY_HIGH_TEMP_C
+            )
+            attrs["safety_low_temp_c"] = self.coordinator._get(
+                CONF_SAFETY_LOW_TEMP_C, DEFAULT_SAFETY_LOW_TEMP_C
+            )
+            attrs["safety_high_rh_pct"] = self.coordinator._get(
+                CONF_SAFETY_HIGH_RH_PCT, DEFAULT_SAFETY_HIGH_RH_PCT
+            )
+            attrs["safety_low_rh_pct"] = self.coordinator._get(
+                CONF_SAFETY_LOW_RH_PCT, DEFAULT_SAFETY_LOW_RH_PCT
+            )
+            attrs["sensor_dropout_min"] = self.coordinator._get(
+                CONF_SENSOR_DROPOUT_MIN, DEFAULT_SENSOR_DROPOUT_MIN_CFG
             )
 
         if key == "cycle_cost":
