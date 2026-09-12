@@ -162,6 +162,16 @@ from .const import (
     # DLI target alerting
     CONF_DLI_ALERT_THRESHOLD_PCT,
     DEFAULT_DLI_ALERT_THRESHOLD_PCT,
+    # 3.2 Canopy wind sweep
+    CONF_WIND_SWEEP_ENABLED,
+    DEFAULT_WIND_SWEEP_ENABLED,
+    WIND_SWEEP_INTERVAL_MIN,
+    WIND_SWEEP_BOOST_PCT,
+    WIND_SWEEP_REST_PCT,
+    # 3.5 Stage-progression heads-up warnings
+    CONF_STAGE_WARNING_LEAD_DAYS,
+    DEFAULT_STAGE_WARNING_LEAD_DAYS,
+    STAGE_TRANSITION_TIPS,
 )
 from .stage_manager import StageManager
 
@@ -317,6 +327,24 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ── Appliance dropout watchdog (Phase 10B) ────────────────────────────
         # Keys are role strings: "zone1_heater", "zone1_dehumid", etc.
         self._appliance_unavail_since: dict[str, Optional[datetime]] = {}
+        # Pre-existing gap: this was read/written throughout
+        # _check_appliance_dropout()/_raise_appliance_dropout_notification()
+        # but never actually initialised here, so the very first dropout
+        # check on a real coordinator (not a test's mock_coord, which sets
+        # this explicitly) would raise AttributeError. Fixed while adding
+        # _record_command_failure() (Part 1), which reads/writes the same dict.
+        self._appliance_dropout_alerted: dict[str, bool] = {}
+
+        # ── Dew point / condensation prediction (Part 3.3) ────────────────────
+        self._dew_point_risk_since: Optional[datetime] = None
+        self._dew_point_alerted: bool = False
+
+        # ── Canopy wind sweep (Part 3.2) ───────────────────────────────────────
+        self._wind_sweep_phase_since: Optional[datetime] = None
+        self._wind_sweep_current_tier: Optional[str] = None
+
+        # ── Stage-progression heads-up warnings (Part 3.5) ─────────────────────
+        self._stage_warning_alerted: dict[str, bool] = {}
 
         # ── Stage manager ─────────────────────────────────────────────────────
         self.stage_manager = StageManager(hass, self._config)
@@ -573,6 +601,18 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         vpd = svp_leaf - (rh_frac * svp_air)
         return max(0.0, vpd)
 
+    def _calc_dew_point_c(self, temp_c: float, rh_pct: float) -> float:
+        """Dew point [°C] via the standard Magnus-formula approximation —
+        reuses the same a/b saturation-vapor-pressure constants as
+        _calc_leaf_vpd above for internal consistency. Used by the dew
+        point / condensation prediction hard override (Part 3.3).
+        """
+        import math
+        rh_frac = max(0.01, min(1.0, rh_pct / 100.0))  # avoid log(0)
+        a, b = 17.27, 237.3
+        alpha = math.log(rh_frac) + (a * temp_c) / (b + temp_c)
+        return (b * alpha) / (a - alpha)
+
     # ── Lights state detection ────────────────────────────────────────────────
 
     def _lights_on(self) -> bool:
@@ -683,6 +723,25 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if remaining < ramp_minutes:
                 return round(100.0 * remaining / ramp_minutes, 1)
         return 100.0
+
+    def _minutes_until_lights_off(self) -> Optional[float]:
+        """Minutes from now until the next scheduled lights-off transition,
+        derived from the same schedule parameters _light_schedule_multiplier
+        uses — Helix Cultivate drives the light schedule directly, so the
+        off-time is always known in advance. Used by predictive
+        pre-heating (Part 3.4).
+
+        Returns None when there is no scheduled "off" transition to predict:
+        hours<=0 (light never on) or hours>=24 (always on).
+        """
+        hours, on_time, _key = self._light_schedule_params()
+        if hours <= 0 or hours >= 24:
+            return None
+        now_t = dt_util.now().time()
+        on_minutes = on_time.hour * 60 + on_time.minute
+        now_minutes = now_t.hour * 60 + now_t.minute
+        off_minutes = (on_minutes + hours * 60.0) % (24 * 60)
+        return (off_minutes - now_minutes) % (24 * 60)
 
     async def _apply_grow_light_schedule(self, light_id: str, applied_pct: float) -> None:
         """Push a schedule-computed brightness to the grow light entity.
@@ -923,6 +982,64 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if self.data:
             self.data[NS_ENERGY]["dli_today_mol"] = 0.0
+
+    # ── Stage-progression heads-up warnings (Part 3.5) ──────────────────────
+
+    async def _check_stage_progression_warning(self) -> None:
+        """Purely informational/advisory reminder for manual grower action —
+        Helix Cultivate does not perform any of these transitions
+        automatically. At CONF_STAGE_WARNING_LEAD_DAYS (default 3) before
+        the active stage's expected duration elapses, fires an
+        informational notification (and dashboard banner, via the same
+        exposed sensor attrs pattern as other advisories) suggesting
+        relevant manual actions for the upcoming transition.
+
+        Fires exactly once per approaching transition (guarded by
+        `_stage_warning_alerted[stage]`, reset the moment the countdown is
+        no longer inside the lead window) — a 30-second tick loop would
+        otherwise re-fire this every tick for the entire lead window.
+        """
+        stage = self.stage_manager.current_stage
+        if stage not in STAGE_SEQUENCE or stage == STAGE_SEQUENCE[-1]:
+            # Drying (the last stage) has no "next" stage to warn about
+            # within this cycle.
+            return
+
+        duration = self.stage_manager._duration(stage)
+        elapsed = self.stage_manager._elapsed_days()
+        days_remaining = duration - elapsed
+        lead_days = int(self._get(CONF_STAGE_WARNING_LEAD_DAYS, DEFAULT_STAGE_WARNING_LEAD_DAYS))
+
+        if days_remaining > lead_days:
+            self._stage_warning_alerted[stage] = False
+            return
+        if self._stage_warning_alerted.get(stage, False):
+            return
+
+        idx = STAGE_SEQUENCE.index(stage)
+        next_stage = STAGE_SEQUENCE[idx + 1]
+        next_label = STAGE_LABELS.get(next_stage, next_stage)
+        tip = STAGE_TRANSITION_TIPS.get(next_stage, "")
+
+        self.hass.bus.async_fire(
+            "helix_cultivate_stage_progression_warning",
+            {
+                "entry_id": self._entry.entry_id,
+                "current_stage": stage,
+                "next_stage": next_stage,
+                "days_remaining": days_remaining,
+            },
+        )
+        await self._notify_critical(
+            title=f"Helix Cultivate — Approaching {next_label}",
+            message=(
+                f"~{days_remaining} day(s) until the expected transition to "
+                f"{next_label}. {tip} This is a reminder for manual action — "
+                "Helix Cultivate does not perform this automatically."
+            ),
+            level="info",
+        )
+        self._stage_warning_alerted[stage] = True
 
     # ── DLI accumulation ─────────────────────────────────────────────────────
 
@@ -1207,6 +1324,29 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             level="critical",
         )
 
+    def _record_command_failure(self, role: str, entity_id: str) -> None:
+        """Feed an actuator command that failed even after the retry
+        wrapper's attempts (ClimateEngine._call_service_with_retry, Part 1)
+        into the exact same dwell-and-notify tracking used above for
+        entities the HA state machine itself reports unavailable — a
+        service call that fails outright after retries is equally valid
+        evidence the appliance is unreachable. Deliberately reuses
+        `_appliance_unavail_since`/`_appliance_dropout_alerted` rather than
+        a second, parallel tracking dict: a persistent failure must
+        accumulate the same 5-minute dwell before alerting once, not spawn
+        its own separate alerting system. If the entity's actual HA state
+        recovers on a later tick, `_check_appliance_dropout`'s own reset
+        branch clears this dwell too, since both share the same dicts.
+        """
+        if self._appliance_unavail_since.get(role) is None:
+            self._appliance_unavail_since[role] = dt_util.utcnow()
+        elapsed = dt_util.utcnow() - self._appliance_unavail_since[role]
+        if elapsed >= timedelta(minutes=5) and not self._appliance_dropout_alerted.get(role, False):
+            self.hass.async_create_task(
+                self._raise_appliance_dropout_notification(role, entity_id)
+            )
+            self._appliance_dropout_alerted[role] = True
+
     # ── Time-lapse camera snapshot ────────────────────────────────────────────
 
     async def _maybe_trigger_snapshot(self) -> None:
@@ -1379,6 +1519,57 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     entity_id, clamped, exc,
                 )
 
+    async def _manage_wind_sweep(self) -> None:
+        """Canopy wind sweep (Part 3.2) — growing stages only. Rotates a
+        boosted speed among the currently-enabled circulation tiers on a
+        dwell timer, rather than every enabled tier running the same static
+        speed simultaneously — mimics natural gusting wind to eliminate
+        static microclimates and add mechanical stem-strengthening stress.
+
+        Must never activate during Drying, where the gentle-cyclic/constant
+        airflow strategy (CONF_DRYING_AIRFLOW_MODE) takes exclusive
+        priority — checked explicitly below, not just left to the toggle.
+        Off by default (CONF_WIND_SWEEP_ENABLED), so nothing changes for
+        existing installs unless a grower opts in.
+        """
+        enabled = bool(self._get(CONF_WIND_SWEEP_ENABLED, DEFAULT_WIND_SWEEP_ENABLED))
+        if not enabled or self.stage_manager.current_stage == STAGE_DRYING:
+            self._wind_sweep_phase_since = None
+            self._wind_sweep_current_tier = None
+            return
+
+        enabled_tiers = [
+            t for t in (FAN_TIER_UPPER, FAN_TIER_MID, FAN_TIER_LOWER)
+            if self._is_fan_tier_enabled(t)
+        ]
+        if not enabled_tiers:
+            return
+
+        now = dt_util.utcnow()
+        if (
+            self._wind_sweep_current_tier not in enabled_tiers
+            or self._wind_sweep_phase_since is None
+        ):
+            self._wind_sweep_current_tier = enabled_tiers[0]
+            self._wind_sweep_phase_since = now
+        else:
+            elapsed_min = (now - self._wind_sweep_phase_since).total_seconds() / 60.0
+            if elapsed_min >= WIND_SWEEP_INTERVAL_MIN:
+                idx = enabled_tiers.index(self._wind_sweep_current_tier)
+                self._wind_sweep_current_tier = enabled_tiers[(idx + 1) % len(enabled_tiers)]
+                self._wind_sweep_phase_since = now
+
+        for tier in enabled_tiers:
+            # Take over from the breeze engine for every tier wind sweep
+            # drives, so its own independent async loop can't fight this
+            # tick-based choreography over the same fans.
+            self._stop_breeze_task(tier)
+            target = (
+                WIND_SWEEP_BOOST_PCT if tier == self._wind_sweep_current_tier
+                else WIND_SWEEP_REST_PCT
+            )
+            await self._apply_fan_speed_to_tier(tier, target)
+
     # ── Update cycle ──────────────────────────────────────────────────────────
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -1468,6 +1659,7 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             mid_canopy_temp, mid_canopy_rh,
             lower_canopy_temp, lower_canopy_rh,
         )
+        await self._check_stage_progression_warning()
 
         await self._maybe_trigger_snapshot()
 
@@ -1539,6 +1731,12 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Helix Cultivate: Breeze task for %s crashed — restarting", tier
                 )
                 self._start_breeze_task(tier)
+
+        # ── Canopy wind sweep (Part 3.2) — runs after breeze-task management
+        # so that, when active, it can stop any breeze task the block above
+        # just (re)started for a tier it's about to take over, rather than
+        # the two fighting over the same fan.
+        await self._manage_wind_sweep()
 
         # ── Lights-off day boundary: DLI target alert + reset ───────────────────
         # Must run BEFORE _lights_state_prev is overwritten below — the

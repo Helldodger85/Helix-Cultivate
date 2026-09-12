@@ -1,6 +1,7 @@
 """Helix Cultivate — Climate Engine: control loops, watchdogs, PID/bang-bang."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from datetime import datetime, timedelta
@@ -104,6 +105,18 @@ from .const import (
     DEFAULT_DRYING_CYCLE_ON_MIN,
     CONF_DRYING_CYCLE_OFF_MIN,
     DEFAULT_DRYING_CYCLE_OFF_MIN,
+    # 3.1 High-temperature graduated light dimming
+    CONF_LIGHT_HIGH_TEMP_DIM_C,
+    DEFAULT_LIGHT_HIGH_TEMP_DIM_C,
+    LIGHT_HIGH_TEMP_DIM_PCT,
+    # 3.3 Dew point / condensation prediction
+    CONF_DEW_POINT_MARGIN_C,
+    DEFAULT_DEW_POINT_MARGIN_C,
+    DEW_POINT_OVERRIDE_DWELL_MIN,
+    # 3.4 Predictive pre-heating before scheduled lights-off
+    CONF_PREHEAT_LEAD_MIN,
+    DEFAULT_PREHEAT_LEAD_MIN,
+    PREHEAT_BIAS_C,
 )
 
 if TYPE_CHECKING:
@@ -128,6 +141,14 @@ VPD_ASSIST_STEP_C: float = 0.3       # Per-tick bias step applied to effective t
 VPD_ASSIST_MAX_BIAS_C: float = 1.5   # Maximum single-tick bias magnitude
 THERMAL_PURGE_MARGIN_C: float = 1.5      # °C band below thermal_runaway_c where purge ramps
 THERMAL_PURGE_SLOPE_TRIGGER: float = 0.5  # °C/min rising trend that activates purge earlier
+
+# ── Actuator command retry policy ──────────────────────────────────────────────
+# Up to 2 retries (3 attempts total) with a short backoff, covering a one-off
+# transient blip (WiFi reconnect, a cloud-API hiccup for anything routed
+# through a vendor cloud like AC Infinity) without waiting for the next
+# 30-second tick. Deliberately uniform across every actuator/integration
+# type — see ClimateEngine._call_service_with_retry.
+ACTUATOR_RETRY_BACKOFF_SEC: tuple[float, ...] = (2.0, 5.0)
 
 # ── Reverse-cycle HVAC modes ──────────────────────────────────────────────────
 HVAC_MODE_HEAT: str = "heat"
@@ -430,6 +451,58 @@ class ClimateEngine:
 
     # ── Appliance service calls ───────────────────────────────────────────────
 
+    async def _call_service_with_retry(
+        self, domain: str, service: str, data: dict[str, Any], role: str = "unknown"
+    ) -> bool:
+        """Call a HA service with up to 2 retries (2s, then 5s backoff) on
+        failure — the single choke point every actuator command in this file
+        routes through, so a one-off transient blip (WiFi reconnect, a
+        cloud-API hiccup for anything routed through a vendor cloud like AC
+        Infinity) doesn't sit lost until the next 30-second tick.
+
+        Deliberately uniform across every actuator and integration type —
+        detecting "is this entity cloud-backed" isn't something HA cleanly
+        exposes, and would be fragile even if it were; a uniform retry
+        policy is more durable and works regardless of which specific
+        hardware happens to be behind an entity today.
+
+        Does NOT raise a new, separate alert when every attempt fails —
+        feeds the failure into the same appliance-dropout dwell-and-notify
+        tracking used for entities the HA state machine itself reports
+        unavailable (coordinator._check_appliance_dropout), so a persistent
+        failure surfaces through the one existing notification pathway
+        rather than a second parallel one.
+
+        Note: this only reduces worst-case delay on a one-off transient
+        blip. It does not (and does not need to) address safety-critical
+        persistence — the existing 30-second re-evaluation loop already
+        re-issues commands like a 100% exhaust override on every tick for
+        as long as the underlying condition (e.g. thermal runaway) persists.
+
+        Returns True if the call ultimately succeeded, False if every
+        attempt failed.
+        """
+        entity_id = data.get("entity_id")
+        attempts = 1 + len(ACTUATOR_RETRY_BACKOFF_SEC)
+        for attempt in range(attempts):
+            if attempt > 0:
+                await asyncio.sleep(ACTUATOR_RETRY_BACKOFF_SEC[attempt - 1])
+            try:
+                await self._coord.hass.services.async_call(domain, service, data)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Helix Cultivate: %s.%s on %s failed (attempt %d/%d): %s",
+                    domain, service, entity_id, attempt + 1, attempts, exc,
+                )
+        _LOGGER.warning(
+            "Helix Cultivate: %s.%s on %s failed after %d attempts — giving up this tick",
+            domain, service, entity_id, attempts,
+        )
+        if entity_id:
+            self._coord._record_command_failure(role, entity_id)
+        return False
+
     async def _set_switch(
         self, entity_id: Optional[str], on: bool, role: str = "unknown"
     ) -> None:
@@ -437,7 +510,9 @@ class ClimateEngine:
 
         `role` identifies the appliance function (e.g. "zone1_heater") for the
         appliance dropout watchdog (Phase 10B) — tracked continuously
-        unavailable entities raise a persistent notification after 5 minutes.
+        unavailable entities raise a persistent notification after 5 minutes,
+        and for the actuator command retry wrapper (Part 1) below — an
+        exhausted-retry failure feeds the same dwell-and-notify tracking.
         """
         if not entity_id:
             return
@@ -448,18 +523,12 @@ class ClimateEngine:
             return
         domain = entity_id.split(".")[0]
         service = "turn_on" if on else "turn_off"
-        try:
-            await self._coord.hass.services.async_call(
-                domain, service, {"entity_id": entity_id}
-            )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning(
-                "Helix Cultivate: failed to call %s.%s on %s: %s",
-                domain, service, entity_id, exc,
-            )
+        await self._call_service_with_retry(
+            domain, service, {"entity_id": entity_id}, role=role
+        )
 
     async def _set_reverse_cycle(
-        self, entity_id: Optional[str], mode: Optional[str]
+        self, entity_id: Optional[str], mode: Optional[str], role: str = "unknown"
     ) -> None:
         """Set a climate entity to the specified hvac_mode (heat / cool / off).
 
@@ -472,16 +541,11 @@ class ClimateEngine:
                 state = self._coord.hass.states.get(entity_id)
                 if state is None or state.state == "unavailable":
                     return
-                try:
-                    await self._coord.hass.services.async_call(
-                        "climate", "set_hvac_mode",
-                        {"entity_id": entity_id, "hvac_mode": HVAC_MODE_OFF},
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    _LOGGER.warning(
-                        "Helix Cultivate: failed to set reverse-cycle %s to off: %s",
-                        entity_id, exc,
-                    )
+                await self._call_service_with_retry(
+                    "climate", "set_hvac_mode",
+                    {"entity_id": entity_id, "hvac_mode": HVAC_MODE_OFF},
+                    role=role,
+                )
             return
 
         state = self._coord.hass.states.get(entity_id)
@@ -493,22 +557,20 @@ class ClimateEngine:
         if current_mode == mode:
             return
 
-        try:
-            await self._coord.hass.services.async_call(
-                "climate", "set_hvac_mode",
-                {"entity_id": entity_id, "hvac_mode": mode},
-            )
+        ok = await self._call_service_with_retry(
+            "climate", "set_hvac_mode",
+            {"entity_id": entity_id, "hvac_mode": mode},
+            role=role,
+        )
+        if ok:
             _LOGGER.debug(
                 "Helix Cultivate: reverse-cycle %s → %s (was %s)",
                 entity_id, mode, current_mode,
             )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning(
-                "Helix Cultivate: failed to set reverse-cycle %s to %s: %s",
-                entity_id, mode, exc,
-            )
 
-    async def _set_fan_pct(self, entity_id: Optional[str], pct: float) -> None:
+    async def _set_fan_pct(
+        self, entity_id: Optional[str], pct: float, role: str = "unknown"
+    ) -> None:
         if not entity_id:
             return
         state = self._coord.hass.states.get(entity_id)
@@ -516,52 +578,48 @@ class ClimateEngine:
             return
         domain = entity_id.split(".")[0]
         clamped = max(0.0, min(100.0, pct))
-        try:
-            if domain == "fan":
-                if clamped <= 0:
-                    await self._coord.hass.services.async_call("fan", "turn_off", {"entity_id": entity_id})
-                else:
-                    await self._coord.hass.services.async_call(
-                        "fan", "set_percentage",
-                        {"entity_id": entity_id, "percentage": int(clamped)},
-                    )
-            elif domain == "switch":
-                await self._coord.hass.services.async_call(
-                    "switch", "turn_on" if clamped >= 50 else "turn_off",
-                    {"entity_id": entity_id},
+        if domain == "fan":
+            if clamped <= 0:
+                await self._call_service_with_retry(
+                    "fan", "turn_off", {"entity_id": entity_id}, role=role
                 )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning(
-                "Helix Cultivate: failed to set fan %s to %.0f%%: %s",
-                entity_id, clamped, exc,
+            else:
+                await self._call_service_with_retry(
+                    "fan", "set_percentage",
+                    {"entity_id": entity_id, "percentage": int(clamped)},
+                    role=role,
+                )
+        elif domain == "switch":
+            await self._call_service_with_retry(
+                "switch", "turn_on" if clamped >= 50 else "turn_off",
+                {"entity_id": entity_id}, role=role,
             )
 
-    async def _set_light_intensity(self, entity_id: Optional[str], pct: float) -> None:
+    async def _set_light_intensity(
+        self, entity_id: Optional[str], pct: float, role: str = "unknown"
+    ) -> None:
         if not entity_id:
             return
         state = self._coord.hass.states.get(entity_id)
         if state is None:
             return
         domain = entity_id.split(".")[0]
-        try:
-            if domain == "light":
-                brightness = int(pct / 100.0 * 255)
-                if pct <= 0:
-                    await self._coord.hass.services.async_call("light", "turn_off", {"entity_id": entity_id})
-                else:
-                    await self._coord.hass.services.async_call(
-                        "light", "turn_on",
-                        {"entity_id": entity_id, "brightness": brightness},
-                    )
-            elif domain == "switch":
-                await self._coord.hass.services.async_call(
-                    "switch", "turn_on" if pct >= 50 else "turn_off",
-                    {"entity_id": entity_id},
+        if domain == "light":
+            brightness = int(pct / 100.0 * 255)
+            if pct <= 0:
+                await self._call_service_with_retry(
+                    "light", "turn_off", {"entity_id": entity_id}, role=role
                 )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning(
-                "Helix Cultivate: failed to set light %s to %.0f%%: %s",
-                entity_id, pct, exc,
+            else:
+                await self._call_service_with_retry(
+                    "light", "turn_on",
+                    {"entity_id": entity_id, "brightness": brightness},
+                    role=role,
+                )
+        elif domain == "switch":
+            await self._call_service_with_retry(
+                "switch", "turn_on" if pct >= 50 else "turn_off",
+                {"entity_id": entity_id}, role=role,
             )
 
     # ── Outdoor conditions helpers ─────────────────────────────────────────────
@@ -683,7 +741,7 @@ class ClimateEngine:
         )
 
         grow_light = self._get(CONF_ZONE2_GROW_LIGHT)
-        await self._set_light_intensity(grow_light, 0.0)
+        await self._set_light_intensity(grow_light, 0.0, role="grow_light")
         self._coord.light_intensity_pct = 0.0
 
         # Kill all Zone 1 heaters (discrete + backup)
@@ -691,8 +749,8 @@ class ClimateEngine:
         await self._set_switch(self._get(CONF_ZONE1_BACKUP_HEATER), False, role="zone1_backup_heater")
         await self._set_switch(self._get(CONF_ZONE2_HEATER), False, role="zone2_heater")
         # Turn off both reverse-cycle units
-        await self._set_reverse_cycle(self._get(CONF_ZONE1_REVERSE_CYCLE), None)
-        await self._set_reverse_cycle(self._get(CONF_ZONE2_REVERSE_CYCLE), None)
+        await self._set_reverse_cycle(self._get(CONF_ZONE1_REVERSE_CYCLE), None, role="zone1_ac")
+        await self._set_reverse_cycle(self._get(CONF_ZONE2_REVERSE_CYCLE), None, role="zone2_ac")
 
         if not self._coord._thermal_runaway_alerted:
             await self._coord._notify_critical(
@@ -717,6 +775,119 @@ class ClimateEngine:
             )
             self._coord._thermal_runaway_alerted = True
 
+        return True
+
+    # ── High-temperature graduated light dimming (Part 3.1) ───────────────────
+
+    async def _handle_light_high_temp_dim(self, canopy_temp: float) -> None:
+        """Soft intermediate step below the hard thermal-runaway cutoff
+        (DEFAULT_THERMAL_RUNAWAY_C, 32°C, which already forces the light
+        fully off) — same "soft margin before hard cutoff" pattern already
+        used for the thermal purge exhaust ramp (THERMAL_PURGE_MARGIN_C).
+
+        At CONF_LIGHT_HIGH_TEMP_DIM_C (default 29°C), caps this tick's
+        already-applied light brightness down to LIGHT_HIGH_TEMP_DIM_PCT
+        (50%) by re-applying through the same choke point the schedule
+        itself uses (coordinator._apply_grow_light_schedule) — never
+        mutating the stage's own light_intensity_pct ceiling. That means it
+        is re-evaluated fresh every tick from whatever
+        coordinator._control_light_schedule() just computed, so the dim
+        releases automatically the instant canopy_temp drops back below
+        threshold, and it folds correctly into an in-progress sunrise/
+        sunset ramp rather than clobbering it with a flat override.
+
+        Only ever called when _handle_thermal_runaway has NOT already
+        triggered this tick (see run()) — the hard 0% cutoff must always
+        win over this soft 50% one if temperature keeps climbing past it.
+        """
+        threshold = float(
+            self._get(CONF_LIGHT_HIGH_TEMP_DIM_C, DEFAULT_LIGHT_HIGH_TEMP_DIM_C)
+        )
+        if canopy_temp < threshold:
+            return
+        grow_light = self._get(CONF_ZONE2_GROW_LIGHT)
+        if not grow_light:
+            return
+        applied = self._coord._light_applied_pct
+        if applied <= LIGHT_HIGH_TEMP_DIM_PCT:
+            return
+        _LOGGER.warning(
+            "Helix Cultivate: canopy %.1f°C >= %.1f°C soft-dim threshold — "
+            "throttling light from %.0f%% to %.0f%%.",
+            canopy_temp, threshold, applied, LIGHT_HIGH_TEMP_DIM_PCT,
+        )
+        await self._coord._apply_grow_light_schedule(grow_light, LIGHT_HIGH_TEMP_DIM_PCT)
+
+    # ── Dew point / condensation prediction (Part 3.3) ─────────────────────────
+
+    async def _handle_dew_point_risk(self, upper_temp: float, upper_rh: float) -> bool:
+        """Track the gap between leaf temperature (existing leaf-offset
+        calculation) and the calculated dew point (standard Magnus-formula
+        approximation from ambient temp/RH). Targets the actual physical
+        mechanism behind botrytis/powdery mildew risk — free surface
+        moisture from condensation — rather than a general humidity
+        threshold: a narrow gap means the leaf surface itself is close to
+        the point where moisture condenses out of the air onto it.
+
+        If the gap narrows below CONF_DEW_POINT_MARGIN_C for a sustained
+        dwell (DEW_POINT_OVERRIDE_DWELL_MIN — same dwell-timer pattern as
+        the drying humidity-ceiling override, so a single noisy reading
+        can't force this), engages a hard "always wins" override: forces
+        the lung-room/Zone 1 heater on directly here, and returns True so
+        the caller forces exhaust to 100% — exactly the same
+        cannot-be-soft-overridden pattern as thermal runaway and the drying
+        humidity-ceiling override. The caller (run()) must also skip Zone
+        1's normal bang-bang control this tick when this returns True, the
+        same way it skips all zone control during thermal runaway — otherwise
+        the normal logic would immediately undo this override if zone1 was
+        already reading close to setpoint.
+        """
+        margin = float(self._get(CONF_DEW_POINT_MARGIN_C, DEFAULT_DEW_POINT_MARGIN_C))
+        leaf_temp = upper_temp + self._coord.effective_leaf_temp_offset_c()
+        dew_point = self._coord._calc_dew_point_c(upper_temp, upper_rh)
+        gap = leaf_temp - dew_point
+
+        if gap >= margin:
+            self._coord._dew_point_risk_since = None
+            self._coord._dew_point_alerted = False
+            return False
+
+        now = dt_util.utcnow()
+        if self._coord._dew_point_risk_since is None:
+            self._coord._dew_point_risk_since = now
+            return False
+
+        elapsed_min = (now - self._coord._dew_point_risk_since).total_seconds() / 60.0
+        if elapsed_min < DEW_POINT_OVERRIDE_DWELL_MIN:
+            return False
+
+        # ── Sustained — engage the hard override ───────────────────────────
+        is_rc = bool(self._get(CONF_ZONE1_IS_REVERSE_CYCLE, False))
+        if is_rc:
+            await self._set_reverse_cycle(
+                self._get(CONF_ZONE1_REVERSE_CYCLE), HVAC_MODE_HEAT, role="zone1_ac"
+            )
+        else:
+            await self._set_switch(self._get(CONF_ZONE1_HEATER), True, role="zone1_heater")
+
+        if not self._coord._dew_point_alerted:
+            _LOGGER.warning(
+                "Helix Cultivate: DEW POINT RISK — leaf %.1f°C is %.1f°C above "
+                "dew point %.1f°C (margin %.1f°C). Forcing exhaust to 100%% "
+                "and lung-room heat.",
+                leaf_temp, gap, dew_point, margin,
+            )
+            await self._coord._notify_critical(
+                title="Helix Cultivate — Condensation Risk",
+                message=(
+                    f"Leaf temperature is only {gap:.1f}°C above the calculated "
+                    f"dew point (margin {margin:.1f}°C) — forcing exhaust to "
+                    "100% and lung-room heat to prevent surface condensation "
+                    "(botrytis/powdery mildew risk)."
+                ),
+                level="critical",
+            )
+            self._coord._dew_point_alerted = True
         return True
 
     # ── Light leak watchdog ───────────────────────────────────────────────────
@@ -880,6 +1051,7 @@ class ClimateEngine:
         sensor_dropout: bool,
         lights_on: bool,
         thermal_runaway: bool,
+        dew_point_risk: bool = False,
     ) -> float:
         """Compute and apply exhaust fan percentage. Returns the applied %."""
         exhaust_id: Optional[str] = self._get(CONF_EXHAUST_FAN)
@@ -887,11 +1059,19 @@ class ClimateEngine:
 
         # ── Hard overrides ────────────────────────────────────────────────────
         if thermal_runaway:
-            await self._set_fan_pct(exhaust_id, 100.0)
+            await self._set_fan_pct(exhaust_id, 100.0, role="exhaust")
+            return 100.0
+
+        if dew_point_risk:
+            # 3.3: same "always wins" precedence tier as thermal runaway —
+            # forces exhaust to 100% regardless of anything below.
+            await self._set_fan_pct(exhaust_id, 100.0, role="exhaust")
             return 100.0
 
         if sensor_dropout:
-            await self._set_fan_pct(exhaust_id, float(DEFAULT_EXHAUST_SAFE_FLOOR_PCT))
+            await self._set_fan_pct(
+                exhaust_id, float(DEFAULT_EXHAUST_SAFE_FLOOR_PCT), role="exhaust"
+            )
             return float(DEFAULT_EXHAUST_SAFE_FLOOR_PCT)
 
         # ── Drying-stage gentle-cyclic override ─────────────────────────────────
@@ -920,7 +1100,7 @@ class ClimateEngine:
         purge_until = self._coord._lights_off_purge_until
         if purge_until is not None and dt_util.utcnow() < purge_until:
             purge_pct = min(100.0, min_pct + 40.0)
-            await self._set_fan_pct(exhaust_id, purge_pct)
+            await self._set_fan_pct(exhaust_id, purge_pct, role="exhaust")
             return purge_pct
 
         # Detect lights → off transition to start purge
@@ -997,7 +1177,7 @@ class ClimateEngine:
                     canopy_temp,
                 )
 
-        await self._set_fan_pct(exhaust_id, final_pct)
+        await self._set_fan_pct(exhaust_id, final_pct, role="exhaust")
         return final_pct
 
     # ── Bang-bang temperature control ────────────────────────────────────────
@@ -1072,6 +1252,28 @@ class ClimateEngine:
         if leaf_vpd > vpd_max and self._is_saturated(zone_label, "humidifier"):
             return -VPD_ASSIST_STEP_C
         return 0.0
+
+    # ── Predictive pre-heating before scheduled lights-off (Part 3.4) ─────────
+
+    def _preheat_bias_c(self) -> float:
+        """Bias Zone 1's effective setpoint upward starting
+        CONF_PREHEAT_LEAD_MIN before the scheduled lights-off transition —
+        Helix Cultivate drives the light schedule directly, so the off-time
+        is always known in advance, letting this respond proactively ahead
+        of the temperature drop that follows lights-off rather than
+        reactively waiting for it to actually start falling.
+
+        Returns 0.0 (no bias) outside the lead window, when pre-heating is
+        disabled (CONF_PREHEAT_LEAD_MIN <= 0), or when there's no scheduled
+        off-transition to predict (light never on, or always on).
+        """
+        lead_min = float(self._get(CONF_PREHEAT_LEAD_MIN, DEFAULT_PREHEAT_LEAD_MIN))
+        if lead_min <= 0:
+            return 0.0
+        minutes_until_off = self._coord._minutes_until_lights_off()
+        if minutes_until_off is None or minutes_until_off > lead_min:
+            return 0.0
+        return PREHEAT_BIAS_C
 
     # ── Temperature trend + thermal purge (Phase 9D) ─────────────────────────
 
@@ -1232,7 +1434,7 @@ class ClimateEngine:
                 state = self._coord.hass.states.get(entity_id)
                 return state.state if state else None
             accepted = zone.request_reverse_cycle_mode(HVAC_MODE_HEAT)
-            await self._set_reverse_cycle(entity_id, accepted or HVAC_MODE_OFF)
+            await self._set_reverse_cycle(entity_id, accepted or HVAC_MODE_OFF, role=f"{zone_label}_ac")
             if accepted == HVAC_MODE_HEAT:
                 _LOGGER.debug(
                     "Helix Cultivate [%s]: Reverse-cycle → HEAT (demand)", zone_label
@@ -1244,7 +1446,7 @@ class ClimateEngine:
                 state = self._coord.hass.states.get(entity_id)
                 return state.state if state else None
             accepted = zone.request_reverse_cycle_mode(HVAC_MODE_COOL)
-            await self._set_reverse_cycle(entity_id, accepted or HVAC_MODE_OFF)
+            await self._set_reverse_cycle(entity_id, accepted or HVAC_MODE_OFF, role=f"{zone_label}_ac")
             if accepted == HVAC_MODE_COOL:
                 _LOGGER.debug(
                     "Helix Cultivate [%s]: Reverse-cycle → COOL (demand)", zone_label
@@ -1260,7 +1462,7 @@ class ClimateEngine:
         if prev_mode in (HVAC_MODE_HEAT, HVAC_MODE_COOL):
             self._record_compressor_off(f"{zone_label}_rc_{prev_mode}")
         accepted = zone.request_reverse_cycle_mode(None)
-        await self._set_reverse_cycle(entity_id, None)
+        await self._set_reverse_cycle(entity_id, None, role=f"{zone_label}_ac")
         return HVAC_MODE_OFF
 
     # ── Zone 1 backup heater staging ─────────────────────────────────────────
@@ -1342,6 +1544,7 @@ class ClimateEngine:
         is_reverse_cycle: bool = False,
         reverse_cycle_id: Optional[str] = None,
         enable_heat_cutoff: bool = False,
+        extra_setpoint_bias_c: float = 0.0,
     ) -> Optional[str]:
         """Evaluate and apply appliance states for a single zone.
 
@@ -1361,11 +1564,20 @@ class ClimateEngine:
         Mutual exclusion is enforced by the ZoneInterlock instance.
         Anti-short-cycle dwell is applied to compressor appliances.
 
+        `extra_setpoint_bias_c` (default 0.0) is an additional, unclamped
+        bias on top of the VPD-assist one below — used by predictive
+        pre-heating (Part 3.4) to nudge Zone 1's effective setpoint upward
+        ahead of a scheduled lights-off transition, so this same existing
+        bang-bang/PID heat demand logic naturally decides to heat, rather
+        than a second, separate override path.
+
         Returns the hvac_mode string applied to the reverse-cycle unit (or None).
         """
         bias = self._vpd_assist_bias(zone_label, leaf_vpd)
-        effective_setpoint = self._coord.temp_setpoint + max(
-            -VPD_ASSIST_MAX_BIAS_C, min(VPD_ASSIST_MAX_BIAS_C, bias)
+        effective_setpoint = (
+            self._coord.temp_setpoint
+            + max(-VPD_ASSIST_MAX_BIAS_C, min(VPD_ASSIST_MAX_BIAS_C, bias))
+            + extra_setpoint_bias_c
         )
         want_heat, want_cool = self._bang_bang_temp(
             current_temp, setpoint_override=effective_setpoint
@@ -1561,7 +1773,7 @@ class ClimateEngine:
             applied_pct = floor_pct
 
         if exhaust_id:
-            await self._set_fan_pct(exhaust_id, applied_pct)
+            await self._set_fan_pct(exhaust_id, applied_pct, role="exhaust")
 
         # 2.A2: every currently-enabled circulation tier, not one generic
         # fan slot — disabled tiers stay untouched.
@@ -1677,11 +1889,11 @@ class ClimateEngine:
         if is_rc and ac_id:
             # AC entity is a heat pump — drive via hvac_mode
             if want_heat:
-                await self._set_reverse_cycle(ac_id, HVAC_MODE_HEAT)
+                await self._set_reverse_cycle(ac_id, HVAC_MODE_HEAT, role="drying_ac")
             elif want_cool:
-                await self._set_reverse_cycle(ac_id, HVAC_MODE_COOL)
+                await self._set_reverse_cycle(ac_id, HVAC_MODE_COOL, role="drying_ac")
             else:
-                await self._set_reverse_cycle(ac_id, None)
+                await self._set_reverse_cycle(ac_id, None, role="drying_ac")
         else:
             # Discrete appliances
             await self._set_switch(heater_id, want_heat, role="drying_heater")
@@ -1699,11 +1911,11 @@ class ClimateEngine:
 
         # ── Gentle cyclic exhaust (fixed %) ────────────────────────────────────
         if exhaust_id:
-            await self._set_fan_pct(exhaust_id, DRYING_CYCLE_EXHAUST_PCT)
+            await self._set_fan_pct(exhaust_id, DRYING_CYCLE_EXHAUST_PCT, role="drying_exhaust")
 
         # ── Indirect circulation fan (always on when mapped) ───────────────────
         if circ_id:
-            await self._set_fan_pct(circ_id, 40.0)
+            await self._set_fan_pct(circ_id, 40.0, role="drying_circ")
 
         _LOGGER.debug(
             "Helix Cultivate [DryingZone]: temp=%.1f°C (target=%.1f), "
@@ -1778,9 +1990,27 @@ class ClimateEngine:
         thermal_runaway = False
         if canopy_temp is not None:
             thermal_runaway = await self._handle_thermal_runaway(canopy_temp)
+            # 3.1: soft intermediate dim step, strictly below the hard
+            # cutoff above — only when the hard cutoff hasn't already
+            # fired, so 0% (hard) always wins over 50% (soft) as canopy
+            # temperature keeps climbing.
+            if not thermal_runaway:
+                await self._handle_light_high_temp_dim(canopy_temp)
+
+        # 3.3: dew point / condensation prediction — hard override, "always
+        # wins" like thermal runaway. Needs both readings to compute a gap;
+        # silently skipped (not treated as a dropout) if either is missing.
+        dew_point_risk = False
+        if upper_temp is not None and upper_rh is not None:
+            dew_point_risk = await self._handle_dew_point_risk(upper_temp, upper_rh)
 
         # ── Zone 1 heater over-temp cutoff ────────────────────────────────────
-        await self._check_zone1_heater_cutoff(canopy_temp)
+        # Skipped while the dew point override is active — it would
+        # otherwise immediately kill the heater _handle_dew_point_risk just
+        # forced on, defeating "always wins" the same way the normal zone1
+        # bang-bang control would if it weren't also skipped below.
+        if not dew_point_risk:
+            await self._check_zone1_heater_cutoff(canopy_temp)
 
         # ── Exhaust fan ───────────────────────────────────────────────────────
         exhaust_pct = await self._control_exhaust(
@@ -1791,6 +2021,7 @@ class ClimateEngine:
             sensor_dropout=sensor_dropout,
             lights_on=lights_on,
             thermal_runaway=thermal_runaway,
+            dew_point_risk=dew_point_risk,
         )
 
         # ── Zone control (skip if dropout or thermal runaway for safety) ───────
@@ -1811,23 +2042,35 @@ class ClimateEngine:
             # ── Zone 1 — Conditioning Room (flag-gated) ───────────────────────
             if self._conditioning_room_enabled():
                 z1_is_rc = bool(self._get(CONF_ZONE1_IS_REVERSE_CYCLE, False))
-                zone1_reverse_cycle_mode = await self._control_zone(
-                    zone=self._z1,
-                    zone_label="zone1",
-                    current_temp=lung_temp,
-                    leaf_vpd=leaf_vpd,
-                    heater_id=self._get(CONF_ZONE1_HEATER),
-                    ac_id=self._get(CONF_ZONE1_AC),
-                    humid_id=self._get(CONF_ZONE1_HUMIDIFIER),
-                    dehumid_id=self._get(CONF_ZONE1_DEHUMIDIFIER),
-                    is_reverse_cycle=z1_is_rc,
-                    reverse_cycle_id=self._get(CONF_ZONE1_REVERSE_CYCLE),
-                    enable_heat_cutoff=True,
-                )
-                zone1_heater_on = self._z1.heater_on
-                zone1_ac_on = self._z1.ac_on
-                zone1_humid_on = self._z1.humid_on
-                zone1_dehumid_on = self._z1.dehumid_on
+                if dew_point_risk:
+                    # 3.3: the hard override already forced the heater/
+                    # reverse-cycle on directly inside _handle_dew_point_risk
+                    # — skip the normal bang-bang call entirely this tick so
+                    # it can't immediately undo that "always wins" action if
+                    # zone1 happens to already be reading close to setpoint,
+                    # exactly like thermal_runaway skips all zone control
+                    # above rather than racing it.
+                    zone1_heater_on = not z1_is_rc
+                    zone1_reverse_cycle_mode = HVAC_MODE_HEAT if z1_is_rc else None
+                else:
+                    zone1_reverse_cycle_mode = await self._control_zone(
+                        zone=self._z1,
+                        zone_label="zone1",
+                        current_temp=lung_temp,
+                        leaf_vpd=leaf_vpd,
+                        heater_id=self._get(CONF_ZONE1_HEATER),
+                        ac_id=self._get(CONF_ZONE1_AC),
+                        humid_id=self._get(CONF_ZONE1_HUMIDIFIER),
+                        dehumid_id=self._get(CONF_ZONE1_DEHUMIDIFIER),
+                        is_reverse_cycle=z1_is_rc,
+                        reverse_cycle_id=self._get(CONF_ZONE1_REVERSE_CYCLE),
+                        enable_heat_cutoff=True,
+                        extra_setpoint_bias_c=self._preheat_bias_c(),
+                    )
+                    zone1_heater_on = self._z1.heater_on
+                    zone1_ac_on = self._z1.ac_on
+                    zone1_humid_on = self._z1.humid_on
+                    zone1_dehumid_on = self._z1.dehumid_on
 
                 # Legacy backup heater staging path (when no is_reverse_cycle)
                 # When is_reverse_cycle=True the backup is handled inside _control_zone

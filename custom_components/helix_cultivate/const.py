@@ -825,3 +825,83 @@ ALL_VALID_ZONE_DEVICE_KEYS: frozenset[str] = frozenset({
     CONF_EM_DRYING_S1, CONF_EM_DRYING_S2, CONF_EM_DRYING_S3, CONF_EM_DRYING_S4,
     CONF_EM_GLOBAL_S1, CONF_EM_GLOBAL_S2, CONF_EM_GLOBAL_S3, CONF_EM_GLOBAL_S4,
 })
+
+# ── 3.1: High-temperature graduated light dimming ────────────────────────────
+# Soft intermediate step below the existing hard thermal-runaway cutoff
+# (DEFAULT_THERMAL_RUNAWAY_C, 32.0°C, which already forces the light fully
+# off) — same "soft margin before hard cutoff" pattern as the thermal purge
+# exhaust ramp (THERMAL_PURGE_MARGIN_C, climate_engine.py).
+CONF_LIGHT_HIGH_TEMP_DIM_C: str = "light_high_temp_dim_c"
+DEFAULT_LIGHT_HIGH_TEMP_DIM_C: float = 29.0
+LIGHT_HIGH_TEMP_DIM_PCT: float = 50.0
+
+# ── 3.2: Canopy wind sweep ────────────────────────────────────────────────────
+# Off by default so nothing changes for existing installs. Growing-stage
+# only — must never activate during Drying, where the gentle-cyclic/constant
+# airflow strategy (CONF_DRYING_AIRFLOW_MODE) takes exclusive priority.
+CONF_WIND_SWEEP_ENABLED: str = "wind_sweep_enabled"
+DEFAULT_WIND_SWEEP_ENABLED: bool = False
+WIND_SWEEP_INTERVAL_MIN: float = 3.0   # minutes each tier holds the boosted turn
+WIND_SWEEP_BOOST_PCT: float = 100.0    # the currently-swept tier's speed
+WIND_SWEEP_REST_PCT: float = 40.0      # every other enabled tier's speed meanwhile
+
+# ── 3.3: Dew point / condensation prediction ─────────────────────────────────
+# Hard override — "always wins", same pattern as thermal runaway and the
+# drying humidity-ceiling override. Targets the actual physical mechanism
+# behind botrytis/powdery mildew (free surface moisture from condensation),
+# not a general humidity threshold: the gap between leaf temperature and the
+# calculated dew point narrowing means the leaf surface itself is at risk of
+# condensing moisture out of the air.
+CONF_DEW_POINT_MARGIN_C: str = "dew_point_margin_c"
+DEFAULT_DEW_POINT_MARGIN_C: float = 2.0
+# Sustained-dwell requirement before engaging, same dwell-timer pattern as
+# the drying humidity-ceiling override (DRYING_HUMIDITY_CEILING_DWELL_MIN) —
+# a single noisy reading must not force the override.
+DEW_POINT_OVERRIDE_DWELL_MIN: float = 10.0
+
+# ── 3.4: Predictive pre-heating before scheduled lights-off ─────────────────
+CONF_PREHEAT_LEAD_MIN: str = "preheat_lead_min"
+DEFAULT_PREHEAT_LEAD_MIN: float = 15.0
+# Applied as an extra bias on top of the existing VPD-assist bias mechanism
+# (VPD_ASSIST_MAX_BIAS_C in climate_engine.py) so the existing bang-bang/PID
+# heat demand logic naturally decides to heat, rather than a second,
+# separate override path.
+PREHEAT_BIAS_C: float = 2.0
+
+# ── 3.5: Stage-progression heads-up warnings ─────────────────────────────────
+# Purely informational/advisory reminders for manual grower action — Helix
+# Cultivate does not perform any of these transitions automatically.
+CONF_STAGE_WARNING_LEAD_DAYS: str = "stage_warning_lead_days"
+DEFAULT_STAGE_WARNING_LEAD_DAYS: int = 3
+# Keyed by the stage being approached (i.e. STAGE_SEQUENCE[current_idx + 1]).
+STAGE_TRANSITION_TIPS: dict[str, str] = {
+    STAGE_SEEDLING: (
+        "Begin gradually removing any humidity dome/cover so seedlings "
+        "acclimate before Seedling stage's lower-humidity target takes effect."
+    ),
+    STAGE_EARLY_VEG: (
+        "Check pot sizing — plan a transplant up if roots are already "
+        "circling before Early Veg's faster growth kicks in."
+    ),
+    STAGE_LATE_VEG: (
+        "Consider a nutrient step-up and confirm trellis/support structure "
+        "is in place before Late Veg's canopy growth accelerates."
+    ),
+    STAGE_STRETCH: (
+        "Check trellis/SCROG netting height and spacing, and consider a "
+        "final defoliation pass — both are much harder once Stretch's "
+        "growth spurt fills in the canopy."
+    ),
+    STAGE_PEAK_FLOWER: (
+        "Confirm bloom nutrients are dialled in and any support stakes/ties "
+        "are ready for heavier flower weight."
+    ),
+    STAGE_RIPENING: (
+        "Start planning flush timing (if used) and harvest logistics — "
+        "drying space, trim schedule, curing jars."
+    ),
+    STAGE_DRYING: (
+        "Confirm the drying space is clean, dark, and holding steady "
+        "temperature/humidity before chop day."
+    ),
+}

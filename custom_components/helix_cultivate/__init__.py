@@ -13,6 +13,7 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.components.frontend import add_extra_js_url, async_register_built_in_panel
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.helpers import entity_registry as er
+from homeassistant.loader import async_get_integration
 
 from .const import DOMAIN, CONFIG_VERSION, CONFIG_MINOR_VERSION
 from .coordinator import HelixCoordinator
@@ -775,10 +776,22 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
             "Helix Cultivate: unexpected error registering static path"
         )
 
-    module_url = (
-        f"/helix_cultivate_www/helix-panel.js"
-        f"?v={CONFIG_VERSION}.{CONFIG_MINOR_VERSION}"
-    )
+    # Cache-busting tied to the actual manifest.json release version (e.g.
+    # "1.2.8"), not CONFIG_VERSION/CONFIG_MINOR_VERSION — those only bump
+    # when a config-entry schema migration is actually needed, which is far
+    # less often than every release, so a browser could keep serving a
+    # stale cached copy across several real releases in a row otherwise.
+    try:
+        integration = await async_get_integration(hass, DOMAIN)
+        cache_bust = str(integration.version)
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception(
+            "Helix Cultivate: could not resolve manifest version for cache-busting; "
+            "falling back to config schema version"
+        )
+        cache_bust = f"{CONFIG_VERSION}.{CONFIG_MINOR_VERSION}"
+
+    module_url = f"/helix_cultivate_www/helix-panel.js?v={cache_bust}"
 
     try:
         async_register_built_in_panel(
@@ -811,10 +824,7 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
     # This makes <helix-glance-card> available on all dashboards (not just the
     # built-in sidebar panel) without requiring the user to add it manually as
     # a Lovelace resource.
-    glance_card_url = (
-        f"/helix_cultivate_www/helix-glance-card.js"
-        f"?v={CONFIG_VERSION}.{CONFIG_MINOR_VERSION}"
-    )
+    glance_card_url = f"/helix_cultivate_www/helix-glance-card.js?v={cache_bust}"
     try:
         add_extra_js_url(hass, glance_card_url)
     except Exception:
