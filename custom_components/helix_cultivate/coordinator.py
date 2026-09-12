@@ -172,6 +172,11 @@ from .const import (
     CONF_STAGE_WARNING_LEAD_DAYS,
     DEFAULT_STAGE_WARNING_LEAD_DAYS,
     STAGE_TRANSITION_TIPS,
+    # Cycle lifecycle (Part 1)
+    CONF_CYCLE_STATE,
+    CONF_STAGE_START_DATE,
+    CYCLE_STATE_ACTIVE,
+    CYCLE_STATE_NOT_STARTED,
 )
 from .stage_manager import StageManager
 
@@ -447,9 +452,12 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ── Repairs / issue_registry health checks (Phase 12B) ────────────────────
 
     def _check_repairs_issues(
-        self, lung_temp: Optional[float], lung_rh: Optional[float]
+        self,
+        lung_temp: Optional[float],
+        lung_rh: Optional[float],
+        sensor_dropout: bool = False,
     ) -> None:
-        """Evaluate the four Repairs conditions and create/clear issues.
+        """Evaluate the Repairs conditions and create/clear issues.
 
         Called once per coordinator tick. `ir.async_create_issue` is
         idempotent — repeated calls with the same issue_id update rather than
@@ -547,6 +555,29 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 is_fixable=False,
                 severity=ir.IssueSeverity.WARNING,
                 translation_key=issue_id,
+            )
+        else:
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+
+        # ── 6. Primary sensor actively dropped out (Part 2.1) ─────────────────
+        # Distinct from #5 above: this is a sensor that WAS mapped and
+        # working, now gone stale/unavailable — surfaced as its own Repairs
+        # issue (with the specific entity_id) so the dashboard's Sensor
+        # Dropout badge has a real Repairs entry to link to, sourced from
+        # the same _check_sensor_dropout() state already driving the
+        # critical notification. Not new dropout-detection logic — the
+        # detection already existed, only the Repairs surfacing was missing.
+        issue_id = "primary_sensor_dropout"
+        primary_temp_id = self._get(CONF_PRIMARY_TEMP_SENSOR)
+        if sensor_dropout and primary_temp_id:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                issue_id,
+                is_fixable=False,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key=issue_id,
+                translation_placeholders={"entity_id": primary_temp_id},
             )
         else:
             ir.async_delete_issue(self.hass, DOMAIN, issue_id)
@@ -1602,7 +1633,7 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         lung_rh: Optional[float] = self._read_sensor(self._get(CONF_LUNG_HUMIDITY_SENSOR))
 
         # ── Repairs / issue_registry health checks ──────────────────────────────
-        self._check_repairs_issues(lung_temp, lung_rh)
+        self._check_repairs_issues(lung_temp, lung_rh, sensor_dropout)
 
         # ── Calculate derived values ───────────────────────────────────────────
         leaf_vpd: Optional[float] = None
@@ -2167,8 +2198,16 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.data[NS_ENERGY]["cycle_kwh"] = 0.0
             self.data[NS_ENERGY]["cycle_cost_usd"] = 0.0
 
-        # Reset stage machine
-        self.stage_manager.reset_cycle()
+        # Return to a genuine not-started state (Part 1.4) — the next
+        # grower action is always an explicit Start New Cycle, never a
+        # silent Germination Day-0 reactivation the instant this closes.
+        self.stage_manager.return_to_not_started()
+        new_options = {
+            **self._entry.options,
+            CONF_CYCLE_STATE: CYCLE_STATE_NOT_STARTED,
+            "current_stage": self.stage_manager.current_stage,
+        }
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
 
         await self._notify_critical(
             title="Helix Cultivate — Harvest Archived",
@@ -2180,6 +2219,78 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         return {**harvest_data, "record_id": record_id}
+
+    # ── Cycle lifecycle (Part 1) ─────────────────────────────────────────────
+
+    async def start_cycle(
+        self, growth_mode: str, start_date: str, starting_stage: str
+    ) -> None:
+        """"Start New Cycle" action (Part 1.2) — the only way a cycle moves
+        from "not_started" to "active". Accepts a backdated start_date
+        (configuring the integration a few days after actually planting)
+        and a non-default starting_stage (e.g. clones purchased already in
+        Early Veg), so day-counting and stage resolution are correct from
+        the very first tick.
+
+        Reuses the existing CONF_GROWTH_MODE toggle rather than a
+        duplicate — growth_mode is persisted here alongside stage/date/
+        cycle_state in a single immediate config-entry write, the same
+        pattern the Grow Stage select entity's setter uses for an explicit,
+        infrequent user action (as opposed to the debounced
+        queue_option_write() sliders use).
+
+        Raises ValueError on an invalid stage or growth mode.
+        """
+        if starting_stage not in STAGE_SEQUENCE:
+            raise ValueError(f"Invalid starting stage: {starting_stage!r}")
+        if growth_mode not in (GROWTH_MODE_AUTOFLOWER, GROWTH_MODE_PHOTOPERIOD):
+            raise ValueError(f"Invalid growth mode: {growth_mode!r}")
+        try:
+            parsed_date = date.fromisoformat(start_date) if start_date else date.today()
+        except (ValueError, TypeError):
+            parsed_date = date.today()
+
+        self._config[CONF_GROWTH_MODE] = growth_mode
+        self.stage_manager.start_new_cycle(starting_stage, parsed_date)
+
+        new_options = {
+            **self._entry.options,
+            CONF_GROWTH_MODE: growth_mode,
+            "current_stage": starting_stage,
+            CONF_STAGE_START_DATE: parsed_date.isoformat(),
+            CONF_CYCLE_STATE: CYCLE_STATE_ACTIVE,
+        }
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+
+        self.hass.bus.async_fire(
+            "helix_cultivate_cycle_started",
+            {
+                "entry_id": self._entry.entry_id,
+                "growth_mode": growth_mode,
+                "starting_stage": starting_stage,
+                "start_date": parsed_date.isoformat(),
+            },
+        )
+
+    async def abort_cycle(self) -> None:
+        """"Abort Cycle" action (Part 1.5) — a second, clearly-distinct
+        destructive action from harvest close-out: no harvest record, no
+        weight entry, no journal archive. For a cycle that never reaches
+        harvest (pests, mistakes, a failed run). Returns directly to
+        "not_started" so the next action is an explicit Start New Cycle.
+        """
+        self.stage_manager.return_to_not_started()
+        new_options = {
+            **self._entry.options,
+            CONF_CYCLE_STATE: CYCLE_STATE_NOT_STARTED,
+            "current_stage": self.stage_manager.current_stage,
+        }
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+
+        self.hass.bus.async_fire(
+            "helix_cultivate_cycle_aborted",
+            {"entry_id": self._entry.entry_id},
+        )
 
     # ── Debounced option persistence ────────────────────────────────────────────
 

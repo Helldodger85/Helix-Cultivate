@@ -13,11 +13,15 @@ if TYPE_CHECKING:
     from .coordinator import HelixCoordinator
 
 from .const import (
+    CONF_CYCLE_STATE,
     CONF_DRYING_CUSTOM_UNLOCKED,
     CONF_PROGRESSION_MODE,
     CONF_RECIPE_FILE,
     CONF_SMOOTH_GLIDES,
     CONF_STAGE_START_DATE,
+    CYCLE_STATE_ACTIVE,
+    CYCLE_STATE_NOT_STARTED,
+    DEFAULT_CYCLE_STATE,
     DEFAULT_DRYING_CUSTOM_UNLOCKED,
     DOMAIN,
     DRYING_LOCKED_TEMP_C,
@@ -108,6 +112,13 @@ class StageManager:
         self._stage_start_date: Optional[date] = self._parse_date(raw_start)
 
         self._cycle_complete: bool = False
+
+        # Cycle lifecycle (Part 1) — "not_started" until the grower
+        # explicitly starts a cycle (start_new_cycle()); existing entries
+        # from before this version are migrated straight to "active" (see
+        # async_migrate_entry's v1.7 branch) so this default only ever
+        # applies to genuinely new installs.
+        self._cycle_state: str = config.get(CONF_CYCLE_STATE, DEFAULT_CYCLE_STATE)
 
         # Actual days spent in each stage this cycle (Phase 11B harvest report).
         # Updated in `_advance_stage()` when leaving a stage; the currently
@@ -466,6 +477,18 @@ class StageManager:
         return self._cycle_complete
 
     @property
+    def cycle_state(self) -> str:
+        """"not_started" or "active" (Part 1) — distinct from cycle_complete,
+        which only ever means "reached the end of Drying". A cycle can be
+        not_started, active-and-in-progress, or active-and-complete
+        (awaiting harvest close-out)."""
+        return self._cycle_state
+
+    @property
+    def is_cycle_active(self) -> bool:
+        return self._cycle_state == CYCLE_STATE_ACTIVE
+
+    @property
     def smooth_glides_active(self) -> bool:
         """True when smooth glides interpolation is enabled."""
         return bool(self._config.get(CONF_SMOOTH_GLIDES, True))
@@ -487,19 +510,60 @@ class StageManager:
         """Return {stage: planned_duration_days} for every stage in sequence."""
         return {stage: self._duration(stage) for stage in STAGE_SEQUENCE}
 
-    def reset_cycle(self) -> None:
-        """Reset the state machine to the beginning of a fresh grow cycle.
+    # ── Cycle lifecycle (Part 1) ─────────────────────────────────────────────
 
-        Called by `HelixCoordinator.close_out_harvest()` after the harvest
-        record has been successfully archived.
+    def start_new_cycle(self, stage: str, start_date: date) -> None:
+        """Explicitly begin a new grow cycle at `stage`, with day-counting
+        anchored to `start_date` — which may be backdated (configuring the
+        integration a few days after actually planting) or today. The one
+        true entry point for a "not_started" -> "active" transition
+        (HelixCoordinator.start_cycle(), Part 1.2).
+
+        Distinct from set_stage() (a manual mid-cycle stage override that
+        doesn't touch cycle_state) and from the old reset_cycle() this
+        replaces (which used to restart immediately at STAGE_SEQUENCE[0]/
+        today rather than returning to a genuine not_started state first).
+        """
+        if stage not in STAGE_SEQUENCE:
+            raise ValueError(f"Invalid starting stage: {stage!r}")
+        previous_stage = self._current_stage
+        self._current_stage = stage
+        self._stage_start_date = start_date
+        self._stage_entry_day = {}
+        self._cycle_complete = False
+        self._cycle_state = CYCLE_STATE_ACTIVE
+        self._config["current_stage"] = stage
+        self._config[CONF_CYCLE_STATE] = CYCLE_STATE_ACTIVE
+        _LOGGER.info(
+            "Helix Cultivate: new cycle started at '%s' (start date %s)",
+            stage, start_date.isoformat(),
+        )
+        if self._coord_ref is not None:
+            self._coord_ref.temp_setpoint_manual_override = False
+            self._coord_ref.vpd_target_manual_override = False
+            self._coord_ref.rh_setpoint_manual_override = False
+        if previous_stage != stage:
+            self._fire_stage_changed_event(previous_stage, stage)
+
+    def return_to_not_started(self) -> None:
+        """Return the state machine to a genuine not-started state — no
+        active stage, no start date, since nothing has actually started yet.
+
+        Used by both HelixCoordinator.close_out_harvest() (Part 1.4: a
+        completed harvest no longer silently reactivates Germination Day 0)
+        and HelixCoordinator.abort_cycle() (Part 1.5: a failed cycle that
+        never reaches harvest). The next grower action is always an
+        explicit start_new_cycle() call, never an implicit one.
         """
         previous_stage = self._current_stage
         self._current_stage = STAGE_SEQUENCE[0]
-        self._stage_start_date = date.today()
+        self._stage_start_date = None
         self._stage_entry_day = {}
         self._cycle_complete = False
+        self._cycle_state = CYCLE_STATE_NOT_STARTED
         self._config["current_stage"] = self._current_stage
-        _LOGGER.info("Helix Cultivate: cycle reset — new grow cycle started at '%s'", self._current_stage)
+        self._config[CONF_CYCLE_STATE] = CYCLE_STATE_NOT_STARTED
+        _LOGGER.info("Helix Cultivate: cycle returned to not-started state.")
         if previous_stage != self._current_stage:
             self._fire_stage_changed_event(previous_stage, self._current_stage)
 

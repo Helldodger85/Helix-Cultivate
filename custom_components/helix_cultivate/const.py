@@ -7,7 +7,7 @@ from typing import Any
 # ── Integration identity ─────────────────────────────────────────────────────
 DOMAIN: str = "helix_cultivate"
 CONFIG_VERSION: int = 1
-CONFIG_MINOR_VERSION: int = 6
+CONFIG_MINOR_VERSION: int = 7
 
 # ── Coordinator ──────────────────────────────────────────────────────────────
 COORDINATOR_UPDATE_INTERVAL: timedelta = timedelta(seconds=30)
@@ -141,6 +141,20 @@ STAGE_DEFAULT_DURATIONS: dict[str, int] = {
     STAGE_RIPENING: 14,
     STAGE_DRYING: 10,
 }
+
+# ── Cycle lifecycle (Part 1) ──────────────────────────────────────────────────
+# A genuine "hasn't been explicitly started yet" state, distinct from any
+# real stage — previously StageManager initialised straight into
+# STAGE_GERMINATION the moment the integration was set up, with no way to
+# tell "a real cycle is running" from "this is just the software's resting
+# default". DEFAULT_CYCLE_STATE ("not_started") applies only to entries
+# created from this version onward — existing entries are migrated straight
+# to "active" (see async_migrate_entry's v1.7 branch) so nothing already
+# tracked is interrupted or reset by this change.
+CONF_CYCLE_STATE: str = "cycle_state"
+CYCLE_STATE_NOT_STARTED: str = "not_started"
+CYCLE_STATE_ACTIVE: str = "active"
+DEFAULT_CYCLE_STATE: str = CYCLE_STATE_NOT_STARTED
 
 # ── Day/Night environmental targets per stage (Phase 5) ───────────────────────
 STAGE_DAYNIGHT_DEFAULTS: dict[str, dict[str, Any]] = {

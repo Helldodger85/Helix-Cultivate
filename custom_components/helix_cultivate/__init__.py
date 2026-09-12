@@ -31,6 +31,8 @@ WS_CMD_EXPORT_RECIPE: str = "helix_cultivate/export_recipe"
 WS_CMD_IMPORT_RECIPE: str = "helix_cultivate/import_recipe"
 WS_CMD_UPDATE_SETTINGS_FIELDS: str = "helix_cultivate/update_settings_fields"
 WS_CMD_RESET_ENERGY_CYCLE: str = "helix_cultivate/reset_energy_cycle"
+WS_CMD_START_CYCLE: str = "helix_cultivate/start_cycle"
+WS_CMD_ABORT_CYCLE: str = "helix_cultivate/abort_cycle"
 
 VALID_STAGE_TARGET_KEYS: frozenset[str] = frozenset({
     "day_temp_c", "night_temp_c",
@@ -73,6 +75,10 @@ VALID_SETTINGS_FIELD_KEYS: frozenset[str] = frozenset({
     "em_zone1_enabled", "em_zone2_enabled", "em_drying_enabled",
     "tariff_mode", "tariff_anytime", "tariff_peak", "tariff_shoulder", "tariff_offpeak",
     "tariff_peak_start", "tariff_peak_end", "tariff_shoulder_start", "tariff_shoulder_end",
+    # v1.2.8 feature settings, now exposed for editing (Part 3) — previously
+    # backend-only with no settings-flow or gear-icon control surface.
+    "light_high_temp_dim_c", "wind_sweep_enabled", "dew_point_margin_c",
+    "preheat_lead_min", "stage_warning_lead_days",
 })
 
 PLATFORMS: list[Platform] = [
@@ -323,6 +329,28 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                 )
             else:
                 _LOGGER.info("Helix Cultivate: migrated entry to v1.6 (no data changes)")
+
+        if current_minor < 7:
+            # v1.6 → v1.7: introduces a real cycle lifecycle state
+            # (CONF_CYCLE_STATE — "not_started"/"active") that gates the
+            # dashboard's "No Active Cycle" empty state. Critical: this
+            # entry already exists, meaning it has a real, currently-tracked
+            # stage and day-count — migrate it straight to "active" so
+            # nothing already running is interrupted or reset. Only entries
+            # created from v1.7 onward default to "not_started" (that
+            # default lives in StageManager/DEFAULT_CYCLE_STATE, applied
+            # when the key is simply absent — nothing to write here for
+            # brand-new entries, since they never go through this migration
+            # path at all).
+            from .const import CONF_CYCLE_STATE, CYCLE_STATE_ACTIVE
+
+            new_opts[CONF_CYCLE_STATE] = CYCLE_STATE_ACTIVE
+            _LOGGER.warning(
+                "Helix Cultivate: migrated entry to v1.7 — cycle_state set to "
+                "'active', preserving this entry's current stage and "
+                "day-count exactly as-is. Only new installs from this "
+                "version onward start in the new 'not_started' state."
+            )
 
         hass.config_entries.async_update_entry(
             config_entry,
@@ -617,6 +645,71 @@ async def ws_reset_energy_cycle(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): WS_CMD_START_CYCLE,
+        vol.Required("growth_mode"): str,
+        vol.Required("start_date"): str,
+        vol.Required("starting_stage"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_start_cycle(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """"Start New Cycle" (Part 1.2) — moves cycle_state from "not_started"
+    to "active", with a possibly-backdated start_date and a possibly-
+    non-default starting_stage.
+    """
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    try:
+        await coordinator.start_cycle(
+            msg["growth_mode"], msg["start_date"], msg["starting_stage"]
+        )
+        connection.send_result(msg["id"], {"success": True})
+    except ValueError as exc:
+        connection.send_error(msg["id"], "invalid_input", str(exc))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_CMD_ABORT_CYCLE,
+    }
+)
+@websocket_api.async_response
+async def ws_abort_cycle(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """"Abort Cycle" (Part 1.5) — a second, clearly-distinct destructive
+    action from harvest close-out: no harvest record, no weight entry.
+    """
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    await coordinator.abort_cycle()
+    connection.send_result(msg["id"], {"success": True})
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): WS_CMD_EXPORT_RECIPE,
     }
 )
@@ -705,6 +798,8 @@ def _async_register_zone_device_ws_commands(hass: HomeAssistant) -> None:
         websocket_api.async_register_command(hass, ws_import_recipe)
         websocket_api.async_register_command(hass, ws_update_settings_fields)
         websocket_api.async_register_command(hass, ws_reset_energy_cycle)
+        websocket_api.async_register_command(hass, ws_start_cycle)
+        websocket_api.async_register_command(hass, ws_abort_cycle)
         hass.data.setdefault(DOMAIN, {})["_zone_ws_registered"] = True
         _LOGGER.info("Helix Cultivate: zone-device WebSocket commands registered")
     except Exception:  # noqa: BLE001

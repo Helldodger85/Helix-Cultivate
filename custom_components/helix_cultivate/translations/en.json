@@ -345,6 +345,10 @@
     "primary_sensor_not_configured": {
       "title": "Primary Sensor Not Configured Yet",
       "description": "No primary canopy temperature sensor is mapped yet, so climate control is paused and exhaust is held at a safe floor. This is expected right after installing — open Settings > Hardware Mapping to finish setup."
+    },
+    "primary_sensor_dropout": {
+      "title": "Primary Sensor Unavailable",
+      "description": "The primary canopy temperature sensor ({entity_id}) has been unavailable or has not updated for over 30 minutes. Exhaust is running at a safe floor and VPD control is suspended until it recovers. Check the sensor's battery, network connection, or integration status."
     }
   }
 }

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from custom_components.helix_cultivate.const import NS_ENERGY
+from custom_components.helix_cultivate.const import CONF_CYCLE_STATE, CYCLE_STATE_NOT_STARTED, NS_ENERGY
 from custom_components.helix_cultivate.coordinator import HelixCoordinator
 
 DOMAIN = "helix_cultivate"
@@ -40,7 +40,11 @@ def fake_coord():
 
     coord.stage_manager = MagicMock()
     coord.stage_manager.actual_stage_durations = MagicMock(return_value={})
-    coord.stage_manager.reset_cycle = MagicMock()
+    coord.stage_manager.return_to_not_started = MagicMock()
+    coord.stage_manager.current_stage = "germination"
+
+    coord._entry.options = {}
+    coord.hass.config_entries.async_update_entry = MagicMock()
 
     coord._vpd_history = deque()
     coord.vpd_target_min = 0.8
@@ -90,3 +94,16 @@ async def test_close_out_harvest_resets_cycle_cost_not_just_kwh(fake_coord):
     assert fake_coord._last_energy_tick is None
     assert fake_coord.data[NS_ENERGY]["cycle_kwh"] == 0.0
     assert fake_coord.data[NS_ENERGY]["cycle_cost_usd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_close_out_harvest_returns_to_not_started(fake_coord):
+    """Part 1.4: a completed harvest must not silently reactivate
+    Germination Day 0 — it returns to a genuine not_started state, and the
+    next grower action is an explicit Start New Cycle."""
+    await fake_coord.close_out_harvest(100.0, 20.0)
+
+    fake_coord.stage_manager.return_to_not_started.assert_called_once()
+    fake_coord.hass.config_entries.async_update_entry.assert_called_once()
+    call_kwargs = fake_coord.hass.config_entries.async_update_entry.call_args.kwargs
+    assert call_kwargs["options"][CONF_CYCLE_STATE] == CYCLE_STATE_NOT_STARTED

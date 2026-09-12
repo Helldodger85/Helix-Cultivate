@@ -691,6 +691,16 @@ class HelixTabTelemetry extends HTMLElement {
     const h = this._hass;
     const d = this._data || {};
 
+    // No Active Cycle (Part 1.3) — a genuinely distinct empty state, not a
+    // greyed-out live view, whenever a cycle hasn't been explicitly
+    // started. Replaces the entire dashboard rather than showing gauges/
+    // stage timeline for what would otherwise look like a real Day-0
+    // Germination cycle that was never actually begun.
+    if (d.cycle_state === 'not_started') {
+      this._renderNoActiveCycle();
+      return;
+    }
+
     const vpd         = d.leaf_vpd       ?? null;
     const vpdTarget   = d.vpd_target     ?? 1.0;
     const dli         = d.dli_today      ?? null;
@@ -709,14 +719,14 @@ class HelixTabTelemetry extends HTMLElement {
 
     const phaseBadge = {
       day:     `<span class="badge bg-amber">☀ Day</span>`,
-      night:   `<span class="badge bg-gray">☽ Night</span>`,
+      night:   `<span class="badge bg-gray" title="It's currently a dark/night period per the lighting schedule — the Night VPD/temperature targets are active instead of Day.">☽ Night</span>`,
       sunrise: `<span class="badge bg-amber">↑ Sunrise Ramp</span>`,
       sunset:  `<span class="badge bg-amber">↓ Sunset Ramp</span>`,
     }[phase] ?? `<span class="badge bg-gray">—</span>`;
 
     const topoBadge = condEnabled
-      ? `<span class="badge bg-purple">⬡ Coordinated</span>`
-      : `<span class="badge bg-blue">◈ Standalone</span>`;
+      ? `<span class="badge bg-purple" title="Coordinated: a Conditioning Room pre-treats air before it enters the Primary Grow Space, working together as one system.">⬡ Coordinated</span>`
+      : `<span class="badge bg-blue" title="Standalone: the Primary Grow Space is controlled directly, with no separate Conditioning Room.">◈ Standalone</span>`;
 
     const stagePct = (stageDay !== '—' && stageDur !== '—')
       ? Math.min(100, Math.round((Number(stageDay) / Number(stageDur)) * 100))
@@ -724,7 +734,11 @@ class HelixTabTelemetry extends HTMLElement {
 
     const alerts = [];
     if (thermalRunaway) alerts.push(`<span class="badge bg-red">🔥 Thermal Runaway</span>`);
-    if (sensorDropout)  alerts.push(`<span class="badge bg-amber">⚠ Sensor Dropout</span>`);
+    if (sensorDropout) {
+      alerts.push(
+        `<span class="badge bg-amber" id="sensor-dropout-badge" style="cursor:pointer" title="Click for details">⚠ Sensor Dropout</span>`
+      );
+    }
 
     // Ambient bar (only if weather entity is mapped)
     const _moon = moonPhase(new Date());
@@ -788,17 +802,20 @@ class HelixTabTelemetry extends HTMLElement {
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px">
           <span style="font-size:1rem;font-weight:800">🌿 Helix Cultivate</span>
           ${topoBadge}${phaseBadge}
-          ${smoothGlide ? '<span class="badge bg-accent">✦ Smooth Glides</span>' : ''}
+          ${smoothGlide ? '<span class="badge bg-accent" title="Smooth Glides: environmental targets (VPD/Temp/RH/Light) blend gradually day-by-day across a stage transition, instead of jumping instantly to the next stage\'s values.">✦ Smooth Glides</span>' : ''}
           ${alerts.join('')}
         </div>
         <div style="display:flex;align-items:center;justify-content:space-around;flex-wrap:wrap;gap:14px">
           <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
             <helix-vpd-gauge id="hud-vpd-gauge"></helix-vpd-gauge>
             <span style="font-size:.68rem;color:var(--hx-text2)">LEAF VPD</span>
+            <span style="font-size:.6rem;color:var(--hx-text2)" title="Green: within 0.08 kPa of target. Orange: within 0.20 kPa. Red: further off and needs attention.">
+              🟢 On target · 🟠 Marginal · 🔴 Needs attention
+            </span>
           </div>
           <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
             <helix-dli-tracker id="hud-dli-tracker"></helix-dli-tracker>
-            <span style="font-size:.68rem;color:var(--hx-text2)">DLI mol/m²</span>
+            <span style="font-size:.68rem;color:var(--hx-text2)" title="Daily Light Integral: total useful (photosynthetically active) light received so far today, in mol/m², compared against the active stage's target.">DLI mol/m²</span>
           </div>
           <div style="text-align:center">
             <div style="font-size:1.1rem;font-weight:800">${stage}</div>
@@ -832,6 +849,61 @@ class HelixTabTelemetry extends HTMLElement {
     if (gauge) { gauge.vpd = vpd; gauge.target = vpdTarget; }
     const dliT = this.shadowRoot.querySelector('#hud-dli-tracker');
     if (dliT) { dliT.dli = dli; }
+
+    // Sensor Dropout badge (Part 2.1) — click shows the specific flagged
+    // sensor(s), sourced from the same tracking state already backing the
+    // "primary_sensor_dropout" Repairs issue, plus a link to Settings >
+    // Repairs for full detail/history. No new dropout-detection logic —
+    // purely a UI connection to what already exists server-side.
+    const dropoutBadge = this.shadowRoot.querySelector('#sensor-dropout-badge');
+    if (dropoutBadge) {
+      dropoutBadge.addEventListener('click', () => {
+        this._showDropoutPopover = !this._showDropoutPopover;
+        this._render();
+      });
+    }
+    if (this._showDropoutPopover && sensorDropout) {
+      const entities = d.sensor_dropout_entities || [];
+      const popover = document.createElement('div');
+      popover.style.cssText = `position:fixed;z-index:1000;background:var(--hx-surface2);
+        border:1px solid var(--hx-border);border-radius:10px;padding:12px;max-width:280px;
+        box-shadow:0 4px 16px rgba(0,0,0,.3);font-size:.78rem;color:var(--hx-text)`;
+      const rect = dropoutBadge.getBoundingClientRect();
+      popover.style.top = `${rect.bottom + 6}px`;
+      popover.style.left = `${rect.left}px`;
+      popover.innerHTML = `
+        <div style="font-weight:700;margin-bottom:6px">⚠ Sensor Dropout</div>
+        ${entities.length
+          ? `<div style="margin-bottom:8px">Currently unavailable or stale:</div>
+             <ul style="margin:0 0 8px;padding-left:18px">
+               ${entities.map(e => `<li style="font-family:monospace;font-size:.72rem">${e}</li>`).join('')}
+             </ul>`
+          : `<div style="margin-bottom:8px;color:var(--hx-text2)">No specific sensor detail available.</div>`}
+        <button id="dropout-popover-repairs" style="width:100%;padding:6px;border-radius:6px;border:1px solid var(--hx-border);
+          background:none;color:var(--hx-text);cursor:pointer;font-size:.72rem">Open Settings → Repairs</button>
+      `;
+      this.shadowRoot.appendChild(popover);
+      const repairsBtn = popover.querySelector('#dropout-popover-repairs');
+      if (repairsBtn) {
+        repairsBtn.addEventListener('click', () => {
+          history.pushState(null, '', '/config/repairs');
+          const evt = new CustomEvent('location-changed', { bubbles: true, composed: true });
+          window.dispatchEvent(evt);
+        });
+      }
+      // Dismiss on outside click (deferred so this same click doesn't
+      // immediately close what it just opened).
+      setTimeout(() => {
+        const dismiss = (ev) => {
+          if (!popover.contains(ev.target) && ev.target !== dropoutBadge) {
+            this._showDropoutPopover = false;
+            popover.remove();
+            document.removeEventListener('click', dismiss);
+          }
+        };
+        document.addEventListener('click', dismiss);
+      }, 0);
+    }
 
     // Wire up sparkline cards
     const tentSpark = this.shadowRoot.querySelector('#spark-tent');
@@ -887,6 +959,37 @@ class HelixTabTelemetry extends HTMLElement {
       }
     }
   }
+
+  // No Active Cycle (Part 1.3) — genuinely distinct empty state. The Start
+  // New Cycle form itself lives on the Plant Cycle tab (the cleanest single
+  // place for it); this button just requests that tab via a bubbling event
+  // HelixPanel listens for, rather than duplicating the form here.
+  _renderNoActiveCycle() {
+    this.shadowRoot.innerHTML = `
+      <style>${BASE_CSS}:host{display:block;}</style>
+      <div class="card" style="text-align:center;padding:36px 20px">
+        <div style="font-size:2.4rem;margin-bottom:8px">🌱</div>
+        <div style="font-size:1.2rem;font-weight:800;margin-bottom:6px">No Active Cycle</div>
+        <div style="font-size:.85rem;color:var(--hx-text2);max-width:420px;margin:0 auto 18px;line-height:1.5">
+          Helix Cultivate isn't tracking a grow right now. Start a new cycle to begin
+          day-counting, stage progression, and environmental control targets.
+        </div>
+        <button id="goto-start-cycle-btn" style="padding:11px 22px;border-radius:10px;border:none;
+          background:var(--hx-accent);color:#fff;font-weight:700;cursor:pointer;font-size:.88rem">
+          🌱 Start New Cycle
+        </button>
+      </div>`;
+
+    const btn = this.shadowRoot.querySelector('#goto-start-cycle-btn');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        this.dispatchEvent(new CustomEvent('request-tab-change', {
+          bubbles: true, composed: true, detail: { tab: 'plant_cycle' },
+        }));
+      });
+    }
+  }
+
   connectedCallback() { this._render(); }
 }
 customElements.define('helix-tab-telemetry', HelixTabTelemetry);
@@ -988,6 +1091,17 @@ class HelixTabCycle extends HTMLElement {
     this._showImportModal = false;
     this._exportYaml = '';
     this._importError = null;
+    // Start New Cycle form draft state (Part 1.2)
+    this._startGrowthMode = 'photoperiod';
+    this._startDate = new Date().toISOString().slice(0, 10);
+    this._startStage = 'germination';
+    this._startError = null;
+    this._startSaving = false;
+    // Abort Cycle confirmation (Part 1.5) — a second, explicit step so a
+    // grower never accidentally aborts when they meant to close out a
+    // real harvest, or vice versa.
+    this._showAbortConfirm = false;
+    this._abortSaving = false;
   }
 
   set hass(h) { this._hass = h; }
@@ -1127,6 +1241,16 @@ class HelixTabCycle extends HTMLElement {
 
   _render() {
     const d = this._data || {};
+
+    // No Active Cycle (Part 1.3) — the Plant Cycle tab is the primary home
+    // for the Start New Cycle form; replaces the entire stage timeline/
+    // profile-editor view rather than showing a stage that was never
+    // actually begun.
+    if (d.cycle_state === 'not_started') {
+      this._renderNoActiveCycle();
+      return;
+    }
+
     const activeStage = d.grow_stage_slug || 'germination';
     const dedicatedDryingRoom = d.enable_drying_environment === true;
     // Never two editable surfaces for the same data: once a dedicated
@@ -1434,6 +1558,48 @@ class HelixTabCycle extends HTMLElement {
             <span class="sw-thumb"></span>
           </label>
         </div>
+        <div class="sec">Stage-Progression Heads-Up Warning</div>
+        <div class="slider-row">
+          <span class="slider-lbl">Lead Time</span>
+          <input type="range" id="stage-warning-lead-slider" min="1" max="14" step="1"
+            value="${d.stage_warning_lead_days ?? 3}"/>
+          <span class="slider-val" id="stage-warning-lead-val">${d.stage_warning_lead_days ?? 3} day${(d.stage_warning_lead_days ?? 3) === 1 ? '' : 's'}</span>
+        </div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:2px">
+          How many days before an expected stage transition to fire an informational reminder
+          with manual-action suggestions (e.g. check trellis netting). Advisory only — Helix
+          Cultivate never advances a stage automatically because of this.
+        </div>
+      </div>
+      <!-- Abort Cycle (Part 1.5) — a second, clearly-distinct destructive
+           action from harvest close-out: no harvest record, no weight
+           entry, no journal archive. -->
+      <div class="card" style="border:1px solid var(--hx-red,#ff5252)">
+        <div class="card-title">⚠ Abort Cycle</div>
+        <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px;line-height:1.5">
+          For a cycle that never reaches harvest — pests, mistakes, or a failed run.
+          This is <b>not</b> the same as closing out a real harvest: it discards the current
+          stage/day-count with no weight entry and no harvest record, and returns to
+          "No Active Cycle". If you actually have a harvest to record, use Close Out Harvest
+          instead.
+        </div>
+        ${this._showAbortConfirm ? `
+          <div style="background:rgba(255,82,82,.1);border-radius:8px;padding:10px;margin-bottom:10px;font-size:.8rem">
+            Are you sure? This cannot be undone — the current cycle's stage and day-count
+            will be lost.
+          </div>
+          <div style="display:flex;gap:8px">
+            <button id="confirm-abort-btn" ${this._abortSaving ? 'disabled' : ''} style="flex:1;padding:10px;border-radius:8px;border:none;
+              background:var(--hx-red,#ff5252);color:#fff;font-weight:700;cursor:pointer">
+              ${this._abortSaving ? 'Aborting…' : 'Yes, Abort This Cycle'}
+            </button>
+            <button id="cancel-abort-btn" style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border);
+              background:none;color:var(--hx-text);cursor:pointer">Cancel</button>
+          </div>
+        ` : `
+          <button id="open-abort-confirm-btn" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--hx-red,#ff5252);
+            background:none;color:var(--hx-red,#ff5252);font-weight:700;cursor:pointer">⚠ Abort Cycle…</button>
+        `}
       </div>
       <!-- Recipe export / import -->
       <div class="card">
@@ -1689,7 +1855,157 @@ class HelixTabCycle extends HTMLElement {
       const ta = this.shadowRoot.querySelector('#import-yaml-textarea');
       this._submitImport(ta.value);
     });
+
+    // Stage-progression warning lead time (Part 3)
+    const warnSl = this.shadowRoot.querySelector('#stage-warning-lead-slider');
+    const warnVal = this.shadowRoot.querySelector('#stage-warning-lead-val');
+    if (warnSl) {
+      warnSl.addEventListener('input', e => {
+        const v = parseInt(e.target.value, 10);
+        if (warnVal) warnVal.textContent = `${v} day${v === 1 ? '' : 's'}`;
+      });
+      warnSl.addEventListener('change', async e => {
+        const entryId = (this._data || {}).entry_id;
+        if (!this._hass || !entryId) return;
+        try {
+          await this._hass.callWS({
+            type: 'helix_cultivate/update_settings_fields',
+            entry_id: entryId,
+            fields: { stage_warning_lead_days: parseInt(e.target.value, 10) },
+          });
+        } catch (err) {
+          console.error('Helix Cultivate: stage_warning_lead_days save failed', err);
+        }
+      });
+    }
+
+    // Abort Cycle (Part 1.5)
+    const openAbortBtn = this.shadowRoot.querySelector('#open-abort-confirm-btn');
+    if (openAbortBtn) openAbortBtn.addEventListener('click', () => {
+      this._showAbortConfirm = true;
+      this._render();
+    });
+    const cancelAbortBtn = this.shadowRoot.querySelector('#cancel-abort-btn');
+    if (cancelAbortBtn) cancelAbortBtn.addEventListener('click', () => {
+      this._showAbortConfirm = false;
+      this._render();
+    });
+    const confirmAbortBtn = this.shadowRoot.querySelector('#confirm-abort-btn');
+    if (confirmAbortBtn) confirmAbortBtn.addEventListener('click', () => this._doAbortCycle());
   }
+
+  async _doAbortCycle() {
+    if (!this._hass) return;
+    this._abortSaving = true;
+    this._render();
+    try {
+      await this._hass.callWS({ type: 'helix_cultivate/abort_cycle' });
+      this._showAbortConfirm = false;
+      // The abort triggers a config-entry reload (same as other explicit
+      // lifecycle actions) — the next coordinator data push naturally
+      // reflects cycle_state === 'not_started', so no manual state patch
+      // is needed here beyond closing the confirm dialog.
+    } catch (e) {
+      console.error('Helix Cultivate: abort_cycle failed', e);
+    } finally {
+      this._abortSaving = false;
+      this._render();
+    }
+  }
+
+  // ── Start New Cycle (Part 1.2 / 1.3) ──────────────────────────────────────
+
+  _renderNoActiveCycle() {
+    const targetableStages = Object.keys(STAGE_META).filter(s => s !== 'drying');
+    this.shadowRoot.innerHTML = `
+      <style>${BASE_CSS}:host{display:block;}</style>
+      <div class="card">
+        <div style="text-align:center;padding:20px 10px 24px">
+          <div style="font-size:2.4rem;margin-bottom:8px">🌱</div>
+          <div style="font-size:1.2rem;font-weight:800;margin-bottom:6px">No Active Cycle</div>
+          <div style="font-size:.85rem;color:var(--hx-text2);max-width:420px;margin:0 auto;line-height:1.5">
+            Start a new cycle to begin day-counting, stage progression, and environmental
+            control targets.
+          </div>
+        </div>
+        <div class="sec">Growth Mode</div>
+        <div style="display:flex;gap:6px;margin-bottom:14px">
+          <button class="start-growth-mode-btn ${this._startGrowthMode === 'photoperiod' ? 'active' : ''}" data-mode="photoperiod"
+            style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${this._startGrowthMode === 'photoperiod' ? 'var(--hx-blue,#209cee)' : 'none'};
+            color:${this._startGrowthMode === 'photoperiod' ? '#fff' : 'var(--hx-text)'};font-weight:600">Photoperiod</button>
+          <button class="start-growth-mode-btn ${this._startGrowthMode === 'autoflower' ? 'active' : ''}" data-mode="autoflower"
+            style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${this._startGrowthMode === 'autoflower' ? 'var(--hx-blue,#209cee)' : 'none'};
+            color:${this._startGrowthMode === 'autoflower' ? '#fff' : 'var(--hx-text)'};font-weight:600">Autoflower</button>
+        </div>
+        <div class="sec">Start Date</div>
+        <div style="margin-bottom:14px">
+          <input type="date" id="start-cycle-date" value="${this._startDate}"
+            style="padding:8px;border-radius:8px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+          <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
+            Backdate this if the plant was already a few days old when you set up the
+            integration — day-counting and stage duration will be calculated from this date.
+          </div>
+        </div>
+        <div class="sec">Starting Stage</div>
+        <div style="margin-bottom:16px">
+          <select id="start-cycle-stage" style="width:100%;padding:8px;border-radius:8px;
+            border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
+            ${targetableStages.map(s => `<option value="${s}" ${this._startStage === s ? 'selected' : ''}>${STAGE_META[s].icon} ${STAGE_META[s].label}</option>`).join('')}
+          </select>
+          <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
+            Defaults to Germination — choose further along (e.g. Early Veg) for clones or
+            plants purchased already established.
+          </div>
+        </div>
+        ${this._startError ? `<div class="badge bg-red" style="margin-bottom:10px">${this._startError}</div>` : ''}
+        <button id="submit-start-cycle-btn" ${this._startSaving ? 'disabled' : ''} style="width:100%;padding:12px;border-radius:10px;border:none;
+          background:var(--hx-accent);color:#fff;font-weight:700;cursor:pointer;font-size:.9rem">
+          ${this._startSaving ? 'Starting…' : '🌱 Start New Cycle'}
+        </button>
+      </div>`;
+
+    this.shadowRoot.querySelectorAll('.start-growth-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this._startGrowthMode = btn.dataset.mode;
+        this._render();
+      });
+    });
+    const dateInput = this.shadowRoot.querySelector('#start-cycle-date');
+    if (dateInput) dateInput.addEventListener('change', e => { this._startDate = e.target.value; });
+    const stageSelect = this.shadowRoot.querySelector('#start-cycle-stage');
+    if (stageSelect) stageSelect.addEventListener('change', e => { this._startStage = e.target.value; });
+
+    const submitBtn = this.shadowRoot.querySelector('#submit-start-cycle-btn');
+    if (submitBtn) submitBtn.addEventListener('click', () => this._doStartCycle());
+  }
+
+  async _doStartCycle() {
+    if (!this._hass) return;
+    this._startError = null;
+    this._startSaving = true;
+    this._render();
+    try {
+      await this._hass.callWS({
+        type: 'helix_cultivate/start_cycle',
+        growth_mode: this._startGrowthMode,
+        start_date: this._startDate,
+        starting_stage: this._startStage,
+      });
+      // Config-entry reload follows (same as other explicit lifecycle
+      // actions) — the next coordinator data push reflects
+      // cycle_state === 'active' with the new stage/date, so no manual
+      // state patch is needed here.
+    } catch (e) {
+      console.error('Helix Cultivate: start_cycle failed', e);
+      this._startError = e?.message || 'Could not start cycle — see console';
+    } finally {
+      this._startSaving = false;
+      this._render();
+    }
+  }
+
   connectedCallback() { this._render(); }
 }
 customElements.define('helix-tab-cycle', HelixTabCycle);
@@ -2206,6 +2522,13 @@ class HelixTabGrowspace extends HTMLElement {
         ${_hwLayerToggleRow('mid_canopy_fan_enabled', 'Mid Canopy Fan', d.mid_canopy_fan_enabled !== false)}
         ${_hwLayerToggleRow('lower_canopy_sensor_enabled', 'Lower Canopy Sensor', d.lower_canopy_sensor_enabled !== false)}
         ${_hwLayerToggleRow('lower_canopy_fan_enabled', 'Lower Canopy Fan', d.lower_canopy_fan_enabled !== false)}
+        ${_hwLayerToggleRow('wind_sweep_enabled', '🌬 Canopy Wind Sweep', d.wind_sweep_enabled === true)}
+        <div style="font-size:.7rem;color:var(--hx-text2);margin:-6px 0 4px">
+          When enabled, rotates a boosted speed among the currently-enabled circulation tiers
+          instead of running them all at the same static speed — mimics natural gusting wind
+          to prevent microclimates and add stem-strengthening stress. Growing stages only;
+          never active during Drying.
+        </div>
         <div class="sec">Grow Light Fixture Type</div>
         <select id="hw-light-type-select" style="width:100%;padding:8px;border-radius:8px;
           border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
@@ -2215,6 +2538,17 @@ class HelixTabGrowspace extends HTMLElement {
         </select>
         <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
           Drives the default leaf-temperature offset and HID/ballast hot-restrike lockout.
+        </div>
+        <div class="sec">High-Temperature Light Dimming</div>
+        <div class="slider-row">
+          <span class="slider-lbl">Soft Dim Threshold</span>
+          <input type="range" id="hw-light-high-temp-dim-slider" min="20" max="31" step="0.5"
+            value="${d.light_high_temp_dim_c ?? 29.0}"/>
+          <span class="slider-val" id="hw-light-high-temp-dim-val">${fn(d.light_high_temp_dim_c ?? 29.0, 1)}°C</span>
+        </div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
+          At this canopy temperature, light intensity is throttled to 50% — a soft step
+          strictly below the hard 32°C thermal-runaway cutoff (which forces the light fully off).
         </div>
         ${_renderSupplementalLightingSection(d)}`;
 
@@ -2238,6 +2572,8 @@ class HelixTabGrowspace extends HTMLElement {
         if (onTimeEl) fields.supplemental_on_time = onTimeEl.value;
         const durationEl = this.shadowRoot.querySelector('#hw-supplemental-duration');
         if (durationEl) fields.supplemental_duration_hours = parseFloat(durationEl.value);
+        const dimSl = this.shadowRoot.querySelector('#hw-light-high-temp-dim-slider');
+        if (dimSl) fields.light_high_temp_dim_c = parseFloat(dimSl.value);
         return fields;
       });
       // Light type is a live select entity — persists immediately on
@@ -2248,6 +2584,13 @@ class HelixTabGrowspace extends HTMLElement {
           this._svc('select', 'select_option', {
             entity_id: 'select.helix_cultivate_light_type', option: e.target.value,
           });
+        });
+      }
+      const dimSl = this.shadowRoot.querySelector('#hw-light-high-temp-dim-slider');
+      const dimVal = this.shadowRoot.querySelector('#hw-light-high-temp-dim-val');
+      if (dimSl) {
+        dimSl.addEventListener('input', e => {
+          if (dimVal) dimVal.textContent = `${fn(parseFloat(e.target.value), 1)}°C`;
         });
       }
       _bindSupplementalLightingSection(this.shadowRoot);
@@ -2613,9 +2956,38 @@ class HelixTabConditioning extends HTMLElement {
         // and any open entity-picker dropdown aren't torn down.
         return;
       }
+      const preheatSectionHtml = `
+        <div class="sec">Predictive Pre-Heating</div>
+        <div class="slider-row">
+          <span class="slider-lbl">Lead Time</span>
+          <input type="range" id="hw-preheat-lead-slider" min="0" max="60" step="5"
+            value="${d.preheat_lead_min ?? 15}"/>
+          <span class="slider-val" id="hw-preheat-lead-val">${d.preheat_lead_min ?? 15} min</span>
+        </div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
+          This many minutes before the scheduled lights-off transition, the lung-room heater
+          is proactively nudged on ahead of the temperature drop that follows — rather than
+          reacting after it's already started falling. Set to 0 to disable.
+        </div>`;
+
       this.shadowRoot.innerHTML = `<style>${BASE_CSS}:host{display:block;}</style>`
-        + _renderHwPicker(ZONE1_HW_KEYS, d.hw_map || {}, this._hass, d.zone1_name || 'Conditioning Room');
-      _bindHwPicker(this.shadowRoot, this, ZONE1_HW_KEYS);
+        + _renderHwPicker(
+            ZONE1_HW_KEYS, d.hw_map || {}, this._hass,
+            d.zone1_name || 'Conditioning Room', preheatSectionHtml
+          );
+      _bindHwPicker(this.shadowRoot, this, ZONE1_HW_KEYS, () => {
+        const fields = {};
+        const preheatSl = this.shadowRoot.querySelector('#hw-preheat-lead-slider');
+        if (preheatSl) fields.preheat_lead_min = parseFloat(preheatSl.value);
+        return fields;
+      });
+      const preheatSl = this.shadowRoot.querySelector('#hw-preheat-lead-slider');
+      const preheatVal = this.shadowRoot.querySelector('#hw-preheat-lead-val');
+      if (preheatSl) {
+        preheatSl.addEventListener('input', e => {
+          if (preheatVal) preheatVal.textContent = `${e.target.value} min`;
+        });
+      }
       this._hwFormBuilt = true;
       return;
     }
@@ -3151,6 +3523,18 @@ class HelixTabSettings extends HTMLElement {
           <input type="range" id="dropout-min" min="5" max="120" step="1" value="${d.sensor_dropout_min ?? 30}"/>
           <span class="slider-val" id="dropout-min-val">${d.sensor_dropout_min ?? 30} min</span>
         </div>
+        <div class="sec">Dew Point / Condensation Override</div>
+        <div class="slider-row">
+          <span class="slider-lbl">Margin</span>
+          <input type="range" id="dew-point-margin-slider" min="0.5" max="5" step="0.1" value="${d.dew_point_margin_c ?? 2.0}"/>
+          <span class="slider-val" id="dew-point-margin-val">${fn(d.dew_point_margin_c ?? 2.0, 1)}°C</span>
+        </div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:2px">
+          If leaf temperature comes within this margin of the calculated dew point for a
+          sustained period, exhaust is forced to 100% and lung-room heating is forced on —
+          the same "always wins" hard override as thermal runaway, targeting the actual
+          mechanism behind botrytis/powdery mildew risk.
+        </div>
       </div>`;
   }
 
@@ -3619,6 +4003,30 @@ class HelixTabSettings extends HTMLElement {
       dropSl.addEventListener('input', e => { if (dropVl) dropVl.textContent = `${e.target.value} min`; });
     }
 
+    // Dew point margin (Part 3) — unlike its sibling Safety sliders above
+    // (currently display-only, a pre-existing gap out of scope here), this
+    // one actually persists on change.
+    const dewSl = this.shadowRoot.querySelector('#dew-point-margin-slider');
+    const dewVl = this.shadowRoot.querySelector('#dew-point-margin-val');
+    if (dewSl) {
+      dewSl.addEventListener('input', e => {
+        if (dewVl) dewVl.textContent = `${fn(parseFloat(e.target.value), 1)}°C`;
+      });
+      dewSl.addEventListener('change', async e => {
+        const entryId = (this._data || {}).entry_id;
+        if (!this._hass || !entryId) return;
+        try {
+          await this._hass.callWS({
+            type: 'helix_cultivate/update_settings_fields',
+            entry_id: entryId,
+            fields: { dew_point_margin_c: parseFloat(e.target.value) },
+          });
+        } catch (err) {
+          console.error('Helix Cultivate: dew_point_margin_c save failed', err);
+        }
+      });
+    }
+
     // Energy & ROI — gear icon and Reset button (only present when
     // this._section === 'energy'; querySelector is a safe no-op otherwise).
     _bindGearBtn(this.shadowRoot, this);
@@ -3956,6 +4364,20 @@ class HelixPanel extends HTMLElement {
       previous_cycle_cost_usd:   this._previousCycleEnergy?.cycle_cost_usd ?? null,
       previous_cycle_archived_at: this._previousCycleEnergy?.archived_at ?? null,
 
+      // Cycle lifecycle (Part 1) — "not_started" or "active", drives the
+      // dashboard's "No Active Cycle" empty state.
+      cycle_state: this._attr('grow_stage', 'sensor', 'cycle_state') ?? 'active',
+
+      // Sensor Dropout badge detail (Part 2.1)
+      sensor_dropout_entities: this._attr('upper_canopy_temp', 'sensor', 'sensor_dropout_entities') ?? [],
+
+      // v1.2.8 feature settings, now exposed for editing (Part 3)
+      light_high_temp_dim_c: this._attr('exhaust_speed', 'sensor', 'light_high_temp_dim_c') ?? 29.0,
+      wind_sweep_enabled:    this._attr('exhaust_speed', 'sensor', 'wind_sweep_enabled')    ?? false,
+      dew_point_margin_c:    this._attr('exhaust_speed', 'sensor', 'dew_point_margin_c')    ?? 2.0,
+      preheat_lead_min:      this._attr('exhaust_speed', 'sensor', 'preheat_lead_min')      ?? 15,
+      stage_warning_lead_days: this._attr('grow_stage', 'sensor', 'stage_warning_lead_days') ?? 3,
+
       // Zone hardware mapping (gear-icon picker support)
       entry_id: this._entryId,
       hw_map:   this._hwMap,
@@ -4065,6 +4487,14 @@ class HelixPanel extends HTMLElement {
     // re-fetch here rather than leaving it stale until a hard page refresh.
     this.shadowRoot.addEventListener('hw-map-saved', () => {
       this._fetchConfigSummary();
+    });
+
+    // Cross-tab navigation for the Telemetry tab's "No Active Cycle" empty
+    // state — its Start New Cycle button lives on the Plant Cycle tab, so
+    // it bubbles this request up rather than duplicating the form here.
+    this.shadowRoot.addEventListener('request-tab-change', (e) => {
+      this._activeTab = e.detail.tab;
+      this._update();
     });
   }
 

@@ -43,6 +43,8 @@ from .const import (
     # Outdoor conditions
     CONF_OUTDOOR_WEATHER_ENTITY,
     CONF_LOCAL_WEATHER_STATION_ENTITY,
+    # Sensor dropout Repairs detail (Part 2.1)
+    CONF_PRIMARY_TEMP_SENSOR,
     # Lighting & DLI engine (Phase 1.5)
     CONF_ZONE2_GROW_LIGHT,
     CONF_ZONE2_LIGHT_TYPE,
@@ -109,6 +111,14 @@ from .const import (
     CONF_TARIFF_SHOULDER_START, DEFAULT_TARIFF_SHOULDER_START,
     CONF_TARIFF_SHOULDER_END, DEFAULT_TARIFF_SHOULDER_END,
     CONF_HARVEST_VALUE_PER_OZ, DEFAULT_HARVEST_VALUE,
+    # Cycle lifecycle (Part 1)
+    CONF_CYCLE_STATE,
+    # v1.2.8 feature settings, now exposed for editing (Part 3)
+    CONF_LIGHT_HIGH_TEMP_DIM_C, DEFAULT_LIGHT_HIGH_TEMP_DIM_C,
+    CONF_WIND_SWEEP_ENABLED, DEFAULT_WIND_SWEEP_ENABLED,
+    CONF_DEW_POINT_MARGIN_C, DEFAULT_DEW_POINT_MARGIN_C,
+    CONF_PREHEAT_LEAD_MIN, DEFAULT_PREHEAT_LEAD_MIN,
+    CONF_STAGE_WARNING_LEAD_DAYS, DEFAULT_STAGE_WARNING_LEAD_DAYS,
 )
 from .coordinator import HelixCoordinator
 
@@ -374,6 +384,16 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
 
         if key in ("upper_canopy_temp", "upper_canopy_rh"):
             attrs["sensor_dropout"] = climate.get("sensor_dropout", False)
+            # Part 2.1 — the specific currently-flagged sensor(s), sourced
+            # from the same state backing the "primary_sensor_dropout"
+            # Repairs issue, so the dashboard badge's popover shows real
+            # detail instead of just a boolean.
+            attrs["sensor_dropout_entities"] = (
+                [self.coordinator._get(CONF_PRIMARY_TEMP_SENSOR)]
+                if climate.get("sensor_dropout", False)
+                and self.coordinator._get(CONF_PRIMARY_TEMP_SENSOR)
+                else []
+            )
             attrs["primary_sensor_ok"] = climate.get("primary_sensor_ok", True)
 
         if key == "exhaust_speed":
@@ -528,6 +548,21 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             attrs["harvest_value_per_oz"] = self.coordinator._get(
                 CONF_HARVEST_VALUE_PER_OZ, DEFAULT_HARVEST_VALUE
             )
+            # v1.2.8 feature settings, now exposed for editing (Part 3) —
+            # each pre-fills its gear-icon/settings control with the
+            # already-coded default until a grower changes it.
+            attrs["light_high_temp_dim_c"] = self.coordinator._get(
+                CONF_LIGHT_HIGH_TEMP_DIM_C, DEFAULT_LIGHT_HIGH_TEMP_DIM_C
+            )
+            attrs["wind_sweep_enabled"] = self.coordinator._get(
+                CONF_WIND_SWEEP_ENABLED, DEFAULT_WIND_SWEEP_ENABLED
+            )
+            attrs["dew_point_margin_c"] = self.coordinator._get(
+                CONF_DEW_POINT_MARGIN_C, DEFAULT_DEW_POINT_MARGIN_C
+            )
+            attrs["preheat_lead_min"] = self.coordinator._get(
+                CONF_PREHEAT_LEAD_MIN, DEFAULT_PREHEAT_LEAD_MIN
+            )
 
         if key == "cycle_cost":
             attrs["cycle_kwh"] = (self.coordinator.data or {}).get(NS_ENERGY, {}).get("cycle_kwh", 0.0)
@@ -538,6 +573,12 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             attrs["stage_duration"] = self.coordinator.stage_manager.stage_duration
             attrs["stage_durations_planned"] = (
                 self.coordinator.stage_manager.planned_stage_durations()
+            )
+            # Cycle lifecycle (Part 1) — "not_started" or "active". Drives
+            # the dashboard's "No Active Cycle" empty state.
+            attrs["cycle_state"] = self.coordinator.stage_manager.cycle_state
+            attrs["stage_warning_lead_days"] = self.coordinator._get(
+                CONF_STAGE_WARNING_LEAD_DAYS, DEFAULT_STAGE_WARNING_LEAD_DAYS
             )
 
         return attrs
