@@ -73,6 +73,7 @@ def fake_coord(monkeypatch):
     # `self.foo()`, it runs the actual logic against this same fake, not a
     # meaningless auto-mock.
     coord._light_schedule_params = lambda: HelixCoordinator._light_schedule_params(coord)
+    coord._light_schedule_params_for_stage = lambda stage: HelixCoordinator._light_schedule_params_for_stage(coord, stage)
     coord._effective_ramp_minutes = lambda light_id: HelixCoordinator._effective_ramp_minutes(coord, light_id)
     coord._estimate_ppfd = lambda: HelixCoordinator._estimate_ppfd(coord)
     coord._lights_on = lambda: HelixCoordinator._lights_on(coord)

@@ -70,6 +70,7 @@ def fake_coord(monkeypatch):
     coord.hass.states.get = MagicMock(return_value=None)
 
     coord._light_schedule_params = lambda: HelixCoordinator._light_schedule_params(coord)
+    coord._light_schedule_params_for_stage = lambda stage: HelixCoordinator._light_schedule_params_for_stage(coord, stage)
     coord._light_schedule_multiplier = lambda light_id: HelixCoordinator._light_schedule_multiplier(coord, light_id)
     coord._effective_ramp_minutes = lambda light_id: HelixCoordinator._effective_ramp_minutes(coord, light_id)
     coord._supplemental_targeted_pct = lambda: HelixCoordinator._supplemental_targeted_pct(coord)

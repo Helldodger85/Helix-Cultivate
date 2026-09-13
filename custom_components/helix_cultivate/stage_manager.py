@@ -234,8 +234,6 @@ class StageManager:
                     base["temp_c"] = float(stage_data["temp_c"])
                 if "rh_pct" in stage_data:
                     base["rh_pct"] = float(stage_data["rh_pct"])
-                if "photoperiod_h" in stage_data:
-                    base["photoperiod_h"] = float(stage_data["photoperiod_h"])
                 for k, v in stage_data.items():
                     if k in STAGE_DAYNIGHT_DEFAULTS.get(stage, {}):
                         base[k] = v
@@ -247,13 +245,27 @@ class StageManager:
         return base
 
     def _duration(self, stage: str) -> int:
-        """Return the target duration (days) for a stage."""
+        """Return the target duration (days) for a stage.
+
+        Layered resolution matches _profile() above: recipe YAML
+        duration_days (if a recipe is loaded) is considered first, then a
+        user-persisted stage_targets_{stage}.duration_days (Part 3,
+        v1.5.0) takes final precedence — the same "later layers win" order
+        _profile() already uses for every other per-stage field. This is
+        the real value PROG_TIMEFRAME auto-advance and the stage-
+        progression heads-up warning both read — editing and saving it
+        genuinely changes when auto-advance fires.
+        """
+        duration = STAGE_DEFAULT_DURATIONS.get(stage, 14)
         if self._recipe:
             stages_data = self._recipe.get("stages", {})
             stage_data = stages_data.get(stage, {})
             if "duration_days" in stage_data:
-                return int(stage_data["duration_days"])
-        return STAGE_DEFAULT_DURATIONS.get(stage, 14)
+                duration = int(stage_data["duration_days"])
+        user_targets = self._config.get(f"stage_targets_{stage}", {})
+        if isinstance(user_targets, dict) and "duration_days" in user_targets:
+            duration = int(user_targets["duration_days"])
+        return duration
 
     # ── Elapsed days ──────────────────────────────────────────────────────────
 
@@ -304,8 +316,7 @@ class StageManager:
         self._config["current_stage"] = self._current_stage
         # Clear manual override flags — fresh stage = fresh glide
         if self._coord_ref is not None:
-            self._coord_ref.temp_setpoint_manual_override = False
-            self._coord_ref.vpd_target_manual_override = False
+            self._coord_ref.clear_stage_overrides()
             self._coord_ref.rh_setpoint_manual_override = False
         self._fire_stage_changed_event(previous_stage, next_stage)
 
@@ -324,8 +335,7 @@ class StageManager:
         self._config["current_stage"] = stage
         # Clear manual override flags — fresh stage = fresh glide
         if self._coord_ref is not None:
-            self._coord_ref.temp_setpoint_manual_override = False
-            self._coord_ref.vpd_target_manual_override = False
+            self._coord_ref.clear_stage_overrides()
             self._coord_ref.rh_setpoint_manual_override = False
         if previous_stage != stage:
             self._fire_stage_changed_event(previous_stage, stage)
@@ -398,10 +408,6 @@ class StageManager:
         if interp is not None:
             return interp
         return self._profile(self._current_stage).get("rh_pct")
-
-    def current_photoperiod_h(self) -> float:
-        """Return the target photoperiod [hours] for the current stage."""
-        return self._profile(self._current_stage).get("photoperiod_h", 12.0)
 
     # ── Drying zone lock (Phase 8) ─────────────────────────────────────────────
 
@@ -551,8 +557,7 @@ class StageManager:
             stage, start_date.isoformat(),
         )
         if self._coord_ref is not None:
-            self._coord_ref.temp_setpoint_manual_override = False
-            self._coord_ref.vpd_target_manual_override = False
+            self._coord_ref.clear_stage_overrides()
             self._coord_ref.rh_setpoint_manual_override = False
         if previous_stage != stage:
             self._fire_stage_changed_event(previous_stage, stage)

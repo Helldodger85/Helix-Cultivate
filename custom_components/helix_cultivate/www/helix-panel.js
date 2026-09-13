@@ -1086,6 +1086,47 @@ const TARIFF_MODE_OPTIONS_JS = Object.keys(TARIFF_MODE_LABELS_JS);
 // the actual authority on stage-group mapping.
 const PHOTOPERIOD_FLOWER_STAGES_JS = new Set(['stretch', 'peak_flower', 'ripening']);
 
+// v1.5.0 Part 2.2: the single formula for "what lighting-hours value does
+// Growth Mode actually compute for this stage" — mirrors
+// HelixCoordinator.computed_photoperiod_hours()/_light_schedule_params_for_stage()
+// exactly (same branches, same stage-group mapping). Every stage's Profile
+// Card reads its own value through this, never an independent per-stage
+// number, so it can never diverge from what's actually being scheduled.
+function _computedPhotoperiodHours(d, stage) {
+  if (stage === 'drying') return 0.0;
+  const mode = d.growth_mode === 'autoflower' ? 'autoflower' : 'photoperiod';
+  if (mode === 'autoflower') return d.af_light_hours ?? 18.0;
+  return PHOTOPERIOD_FLOWER_STAGES_JS.has(stage) ? (d.pp_flower_hours ?? 12.0) : (d.pp_veg_hours ?? 18.0);
+}
+
+// Mirrors const.py STAGE_DEFAULT_DURATIONS — the day-count fallback when no
+// user-persisted stage_targets_{stage}.duration_days override exists yet.
+const STAGE_DEFAULT_DURATIONS_JS = {
+  germination: 4, seedling: 10, early_veg: 14, late_veg: 14,
+  stretch: 14, peak_flower: 28, ripening: 14, drying: 10,
+};
+
+// v1.5.0 Part 3.2: mode-aware recommended-range guidance — genuinely
+// reasonable horticultural ranges per stage, scoped only to Autoflower vs.
+// Photoperiod (never strain-specific). Drying is the same regardless of
+// growth mode — it's a post-harvest cure, not a live-plant response.
+const DAY_COUNT_GUIDANCE_JS = {
+  autoflower: {
+    germination: '2–5 days', seedling: '5–10 days', early_veg: '7–14 days',
+    late_veg: '7–14 days', stretch: '5–10 days', peak_flower: '21–35 days',
+    ripening: '5–10 days', drying: '7–14 days',
+  },
+  photoperiod: {
+    germination: '3–7 days', seedling: '7–14 days', early_veg: '7–21 days',
+    late_veg: '7–21 days', stretch: '7–21 days', peak_flower: '21–35 days',
+    ripening: '7–14 days', drying: '7–14 days',
+  },
+};
+function _dayCountGuidance(d, stage) {
+  const mode = d.growth_mode === 'autoflower' ? 'autoflower' : 'photoperiod';
+  return DAY_COUNT_GUIDANCE_JS[mode][stage] || 'Typically 7–14 days';
+}
+
 const RAMP_PRESET_LABELS_JS = {
   gentle: 'Gentle (~30 min)',
   standard: 'Standard (~15 min)',
@@ -1107,14 +1148,14 @@ const STAGE_META = {
 // Mirrors const.py STAGE_DAYNIGHT_DEFAULTS — used as the frontend fallback
 // baseline when no user-persisted stage_targets_{stage} override exists yet.
 const STAGE_DAYNIGHT_DEFAULTS_JS = {
-  germination: { day_temp_c:24.0, night_temp_c:22.0, day_vpd_min:0.35, day_vpd_max:0.50, night_vpd_min:0.30, night_vpd_max:0.45, light_intensity_pct:50, photoperiod_h:20.0, fan_speed_pct:25 },
-  seedling:    { day_temp_c:23.5, night_temp_c:21.0, day_vpd_min:0.50, day_vpd_max:0.70, night_vpd_min:0.40, night_vpd_max:0.60, light_intensity_pct:60, photoperiod_h:20.0, fan_speed_pct:30 },
-  early_veg:   { day_temp_c:24.0, night_temp_c:20.0, day_vpd_min:0.60, day_vpd_max:0.90, night_vpd_min:0.45, night_vpd_max:0.65, light_intensity_pct:70, photoperiod_h:18.0, fan_speed_pct:35 },
-  late_veg:    { day_temp_c:24.0, night_temp_c:20.0, day_vpd_min:0.80, day_vpd_max:1.05, night_vpd_min:0.60, night_vpd_max:0.80, light_intensity_pct:80, photoperiod_h:18.0, fan_speed_pct:40 },
-  stretch:     { day_temp_c:25.0, night_temp_c:21.0, day_vpd_min:0.90, day_vpd_max:1.15, night_vpd_min:0.70, night_vpd_max:0.90, light_intensity_pct:90, photoperiod_h:12.0, fan_speed_pct:45 },
-  peak_flower: { day_temp_c:26.0, night_temp_c:22.0, day_vpd_min:1.10, day_vpd_max:1.40, night_vpd_min:0.85, night_vpd_max:1.10, light_intensity_pct:100, photoperiod_h:12.0, fan_speed_pct:50 },
-  ripening:    { day_temp_c:24.0, night_temp_c:18.0, day_vpd_min:1.30, day_vpd_max:1.55, night_vpd_min:1.00, night_vpd_max:1.25, light_intensity_pct:85, photoperiod_h:12.0, fan_speed_pct:45 },
-  drying:      { day_temp_c:15.5, night_temp_c:15.5, day_vpd_min:1.05, day_vpd_max:1.15, night_vpd_min:1.05, night_vpd_max:1.15, light_intensity_pct:0, photoperiod_h:0.0, fan_speed_pct:40 },
+  germination: { day_temp_c:24.0, night_temp_c:22.0, day_vpd_min:0.35, day_vpd_max:0.50, night_vpd_min:0.30, night_vpd_max:0.45, light_intensity_pct:50, fan_speed_pct:25 },
+  seedling:    { day_temp_c:23.5, night_temp_c:21.0, day_vpd_min:0.50, day_vpd_max:0.70, night_vpd_min:0.40, night_vpd_max:0.60, light_intensity_pct:60, fan_speed_pct:30 },
+  early_veg:   { day_temp_c:24.0, night_temp_c:20.0, day_vpd_min:0.60, day_vpd_max:0.90, night_vpd_min:0.45, night_vpd_max:0.65, light_intensity_pct:70, fan_speed_pct:35 },
+  late_veg:    { day_temp_c:24.0, night_temp_c:20.0, day_vpd_min:0.80, day_vpd_max:1.05, night_vpd_min:0.60, night_vpd_max:0.80, light_intensity_pct:80, fan_speed_pct:40 },
+  stretch:     { day_temp_c:25.0, night_temp_c:21.0, day_vpd_min:0.90, day_vpd_max:1.15, night_vpd_min:0.70, night_vpd_max:0.90, light_intensity_pct:90, fan_speed_pct:45 },
+  peak_flower: { day_temp_c:26.0, night_temp_c:22.0, day_vpd_min:1.10, day_vpd_max:1.40, night_vpd_min:0.85, night_vpd_max:1.10, light_intensity_pct:100, fan_speed_pct:50 },
+  ripening:    { day_temp_c:24.0, night_temp_c:18.0, day_vpd_min:1.30, day_vpd_max:1.55, night_vpd_min:1.00, night_vpd_max:1.25, light_intensity_pct:85, fan_speed_pct:45 },
+  drying:      { day_temp_c:15.5, night_temp_c:15.5, day_vpd_min:1.05, day_vpd_max:1.15, night_vpd_min:1.05, night_vpd_max:1.15, light_intensity_pct:0, fan_speed_pct:40 },
 };
 
 function _svpKpa(tC) { return 0.6108 * Math.exp(17.27 * tC / (tC + 237.3)); }
@@ -1258,10 +1299,42 @@ class HelixTabCycle extends HTMLElement {
     }
   }
 
+  // Part 1.1 (v1.5.0): immediate write to the single shared growth_mode
+  // config value — the same key Primary Grow Space's own toggle (batched
+  // into its "Save Lighting Schedule" flow) ultimately writes to, so
+  // there is never a possibility of the two disagreeing. Optimistically
+  // patches local data so this instance re-renders immediately rather
+  // than waiting for the next coordinator poll.
+  async _setGrowthMode(mode) {
+    const entryId = (this._data || {}).entry_id;
+    if (!this._hass || !entryId) return;
+    try {
+      await this._hass.callWS({
+        type: 'helix_cultivate/update_settings_fields',
+        entry_id: entryId,
+        fields: { growth_mode: mode },
+      });
+      this._data = { ...(this._data || {}), growth_mode: mode };
+      this._render();
+    } catch (e) {
+      console.error('Helix Cultivate: growth mode update failed', e);
+    }
+  }
+
   _stageValue(stage, key) {
     const persisted = (this._data || {})[`stage_targets_${stage}`];
     if (persisted && persisted[key] !== undefined) return persisted[key];
     return (STAGE_DAYNIGHT_DEFAULTS_JS[stage] || STAGE_DAYNIGHT_DEFAULTS_JS.germination)[key];
+  }
+
+  // v1.5.0 Part 3.1: duration_days lives in its own default table
+  // (STAGE_DEFAULT_DURATIONS_JS, mirroring const.py's STAGE_DEFAULT_
+  // DURATIONS) rather than STAGE_DAYNIGHT_DEFAULTS_JS, matching the same
+  // separation the backend's StageManager._duration() keeps from _profile().
+  _stageDuration(stage) {
+    const persisted = (this._data || {})[`stage_targets_${stage}`];
+    if (persisted && persisted.duration_days !== undefined) return persisted.duration_days;
+    return STAGE_DEFAULT_DURATIONS_JS[stage] ?? 14;
   }
 
   // Reads the currently-displayed slider values straight from the DOM and
@@ -1279,6 +1352,8 @@ class HelixTabCycle extends HTMLElement {
       light_intensity_pct: parseFloat(q('#light-slider').value),
       fan_speed_pct: parseFloat(q('#fan-slider').value),
     };
+    const durationEl = q('#stage-duration-slider');
+    if (durationEl) targets.duration_days = parseInt(durationEl.value, 10);
 
     const entryId = (this._data || {}).entry_id;
     const statusEl = this.shadowRoot.querySelector('#stage-save-status');
@@ -1565,7 +1640,13 @@ class HelixTabCycle extends HTMLElement {
     const vpdMax = this._stageValue(stage, vpdMaxKey);
     const lightPct = this._stageValue(stage, 'light_intensity_pct');
     const fanPct = this._stageValue(stage, 'fan_speed_pct');
-    const photoperiod = this._stageValue(stage, 'photoperiod_h');
+    // v1.5.0 Part 2.2: no longer an independent per-stage value — always a
+    // live, read-only reflection of what Growth Mode actually computes.
+    const photoperiod = _computedPhotoperiodHours(d, stage);
+    // v1.5.0 Part 3: genuinely editable, wired to real auto-advance timing
+    // (StageManager._duration()) — not a disconnected display number.
+    const stageDuration = this._stageDuration(stage);
+    const durationGuidance = _dayCountGuidance(d, stage);
 
     const rhLo = _rhGuideForVpd(tempAnchor, vpdMax);
     const rhHi = _rhGuideForVpd(tempAnchor, vpdMin);
@@ -1573,8 +1654,46 @@ class HelixTabCycle extends HTMLElement {
       ? `Guide: ~${fn(rhLo,0)}–${fn(rhHi,0)}% RH at ${fn(tempAnchor,1)}°C`
       : '—';
 
+    // Part 1.2 (v1.5.0): reuses CONF_ZONE2_OCCUPIED — the same flag the
+    // Environmental Learning gating work established — rather than new
+    // tracking. Applies identically to Primary Grow Space's own copy of
+    // this toggle (helix-tab-growspace).
+    const zone2OccupiedCycle = d.zone2_occupied === true;
+    const growthModeCycle = d.growth_mode === 'autoflower' ? 'autoflower' : 'photoperiod';
+    const growthModeCardHtml = `
+      <div class="card">
+        <div class="card-title">🌗 Growth Mode</div>
+        <div class="hx-period-toggle" style="display:flex;gap:6px">
+          <button class="cycle-growth-mode-btn ${growthModeCycle === 'autoflower' ? 'active' : ''}" data-mode="autoflower"
+            ${zone2OccupiedCycle ? 'disabled' : ''}
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);
+            cursor:${zone2OccupiedCycle ? 'not-allowed' : 'pointer'};opacity:${zone2OccupiedCycle ? '0.6' : '1'};
+            background:${growthModeCycle === 'autoflower' ? 'var(--hx-blue,#209cee)' : 'none'};
+            color:${growthModeCycle === 'autoflower' ? '#fff' : 'var(--hx-text)'};font-weight:600">🌻 Autoflower</button>
+          <button class="cycle-growth-mode-btn ${growthModeCycle === 'photoperiod' ? 'active' : ''}" data-mode="photoperiod"
+            ${zone2OccupiedCycle ? 'disabled' : ''}
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);
+            cursor:${zone2OccupiedCycle ? 'not-allowed' : 'pointer'};opacity:${zone2OccupiedCycle ? '0.6' : '1'};
+            background:${growthModeCycle === 'photoperiod' ? 'var(--hx-blue,#209cee)' : 'none'};
+            color:${growthModeCycle === 'photoperiod' ? '#fff' : 'var(--hx-text)'};font-weight:600">📅 Photoperiod</button>
+        </div>
+        ${zone2OccupiedCycle ? `
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:6px">
+          🔒 Locked while a cycle occupies Primary Grow Space — changing Growth
+          Mode mid-cycle would abruptly change the active lighting schedule.
+          Editable again once this space is empty.
+        </div>` : ''}
+      </div>`;
+
     this.shadowRoot.innerHTML = `
       <style>${BASE_CSS}:host{display:block;}</style>
+      <!-- Part 6 (v1.5.0): explanatory copy, verbatim -->
+      <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px;line-height:1.5">
+        This is where you set up each growth stage's targets — temperature, VPD, lighting, and
+        how many days it should typically run. Use the recommended defaults as-is, or adjust
+        them to match your own strain and setup. Changes here are permanent and apply
+        immediately, even to the stage you're currently in.
+      </div>
       <!-- Stage timeline -->
       <div class="card">
         <div class="card-title">🌱 Grow Stage Timeline</div>
@@ -1598,6 +1717,10 @@ class HelixTabCycle extends HTMLElement {
       ${harvestSectionHtml}
       ${dryingHandoffHtml}
       ${dryingHarvestCompleteHtml}
+      <!-- Part 1.1 (v1.5.0): Growth Mode surfaced directly above the
+           Profile Card — the exact same config value as Primary Grow
+           Space's own toggle, never a separate per-stage setting. -->
+      ${growthModeCardHtml}
       <!-- Day/Night stage profile editor -->
       ${dryingHiddenNotice ? `
       <div class="card">
@@ -1661,8 +1784,18 @@ class HelixTabCycle extends HTMLElement {
         </div>
         <div class="metric-row" style="margin-top:6px">
           <span class="metric-label">Photoperiod</span>
-          <span class="metric-val">${fn(photoperiod,1)} h</span>
+          <span class="metric-val">${fn(photoperiod,1)} h <span style="font-size:.68rem;color:var(--hx-text2)">(from Growth Mode)</span></span>
         </div>
+
+        <div class="sec">Stage Duration</div>
+        <div class="slider-row">
+          <input type="range" id="stage-duration-slider" min="1" max="70" step="1" value="${stageDuration}"/>
+          <span class="slider-val" id="stage-duration-val">${stageDuration} day${stageDuration === 1 ? '' : 's'}</span>
+        </div>
+        <div style="font-size:.72rem;color:var(--hx-text2);margin:2px 0 10px" id="duration-guide-text">
+          Typically ${durationGuidance} for ${growthModeCycle === 'autoflower' ? 'Autoflower' : 'Photoperiod'}
+        </div>
+
         <div style="display:flex;align-items:center;gap:10px;margin-top:12px">
           <button id="save-stage-targets-btn" style="padding:9px 16px;border-radius:8px;border:none;
             background:var(--hx-blue,#209cee);color:#fff;font-weight:600;cursor:pointer">💾 Save Stage Targets</button>
@@ -1858,40 +1991,47 @@ class HelixTabCycle extends HTMLElement {
       refreshRhGuide();
     });
 
-    // Temp anchor slider — the anchor IS the live point target for the
-    // active stage, so (unlike the VPD range endpoints) pushing it straight
-    // to number.helix_cultivate_temp_setpoint for a live preview is valid.
+    // Temp anchor slider — v1.5.0: no longer pushes a "live preview" to
+    // number.helix_cultivate_temp_setpoint on change. That entity now
+    // feeds the day/night-keyed Temporary Override system (Part 4), so a
+    // preview push here would leave a stale override in place that could
+    // shadow this exact slider's own "Save Stage Targets" click (Part 5
+    // requires the permanent save to take effect immediately, unshadowed).
     const tempSl = this.shadowRoot.querySelector('#temp-anchor-slider');
     const tempVal = this.shadowRoot.querySelector('#temp-anchor-val');
     tempSl.addEventListener('input', e => {
       tempVal.textContent = fT(parseFloat(e.target.value));
       refreshRhGuide();
     });
-    tempSl.addEventListener('change', e => {
-      if (isActiveStage) {
-        this._callService('number', 'set_value', {
-          entity_id: 'number.helix_cultivate_temp_setpoint', value: parseFloat(e.target.value)
-        });
-      }
-    });
 
-    // Light slider — direct point value, live-preview push is valid for the
-    // active stage exactly as with the temp anchor above.
+    // Light slider — same reasoning as the temp anchor above.
     const lightSl = this.shadowRoot.querySelector('#light-slider');
     const lightVal = this.shadowRoot.querySelector('#light-val');
     lightSl.addEventListener('input', e => { lightVal.textContent = fPct(parseFloat(e.target.value)); });
-    lightSl.addEventListener('change', e => {
-      if (isActiveStage) {
-        this._callService('number', 'set_value', {
-          entity_id: 'number.helix_cultivate_light_intensity', value: parseFloat(e.target.value)
-        });
-      }
-    });
 
     // Fan speed slider
     const fanSl = this.shadowRoot.querySelector('#fan-slider');
     const fanVal = this.shadowRoot.querySelector('#fan-val');
     fanSl.addEventListener('input', e => { fanVal.textContent = fPct(parseFloat(e.target.value)); });
+
+    // Stage duration slider (Part 3.1)
+    const durationSl = this.shadowRoot.querySelector('#stage-duration-slider');
+    const durationVal = this.shadowRoot.querySelector('#stage-duration-val');
+    if (durationSl) {
+      durationSl.addEventListener('input', e => {
+        const v = parseInt(e.target.value, 10);
+        if (durationVal) durationVal.textContent = `${v} day${v === 1 ? '' : 's'}`;
+      });
+    }
+
+    // Growth Mode toggle (Part 1.1) — immediate write, same config value
+    // as Primary Grow Space's own copy of this toggle.
+    this.shadowRoot.querySelectorAll('.cycle-growth-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.disabled) return;
+        this._setGrowthMode(btn.dataset.mode);
+      });
+    });
 
     // Explicit Save — reads every slider above straight from the DOM.
     const saveStageBtn = this.shadowRoot.querySelector('#save-stage-targets-btn');
@@ -2769,6 +2909,12 @@ class HelixTabGrowspace extends HTMLElement {
     // an explicit Save commits them or fresh coordinator data arrives.
     this._growthModeDraft = null;
     this._rampPresetDraft = null;
+    // Temporary Override section (v1.5.0 Part 4) — which context the
+    // sliders are currently showing/will adjust; defaults to whichever
+    // phase is actually active right now on first render (see _render()),
+    // then stays as the grower left it across re-renders.
+    this._overrideContext = null;
+    this._overrideStatus = '';
   }
 
   set hass(h) { this._hass = h; }
@@ -2783,6 +2929,59 @@ class HelixTabGrowspace extends HTMLElement {
   // dimensions / stage targets. Only the currently-visible group's fields
   // (Autoflower or Photoperiod) are sent; the backend upserts individual
   // keys, so the hidden group's previously-saved values are left untouched.
+  // Part 4.1/4.2 (v1.5.0): reads all three Temporary Override sliders for
+  // whichever Day/Night context is currently selected and applies them in
+  // one batch — a single "Apply Override" action, deliberately worded
+  // differently from Plant Cycle's "Save Stage Targets" to reinforce that
+  // this is not a permanent change. Each kind is sent as its own WS call
+  // (the backend keeps them as independent slots), but from the user's
+  // perspective this is one button.
+  async _applyOverridesFromDom() {
+    const q = (id) => this.shadowRoot.querySelector(id);
+    const entryId = (this._data || {}).entry_id;
+    const statusEl = q('#override-status');
+    if (!this._hass || !entryId) {
+      this._overrideStatus = '❌ Apply failed — no config entry found';
+      if (statusEl) statusEl.textContent = this._overrideStatus;
+      return;
+    }
+    const context = this._overrideContext;
+    const values = [
+      ['temp', parseFloat(q('#override-temp-sl').value)],
+      ['vpd', parseFloat(q('#override-vpd-sl').value)],
+      ['light', parseFloat(q('#override-light-sl').value)],
+    ];
+    this._overrideStatus = 'Applying…';
+    if (statusEl) statusEl.textContent = this._overrideStatus;
+    const attrKey = { temp: 'temp_c', vpd: 'vpd', light: 'light_pct' };
+    try {
+      for (const [kind, value] of values) {
+        await this._hass.callWS({
+          type: 'helix_cultivate/apply_temporary_override',
+          context, kind, value,
+        });
+        // Optimistic patch so the 🔧 indicator appears immediately rather
+        // than waiting for the next coordinator poll —
+        // apply_temporary_override() already took effect server-side
+        // synchronously by the time this WS call resolves. Only patch the
+        // live effective value too when this context is the one actually
+        // active right now — an override for the OTHER context has no
+        // live effect until that context becomes active.
+        this._data = { ...(this._data || {}), [`override_${context}_${attrKey[kind]}`]: value };
+        if (context === ((this._data || {}).phase === 'night' ? 'night' : 'day')) {
+          if (kind === 'temp') this._data.temp_setpoint = value;
+          if (kind === 'vpd') this._data.vpd_target = value;
+          if (kind === 'light') this._data.light_intensity_pct = value;
+        }
+      }
+      this._overrideStatus = '✅ Applied';
+    } catch (e) {
+      console.error('Helix Cultivate: apply temporary override failed', e);
+      this._overrideStatus = '❌ Apply failed — see console';
+    }
+    this._render();
+  }
+
   async _saveLightingScheduleFromDom() {
     const q = (id) => this.shadowRoot.querySelector(id);
     const growthMode = this._growthModeDraft || (this._data || {}).growth_mode || 'photoperiod';
@@ -2992,6 +3191,16 @@ class HelixTabGrowspace extends HTMLElement {
     const lightP  = d.light_intensity_pct ?? 100;
     const exhaust = d.exhaust_pct ?? null;
 
+    // Temporary Override system (v1.5.0 Part 4) — defaults the toggle to
+    // whichever phase is actually active right now, on first render only;
+    // afterward it stays wherever the grower left it.
+    if (this._overrideContext === null) this._overrideContext = d.phase === 'night' ? 'night' : 'day';
+    const overrideCtx = this._overrideContext;
+    const overrideTempActive = overrideCtx === 'day' ? d.override_day_temp_c : d.override_night_temp_c;
+    const overrideVpdActive = overrideCtx === 'day' ? d.override_day_vpd : d.override_night_vpd;
+    const overrideLightActive = overrideCtx === 'day' ? d.override_day_light_pct : d.override_night_light_pct;
+    const OVERRIDE_BADGE = '<span style="font-size:.68rem;color:var(--hx-amber);white-space:nowrap">🔧 Temporary override — reverts at next stage change</span>';
+
     // Appliance state chips
     const applianceRow = `
       <div class="chip-row" style="margin-bottom:10px">
@@ -3130,6 +3339,18 @@ class HelixTabGrowspace extends HTMLElement {
         <span class="metric-val">${fn(dliToday, 1)} / Target: ${fn(targetDli, 0)} mol (${dliPct}%)</span>
       </div>` : '';
 
+    // Part 1.2 (v1.5.0): Growth Mode is locked read-only the moment
+    // Primary Grow Space is occupied — reusing the same CONF_ZONE2_OCCUPIED
+    // flag the Environmental Learning gating work established, since it
+    // already correctly answers "is a plant currently in this space"
+    // across both topologies. Applies here identically to the Plant Cycle
+    // tab's own copy of this same toggle — one config value, one lock rule.
+    const zone2OccupiedGrowspace = d.zone2_occupied === true;
+    const growthModeLockNoticeHtml = zone2OccupiedGrowspace ? `
+      <div style="font-size:.7rem;color:var(--hx-text2);margin:-4px 0 10px">
+        🔒 Locked while a cycle occupies Primary Grow Space — changing Growth
+        Mode mid-cycle would abruptly change the active lighting schedule.
+      </div>` : '';
     const lightingCardHtml = `
       <div class="card">
         <div class="card-title">💡 Lighting &amp; Growth Schedule</div>
@@ -3140,12 +3361,17 @@ class HelixTabGrowspace extends HTMLElement {
         ${dliIndicatorHtml}
         <div class="hx-period-toggle" style="display:flex;gap:6px;margin-bottom:12px">
           <button class="growth-mode-btn ${growthMode === 'autoflower' ? 'active' : ''}" data-mode="autoflower"
-            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            ${zone2OccupiedGrowspace ? 'disabled' : ''}
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);
+            cursor:${zone2OccupiedGrowspace ? 'not-allowed' : 'pointer'};opacity:${zone2OccupiedGrowspace ? '0.6' : '1'};
             background:${growthMode === 'autoflower' ? 'var(--hx-blue,#209cee)' : 'none'};color:${growthMode === 'autoflower' ? '#fff' : 'var(--hx-text)'};font-weight:600">🌻 Autoflower</button>
           <button class="growth-mode-btn ${growthMode === 'photoperiod' ? 'active' : ''}" data-mode="photoperiod"
-            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            ${zone2OccupiedGrowspace ? 'disabled' : ''}
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);
+            cursor:${zone2OccupiedGrowspace ? 'not-allowed' : 'pointer'};opacity:${zone2OccupiedGrowspace ? '0.6' : '1'};
             background:${growthMode === 'photoperiod' ? 'var(--hx-blue,#209cee)' : 'none'};color:${growthMode === 'photoperiod' ? '#fff' : 'var(--hx-text)'};font-weight:600">🌗 Photoperiod</button>
         </div>
+        ${growthModeLockNoticeHtml}
         ${scheduleFieldsHtml}
         <div class="sec">Sunrise / Sunset Dimming Ramp</div>
         <div class="toggle-row">
@@ -3166,6 +3392,10 @@ class HelixTabGrowspace extends HTMLElement {
 
     this.shadowRoot.innerHTML = `
       <style>${BASE_CSS}:host{display:block;}</style>
+      <!-- Part 6 (v1.5.0): explanatory copy, verbatim -->
+      <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px;line-height:1.5">
+        This is where you monitor and fine-tune your grow space in real time.
+      </div>
       <!-- Live readings -->
       <div class="card">
         <div class="card-title" style="display:flex;align-items:center">🌱 ${d.zone2_name || 'Primary Grow Space'} — Live ${_gearBtnHtml()}</div>
@@ -3188,20 +3418,62 @@ class HelixTabGrowspace extends HTMLElement {
       <!-- Setpoints -->
       <div class="card">
         <div class="card-title">🎯 Setpoints &amp; Controls</div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-bottom:8px">
+          Live effective values right now — permanent stage targets are edited on the
+          Plant Cycle tab; temporary nudges are below.
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Temp Setpoint</span>
+          <span class="metric-val">${fT(tempSP)} ${overrideTempActive != null ? OVERRIDE_BADGE : ''}</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">VPD Target</span>
+          <span class="metric-val">${fVPD(vpdT)} ${overrideVpdActive != null ? OVERRIDE_BADGE : ''}</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Light Intensity</span>
+          <span class="metric-val">${fPct(lightP)} ${overrideLightActive != null ? OVERRIDE_BADGE : ''}</span>
+        </div>
+      </div>
+      <!-- Temporary Override (v1.5.0 Part 4) -->
+      <div class="card">
+        <div class="card-title">🔧 Temporary Override</div>
+        <div style="font-size:.72rem;color:var(--hx-text2);margin-bottom:10px;line-height:1.5">
+          🔧 Temporary Override — these sliders let you nudge today's temperature, VPD, or light
+          intensity without changing your saved stage settings. An override stays active until
+          this stage ends, then automatically resets to your saved default. To make a permanent
+          change instead, edit it on the Plant Cycle tab.
+        </div>
+        <div class="hx-period-toggle" style="display:flex;gap:6px;margin-bottom:12px">
+          <button class="override-context-btn ${overrideCtx === 'day' ? 'active' : ''}" data-context="day"
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${overrideCtx === 'day' ? 'var(--hx-blue,#209cee)' : 'none'};color:${overrideCtx === 'day' ? '#fff' : 'var(--hx-text)'};font-weight:600">☀️ Day</button>
+          <button class="override-context-btn ${overrideCtx === 'night' ? 'active' : ''}" data-context="night"
+            style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${overrideCtx === 'night' ? 'var(--hx-blue,#209cee)' : 'none'};color:${overrideCtx === 'night' ? '#fff' : 'var(--hx-text)'};font-weight:600">🌙 Night</button>
+        </div>
         <div class="slider-row">
           <span class="slider-lbl">Temp Setpoint</span>
-          <input type="range" id="temp-sp" min="15" max="35" step="0.5" value="${tempSP}"/>
-          <span class="slider-val" id="temp-sp-val">${fT(tempSP)}</span>
+          <input type="range" id="override-temp-sl" min="15" max="35" step="0.5" value="${fn(overrideTempActive ?? tempSP, 1)}"/>
+          <span class="slider-val" id="override-temp-val">${fT(overrideTempActive ?? tempSP)}</span>
         </div>
+        ${overrideTempActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}
         <div class="slider-row">
           <span class="slider-lbl">VPD Target</span>
-          <input type="range" id="vpd-sp" min="0.3" max="2.0" step="0.05" value="${fn(vpdT,2)}"/>
-          <span class="slider-val" id="vpd-sp-val">${fVPD(vpdT)}</span>
+          <input type="range" id="override-vpd-sl" min="0.3" max="2.0" step="0.05" value="${fn(overrideVpdActive ?? vpdT, 2)}"/>
+          <span class="slider-val" id="override-vpd-val">${fVPD(overrideVpdActive ?? vpdT)}</span>
         </div>
+        ${overrideVpdActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}
         <div class="slider-row">
           <span class="slider-lbl">Light Intensity</span>
-          <input type="range" id="light-sp" min="0" max="100" step="1" value="${lightP}"/>
-          <span class="slider-val" id="light-sp-val">${fPct(lightP)}</span>
+          <input type="range" id="override-light-sl" min="0" max="100" step="1" value="${fn(overrideLightActive ?? lightP, 0)}"/>
+          <span class="slider-val" id="override-light-val">${fPct(overrideLightActive ?? lightP)}</span>
+        </div>
+        ${overrideLightActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}
+        <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+          <button id="apply-override-btn" style="padding:9px 16px;border-radius:8px;border:none;
+            background:var(--hx-amber,#e6a817);color:#111;font-weight:700;cursor:pointer">🔧 Apply Override</button>
+          <span id="override-status" style="font-size:.75rem;color:var(--hx-text2)">${this._overrideStatus}</span>
         </div>
       </div>
       ${lightingCardHtml}
@@ -3211,18 +3483,29 @@ class HelixTabGrowspace extends HTMLElement {
         ${fanCards}
       </div>`;
 
-    // Setpoint bindings
-    const bindings = [
-      ['#temp-sp', '#temp-sp-val', fT, 'number', 'set_value', 'number.helix_cultivate_temp_setpoint'],
-      ['#vpd-sp',  '#vpd-sp-val',  fVPD, 'number', 'set_value', 'number.helix_cultivate_vpd_target'],
-      ['#light-sp','#light-sp-val',fPct, 'number', 'set_value', 'number.helix_cultivate_light_intensity'],
+    // Day/Night context toggle for the Temporary Override section
+    this.shadowRoot.querySelectorAll('.override-context-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this._overrideContext = btn.dataset.context;
+        this._render();
+      });
+    });
+
+    // Live slider-value labels (no auto-apply — explicit button below)
+    const overrideSliderBindings = [
+      ['#override-temp-sl', '#override-temp-val', fT],
+      ['#override-vpd-sl', '#override-vpd-val', fVPD],
+      ['#override-light-sl', '#override-light-val', fPct],
     ];
-    for (const [slId, valId, fmt, domain, svc, entityId] of bindings) {
+    for (const [slId, valId, fmt] of overrideSliderBindings) {
       const sl = this.shadowRoot.querySelector(slId);
       const vl = this.shadowRoot.querySelector(valId);
       if (!sl) continue;
       sl.addEventListener('input', e => { if (vl) vl.textContent = fmt(parseFloat(e.target.value)); });
-      sl.addEventListener('change', e => this._svc(domain, svc, { entity_id: entityId, value: parseFloat(e.target.value) }));
+    }
+    const applyOverrideBtn = this.shadowRoot.querySelector('#apply-override-btn');
+    if (applyOverrideBtn) {
+      applyOverrideBtn.addEventListener('click', () => this._applyOverridesFromDom());
     }
 
     // Fan speed sliders
@@ -4931,6 +5214,13 @@ class HelixPanel extends HTMLElement {
       zone2_occupied: this._attr('exhaust_speed', 'sensor', 'zone2_occupied') === true,
       drying_occupied: this._attr('exhaust_speed', 'sensor', 'drying_occupied') === true,
       drying_batch_elapsed_days: this._attr('exhaust_speed', 'sensor', 'drying_batch_elapsed_days') ?? null,
+      // Temporary Override system (v1.5.0 Part 4)
+      override_day_temp_c: this._attr('exhaust_speed', 'sensor', 'override_day_temp_c') ?? null,
+      override_night_temp_c: this._attr('exhaust_speed', 'sensor', 'override_night_temp_c') ?? null,
+      override_day_vpd: this._attr('exhaust_speed', 'sensor', 'override_day_vpd') ?? null,
+      override_night_vpd: this._attr('exhaust_speed', 'sensor', 'override_night_vpd') ?? null,
+      override_day_light_pct: this._attr('exhaust_speed', 'sensor', 'override_day_light_pct') ?? null,
+      override_night_light_pct: this._attr('exhaust_speed', 'sensor', 'override_night_light_pct') ?? null,
 
       // Independent canopy sensor/fan layer toggles (mid/lower only — upper
       // is the mandatory primary layer for both, no toggle)

@@ -442,18 +442,30 @@ class HelixNumber(CoordinatorEntity[HelixCoordinator], NumberEntity):
         except Exception:  # noqa: BLE001
             return self.entity_description.native_min_value or 0.0
 
+    # Part 4 (v1.5.0): Temp Setpoint/VPD Target/Light Intensity now route
+    # through the day/night-keyed Temporary Override system instead of a
+    # context-blind manual-override boolean — applied to whichever context
+    # ("day"/"night") is actually active right now, so this entity and the
+    # dashboard's own Temporary Override section are one single mechanism,
+    # never two competing ones.
+    _OVERRIDE_KIND_BY_KEY: dict[str, str] = {
+        NUMBER_VPD_TARGET: "vpd",
+        NUMBER_TEMP_SETPOINT: "temp",
+        NUMBER_LIGHT_INTENSITY: "light",
+    }
+
     async def async_set_native_value(self, value: float) -> None:
         """Apply a new value via the coordinator setter."""
         try:
-            self.entity_description.set_fn(self.coordinator, value)
-            # Set manual override flag so smooth glides don't clobber user input
             key = self.entity_description.key
-            if key == NUMBER_VPD_TARGET:
-                self.coordinator.vpd_target_manual_override = True
-            elif key == NUMBER_TEMP_SETPOINT:
-                self.coordinator.temp_setpoint_manual_override = True
-            elif key == NUMBER_RH_SETPOINT:
-                self.coordinator.rh_setpoint_manual_override = True
+            override_kind = self._OVERRIDE_KIND_BY_KEY.get(key)
+            if override_kind is not None:
+                context = "day" if self.coordinator._lights_on() else "night"
+                self.coordinator.apply_temporary_override(context, override_kind, value)
+            else:
+                self.entity_description.set_fn(self.coordinator, value)
+                if key == NUMBER_RH_SETPOINT:
+                    self.coordinator.rh_setpoint_manual_override = True
         except Exception:  # noqa: BLE001
             pass
         self.async_write_ha_state()

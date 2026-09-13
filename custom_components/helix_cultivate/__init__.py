@@ -40,13 +40,23 @@ WS_CMD_HARVEST_COMPLETE_DRYING_BATCH: str = "helix_cultivate/harvest_complete_dr
 WS_CMD_START_DEEP_CALIBRATION: str = "helix_cultivate/start_deep_calibration"
 WS_CMD_START_LIVE_ACTUATOR_TEST: str = "helix_cultivate/start_live_actuator_test"
 WS_CMD_GET_LEARNING_STATUS: str = "helix_cultivate/get_learning_status"
+WS_CMD_APPLY_TEMPORARY_OVERRIDE: str = "helix_cultivate/apply_temporary_override"
 
 VALID_STAGE_TARGET_KEYS: frozenset[str] = frozenset({
     "day_temp_c", "night_temp_c",
     "day_vpd_min", "day_vpd_max",
     "night_vpd_min", "night_vpd_max",
-    "light_intensity_pct", "photoperiod_h", "fan_speed_pct",
+    "light_intensity_pct", "fan_speed_pct",
     "target_dli_mol",
+    # v1.5.0 Part 3: the real value StageManager._duration() uses for
+    # PROG_TIMEFRAME auto-advance and the stage-progression heads-up
+    # warning — not a disconnected display number.
+    "duration_days",
+    # v1.5.0 Part 2: "photoperiod_h" deliberately removed from this set —
+    # a stage's lighting-hours value is no longer independently editable;
+    # it is always a live, read-only reflection of the real Growth-Mode-
+    # computed schedule (growth_mode + af/pp hours), the single source of
+    # truth for what's actually being scheduled.
 })
 
 # Static config-entry-backed settings fields with an explicit Save button in
@@ -582,6 +592,15 @@ async def ws_update_stage_targets(
     merged into the existing `stage_targets_{stage}` dict rather than
     replacing it, so partial updates (e.g. a single slider change) do not
     clobber other previously-persisted keys for the same stage.
+
+    v1.5.0 Part 5: also patches the live coordinator's in-memory `_config`
+    immediately, the same way ws_update_settings_fields already does —
+    verified directly (not assumed) that a save for the CURRENTLY ACTIVE
+    stage was otherwise only picked up once the config-entry-triggered
+    reload actually completed, rather than on the very next control-loop
+    tick. StageManager._profile() has no caching of its own (recomputed
+    fresh from this dict every call), so patching it here closes that gap
+    without waiting on the reload at all.
     """
     from .const import STAGE_SEQUENCE
 
@@ -600,9 +619,48 @@ async def ws_update_stage_targets(
     key = f"stage_targets_{msg['stage']}"
     existing: dict[str, Any] = entry.options.get(key, {})
     merged: dict[str, Any] = {**existing, **validated}
+
+    coordinator: Optional[HelixCoordinator] = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is not None:
+        coordinator._config[key] = merged
+
     new_options: dict[str, Any] = {**entry.options, key: merged}
     hass.config_entries.async_update_entry(entry, options=new_options)
     connection.send_result(msg["id"], {"success": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_CMD_APPLY_TEMPORARY_OVERRIDE,
+        vol.Required("context"): vol.In(["day", "night"]),
+        vol.Required("kind"): vol.In(["temp", "vpd", "light"]),
+        vol.Required("value"): vol.Coerce(float),
+    }
+)
+@websocket_api.async_response
+async def ws_apply_temporary_override(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Part 4 (v1.5.0): set a live, temporary override on Primary Grow
+    Space for one context/kind combination — in-memory only, never
+    persisted, cleared automatically the moment the active stage changes.
+    """
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    try:
+        coordinator.apply_temporary_override(msg["context"], msg["kind"], msg["value"])
+        connection.send_result(msg["id"], {"success": True})
+    except ValueError as exc:
+        connection.send_error(msg["id"], "invalid_input", str(exc))
 
 
 @websocket_api.websocket_command(
@@ -639,6 +697,17 @@ async def ws_update_settings_fields(
     validated: dict[str, Any] = {
         k: v for k, v in msg["fields"].items() if k in VALID_SETTINGS_FIELD_KEYS
     }
+    # v1.5.0 Part 1.2: Growth Mode is locked server-side too, not just
+    # disabled in the UI — the same defense-in-depth pattern already used
+    # for space_now_empty()'s topology guard. Reused across BOTH surfaces
+    # that can write growth_mode (Plant Cycle's toggle and Primary Grow
+    # Space's own copy), since both route through this one handler.
+    if "growth_mode" in validated and coordinator.is_zone2_occupied():
+        connection.send_error(
+            msg["id"], "growth_mode_locked",
+            "Growth Mode is locked while a cycle occupies Primary Grow Space.",
+        )
+        return
     for field_key, field_value in validated.items():
         coordinator._config[field_key] = field_value
         coordinator.queue_option_write(field_key, field_value)
@@ -1053,6 +1122,7 @@ def _async_register_zone_device_ws_commands(hass: HomeAssistant) -> None:
         websocket_api.async_register_command(hass, ws_update_zone_devices)
         websocket_api.async_register_command(hass, ws_get_config_summary)
         websocket_api.async_register_command(hass, ws_update_stage_targets)
+        websocket_api.async_register_command(hass, ws_apply_temporary_override)
         websocket_api.async_register_command(hass, ws_toggle_drying_lock)
         websocket_api.async_register_command(hass, ws_close_out_harvest)
         websocket_api.async_register_command(hass, ws_export_recipe)

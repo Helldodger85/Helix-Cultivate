@@ -409,10 +409,25 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.breeze_upper_enabled: bool = self._read_persisted_breeze_enabled(FAN_TIER_UPPER)
         self.breeze_mid_enabled: bool = self._read_persisted_breeze_enabled(FAN_TIER_MID)
         self.breeze_lower_enabled: bool = self._read_persisted_breeze_enabled(FAN_TIER_LOWER)
-        # ── Manual override flags (set by number entities, cleared on stage advance) ──
-        self.temp_setpoint_manual_override: bool = False
-        self.vpd_target_manual_override: bool = False
+        # ── Manual override flag (RH only — Temp/VPD/Light moved to the
+        # Temporary Override system below in v1.5.0 Part 4) ─────────────────
         self.rh_setpoint_manual_override: bool = False
+
+        # ── Temporary Override system (v1.5.0 Part 4) ────────────────────────
+        # Day/Night-keyed, in-memory only (never persisted — genuinely
+        # temporary) live overrides for Temp Setpoint, VPD Target, and Light
+        # Intensity. Each is consulted fresh every tick by the smooth-glides
+        # block below, taking precedence over that context's saved stage
+        # default for as long as the slot is set; cleared unconditionally by
+        # StageManager the moment the active stage changes (manual or
+        # PROG_TIMEFRAME auto-advance) via clear_stage_overrides() below.
+        # Replaces the old context-blind temp_setpoint_manual_override/
+        # vpd_target_manual_override booleans, which had no notion of day
+        # vs night at all and (for VPD) only ever touched the display
+        # midpoint, never the real vpd_target_min/max control band.
+        self._temp_override: dict[str, Optional[float]] = {"day": None, "night": None}
+        self._vpd_override: dict[str, Optional[float]] = {"day": None, "night": None}
+        self._light_override: dict[str, Optional[float]] = {"day": None, "night": None}
 
         # ── Light schedule engine (Phase 1.5) ───────────────────────────────────
         # Actual last-applied grow-light brightness (0-100), distinct from
@@ -703,6 +718,92 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         state = self.hass.states.get(light_id)
         return state is not None and state.state in ("on",)
 
+    # ── Temporary Override system (v1.5.0 Part 4) ────────────────────────────
+
+    def _override_store(self, kind: str) -> dict[str, Optional[float]]:
+        store = {
+            "temp": self._temp_override,
+            "vpd": self._vpd_override,
+            "light": self._light_override,
+        }.get(kind)
+        if store is None:
+            raise ValueError(f"Unknown Temporary Override kind: {kind!r}")
+        return store
+
+    def apply_temporary_override(self, context: str, kind: str, value: float) -> None:
+        """Set a live, temporary override for `kind` ("temp"/"vpd"/"light")
+        in `context` ("day"/"night") — used by the control loop in place of
+        that context's saved stage default until the active stage changes.
+        Never touches the other context or the other two kinds. If
+        `context` is the one currently active, the effective live setpoint
+        is refreshed immediately rather than waiting for the next Day/Night
+        Smooth-Glides flip to notice it.
+        """
+        if context not in ("day", "night"):
+            raise ValueError(f"Invalid override context: {context!r}")
+        self._override_store(kind)[context] = value
+        current_context = "day" if self._lights_on() else "night"
+        if context == current_context:
+            self._apply_active_setpoints()
+
+    def clear_stage_overrides(self) -> None:
+        """Called by StageManager on every stage transition (manual or
+        PROG_TIMEFRAME auto-advance) — all six slots (day/night x
+        temp/vpd/light) clear unconditionally, regardless of which context
+        is currently active, so control reverts to the new stage's own
+        saved defaults on the very next tick."""
+        for store in (self._temp_override, self._vpd_override, self._light_override):
+            store["day"] = None
+            store["night"] = None
+
+    def has_active_override(self, context: str, kind: str) -> bool:
+        return self._override_store(kind).get(context) is not None
+
+    def _apply_active_setpoints(self) -> None:
+        """Recompute temp_setpoint/vpd_target(_min/_max)/light_intensity_pct
+        for whichever Day/Night context is active right now, from either an
+        active Temporary Override or the stage's own saved default —
+        exactly the same resolution the main coordinator tick's
+        smooth-glides block performs, factored out so
+        apply_temporary_override() can apply a change immediately instead
+        of waiting for the next tick. No-ops (leaves live setpoints alone)
+        when Smooth Glides is disabled — this system is Smooth Glides'
+        day/night resolution mechanism, not a replacement for it.
+        """
+        if not self.smooth_glides_enabled:
+            return
+        is_day = self._lights_on()
+        context = "day" if is_day else "night"
+        vpd_min, vpd_max = self.stage_manager.current_vpd_range(is_day)
+        sm_temp = self.stage_manager.current_temp_anchor(is_day)
+
+        temp_override = self._temp_override.get(context)
+        if temp_override is not None:
+            self.temp_setpoint = temp_override
+        elif sm_temp is not None:
+            self.temp_setpoint = sm_temp
+
+        vpd_override = self._vpd_override.get(context)
+        if vpd_override is not None:
+            half_width = max(0.0, vpd_max - vpd_min) / 2.0
+            self.vpd_target_min = max(0.0, vpd_override - half_width)
+            self.vpd_target_max = vpd_override + half_width
+            self.vpd_target = vpd_override
+        else:
+            self.vpd_target_min = vpd_min
+            self.vpd_target_max = vpd_max
+            self.vpd_target = (vpd_min + vpd_max) / 2.0
+
+        light_override = self._light_override.get(context)
+        if light_override is not None:
+            self.light_intensity_pct = light_override
+        else:
+            stage_light_pct = self.stage_manager._profile(
+                self.stage_manager.current_stage
+            ).get("light_intensity_pct")
+            if stage_light_pct is not None:
+                self.light_intensity_pct = float(stage_light_pct)
+
     # ── Light schedule engine (Phase 1.5) ─────────────────────────────────────
     #
     # Helix Cultivate is the sole authority for the grow-light schedule.
@@ -711,20 +812,19 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # DLI sensor is mapped, by design (B7: DLI presence must never gate
     # scheduling, growth mode, ramp, or lockout).
 
-    def _light_schedule_params(self) -> tuple[float, dtime, str]:
+    def _light_schedule_params_for_stage(self, stage: str) -> tuple[float, dtime, str]:
         """Return (hours, on_time, schedule_key) for the schedule that
-        applies RIGHT NOW, based on growth mode and the current stage.
-
-        Recomputed fresh every call — a stage transition (auto-advance or
-        manual) is reflected on the very next call with no interpolation,
-        which is what makes the Veg->Flower transition a single instant
-        switch rather than a gradual ramp (see _light_schedule_multiplier).
+        applies to `stage`, based on growth mode — the single place this is
+        ever decided (v1.5.0 Part 2). Both _light_schedule_params() (the
+        live control loop, always for the CURRENT stage) and
+        computed_photoperiod_hours() (an arbitrary stage, for the Plant
+        Cycle timeline's read-only preview of every stage at once) resolve
+        through this one method, so the two can never diverge.
         """
         # Drying is a fixed dark period regardless of growth mode — it's a
         # post-harvest curing stage, not a live-plant photoperiod response,
         # so it overrides autoflower's constant schedule too. Checked before
         # branching on growth mode so this can never be shadowed by it.
-        stage = self.stage_manager.current_stage
         if stage == STAGE_DRYING:
             return 0.0, dtime(0, 0), "drying"
 
@@ -754,6 +854,31 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             DEFAULT_PP_VEG_LIGHTS_ON_TIME,
         )
         return hours, on_time, "pp_veg"
+
+    def _light_schedule_params(self) -> tuple[float, dtime, str]:
+        """Return (hours, on_time, schedule_key) for the schedule that
+        applies RIGHT NOW, based on growth mode and the current stage.
+
+        Recomputed fresh every call — a stage transition (auto-advance or
+        manual) is reflected on the very next call with no interpolation,
+        which is what makes the Veg->Flower transition a single instant
+        switch rather than a gradual ramp (see _light_schedule_multiplier).
+        """
+        return self._light_schedule_params_for_stage(self.stage_manager.current_stage)
+
+    def computed_photoperiod_hours(self, stage: str) -> float:
+        """Part 2.2 (v1.5.0): the real lighting-hours value Growth Mode
+        actually computes for `stage` — Autoflower's single constant value,
+        or the Veg/Flower-group value under Photoperiod. Used by the Plant
+        Cycle tab's Grow Stage Timeline to show every stage's own real
+        value (not just whichever one is currently active) as a read-only
+        reflection — there is exactly one place this number is decided
+        (_light_schedule_params_for_stage above); this can never diverge
+        from what's actually being scheduled once that stage becomes
+        active, since both call the same method.
+        """
+        hours, _on_time, _key = self._light_schedule_params_for_stage(stage)
+        return hours
 
     def _effective_ramp_minutes(self, light_id: Optional[str]) -> float:
         """Return the sunrise/sunset ramp duration in minutes, or 0.0 if the
@@ -1864,13 +1989,19 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.smooth_glides_enabled:
             vpd_min, vpd_max = self.stage_manager.current_vpd_range(is_day)
             sm_temp = self.stage_manager.current_temp_anchor(is_day)
-            if not self.vpd_target_manual_override:
-                self.vpd_target_min = vpd_min
-                self.vpd_target_max = vpd_max
-                self.vpd_target = (vpd_min + vpd_max) / 2.0
-            if sm_temp is not None and not self.temp_setpoint_manual_override:
-                self.temp_setpoint = sm_temp
-            # RH setpoint: derive from midpoint VPD at anchor temp (Tetens formula)
+
+            # Part 4 (v1.5.0): resolves temp_setpoint/vpd_target(_min/_max)/
+            # light_intensity_pct for the current Day/Night context — an
+            # active Temporary Override takes precedence over the stage's
+            # own saved default, exactly the same resolution
+            # apply_temporary_override() performs immediately when a new
+            # override is set, factored out so both stay identical.
+            self._apply_active_setpoints()
+
+            # RH setpoint: derive from midpoint VPD at anchor temp (Tetens
+            # formula) — deliberately from the stage's own configured VPD
+            # range/temp anchor, not from any active Temporary Override, so
+            # a temporary VPD/temp nudge doesn't also perturb the RH target.
             if not self.rh_setpoint_manual_override:
                 import math
 

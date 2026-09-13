@@ -458,6 +458,16 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             # drying_stage_start_date — never a value frozen at the moment
             # "Space Now Empty" was pressed.
             attrs["drying_batch_elapsed_days"] = self.coordinator.drying_batch_elapsed_days()
+            # Temporary Override system (v1.5.0 Part 4) — None when no
+            # override is currently active for that context/kind, so the
+            # frontend's indicator ("🔧 Temporary override…") only ever
+            # shows for a genuine active override.
+            attrs["override_day_temp_c"] = self.coordinator._temp_override.get("day")
+            attrs["override_night_temp_c"] = self.coordinator._temp_override.get("night")
+            attrs["override_day_vpd"] = self.coordinator._vpd_override.get("day")
+            attrs["override_night_vpd"] = self.coordinator._vpd_override.get("night")
+            attrs["override_day_light_pct"] = self.coordinator._light_override.get("day")
+            attrs["override_night_light_pct"] = self.coordinator._light_override.get("night")
             # Outdoor conditions (local weather station override applied
             # server-side if mapped)
             attrs["outdoor_weather_entity"] = self.coordinator._get(CONF_OUTDOOR_WEATHER_ENTITY)

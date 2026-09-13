@@ -17,7 +17,7 @@ the way a real config-entry reload would reconstruct it.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -30,6 +30,17 @@ from custom_components.helix_cultivate.const import (
 )
 from custom_components.helix_cultivate.stage_manager import StageManager
 
+# The migration writes dt_util.now().date() (HA's own configured-timezone
+# "now"), while StageManager._elapsed_days() separately computes against
+# the bare Python date.today() — the two are only guaranteed to agree in a
+# real install because HA and the host OS share one timezone. In this bare
+# test harness (no hass.config.time_zone configured) dt_util defaults to
+# UTC, which can genuinely fall on a different calendar date than the test
+# machine's own local date.today() depending on time of day — pinning
+# dt_util.now() to "right now, in date.today()'s own date" removes that
+# ambiguity outright rather than working around it after the fact.
+_TODAY = date.today()
+
 
 def _make_config_entry(entry_id="entry123", version=1, minor_version=6, data=None, options=None):
     return SimpleNamespace(
@@ -39,6 +50,12 @@ def _make_config_entry(entry_id="entry123", version=1, minor_version=6, data=Non
         data=data or {},
         options=options or {},
     )
+
+
+@pytest.fixture(autouse=True)
+def _pin_dt_util_now(monkeypatch):
+    fixed = datetime.combine(_TODAY, time(12, 0), tzinfo=timezone.utc)
+    monkeypatch.setattr(helix_init.dt_util, "now", lambda: fixed)
 
 
 @pytest.fixture
@@ -61,7 +78,7 @@ async def test_v19_migration_writes_stage_start_date_when_missing(fake_hass):
     await helix_init.async_migrate_entry(fake_hass, entry)
 
     call_kwargs = fake_hass.config_entries.async_update_entry.call_args.kwargs
-    assert call_kwargs["options"].get(CONF_STAGE_START_DATE) == date.today().isoformat()
+    assert call_kwargs["options"].get(CONF_STAGE_START_DATE) == _TODAY.isoformat()
     assert call_kwargs["minor_version"] == CONFIG_MINOR_VERSION
 
 
@@ -112,8 +129,8 @@ async def test_stage_start_date_survives_simulated_reload_across_multiple_constr
     sm_reload_2 = StageManager(MagicMock(), dict(merged_config))
     elapsed_2 = sm_reload_2._elapsed_days()
 
-    assert sm_reload_1._stage_start_date == date.today()
-    assert sm_reload_2._stage_start_date == date.today()
+    assert sm_reload_1._stage_start_date == _TODAY
+    assert sm_reload_2._stage_start_date == _TODAY
     assert elapsed_1 == elapsed_2 == 0
 
 

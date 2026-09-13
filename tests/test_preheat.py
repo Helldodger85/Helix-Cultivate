@@ -35,6 +35,7 @@ def fake_light_sched_coord(monkeypatch):
     coord.stage_manager = MagicMock()
     coord.stage_manager.current_stage = STAGE_EARLY_VEG
     coord._light_schedule_params = lambda: HelixCoordinator._light_schedule_params(coord)
+    coord._light_schedule_params_for_stage = lambda stage: HelixCoordinator._light_schedule_params_for_stage(coord, stage)
     coord._minutes_until_lights_off = lambda: HelixCoordinator._minutes_until_lights_off(coord)
     return coord
 
