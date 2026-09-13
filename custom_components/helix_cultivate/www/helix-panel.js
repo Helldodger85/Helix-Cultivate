@@ -281,7 +281,7 @@ const BASE_CSS = `
 
 function buildSparklineSVG(points, colour, width = 200, height = 40, filled = false, band = null) {
   if (!points || points.length < 2) {
-    return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+    return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
       <text x="${width/2}" y="${height/2}" text-anchor="middle" font-size="9"
         fill="rgba(150,160,180,0.5)">No data</text></svg>`;
   }
@@ -324,12 +324,18 @@ function buildSparklineSVG(points, colour, width = 200, height = 40, filled = fa
   const lastX = parseFloat(lastPt.split(',')[0]);
   const lastY = parseFloat(lastPt.split(',')[1]);
 
-  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="overflow:visible">
+  // Part 1.3: width="100%" + preserveAspectRatio="none" so the sparkline
+  // genuinely fills its container's actual measured width — the previous
+  // fixed pixel width attribute rendered at a constant size regardless of
+  // how much space the card actually had. The viewBox keeps all the point
+  // math above in a fixed logical coordinate space; only the final render
+  // size is now responsive.
+  return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="overflow:visible;display:block">
     ${bandRect}
     ${fillPath}
     <polyline points="${polyline}" fill="none" stroke="${colour}" stroke-width="1.8"
-      stroke-linecap="round" stroke-linejoin="round"/>
-    <circle cx="${lastX}" cy="${lastY}" r="3" fill="${colour}"/>
+      stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
+    <circle cx="${lastX}" cy="${lastY}" r="3" fill="${colour}" vector-effect="non-scaling-stroke"/>
   </svg>`;
 }
 
@@ -441,6 +447,19 @@ class HelixSparklineCard extends HTMLElement {
   set hass(h) { this._hass = h; this._renderShell(); this._maybeFetch(); }
   set data(d) { this._data = d || {}; this._renderShell(); }
   set zone(z) { this._zone = z; }
+  // Part 1.3: the parent tab rebuilds its whole innerHTML (including this
+  // element's own <helix-sparkline-card> tag) on every coordinator data
+  // push, which destroys and recreates this instance — silently resetting
+  // _timeframe back to the constructor default ('live') every time. The
+  // parent now persists the selection itself and restores it here via this
+  // setter immediately after each rebuild.
+  set timeframe(tf) {
+    if (!tf || tf === this._timeframe) return;
+    this._timeframe = tf;
+    this._renderShell();
+    if (this._timeframe !== 'live') this._maybeFetch();
+  }
+  get timeframe() { return this._timeframe; }
 
   _entityIds() {
     const d = this._data;
@@ -548,7 +567,8 @@ class HelixSparklineCard extends HTMLElement {
         .reading .l { font-size: .65rem; color: var(--hx-text2); }
         .spark-section { margin-top: 4px; }
         .spark-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
-        .spark-lbl { font-size: .68rem; color: var(--hx-text2); min-width: 28px; }
+        .spark-row svg { flex: 1 1 auto; min-width: 0; width: 100%; }
+        .spark-lbl { font-size: .68rem; color: var(--hx-text2); min-width: 28px; flex-shrink: 0; }
         .loading { font-size: .72rem; color: var(--hx-text2); padding: 8px 0; text-align: center; }
       </style>
       <div class="zone-card">
@@ -592,6 +612,12 @@ class HelixSparklineCard extends HTMLElement {
         this._sparkData = {};
         this._renderShell();
         if (this._timeframe !== 'live') this._maybeFetch();
+        // Notify the parent tab so it can persist this selection across its
+        // next full re-render (see the `timeframe` setter above).
+        this.dispatchEvent(new CustomEvent('sparkline-timeframe-changed', {
+          bubbles: true, composed: true,
+          detail: { id: this.id, timeframe: this._timeframe },
+        }));
       });
     });
   }
@@ -684,7 +710,19 @@ function overrideChip(label, entityId, currentState, hass, visible = true) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class HelixTabTelemetry extends HTMLElement {
-  constructor() { super(); this.attachShadow({ mode: 'open' }); }
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    // Part 1.3: _render() rebuilds this.shadowRoot.innerHTML on every
+    // coordinator data push, which destroys and recreates the child
+    // <helix-sparkline-card> elements — this dict is what survives that
+    // rebuild (it lives on this outer, never-destroyed host element) so
+    // each card's selected timeframe can be restored after every rebuild.
+    this._sparklineTimeframes = {};
+    this.addEventListener('sparkline-timeframe-changed', (e) => {
+      this._sparklineTimeframes[e.detail.id] = e.detail.timeframe;
+    });
+  }
 
   set hass(h) { this._hass = h; this._render(); }
   set data(d) { this._data = d; this._render(); }
@@ -713,7 +751,16 @@ class HelixTabTelemetry extends HTMLElement {
     const smoothGlide = d.smooth_glides  ?? false;
     const topology    = d.topology       ?? 'coordinated';
     const thermalRunaway = d.thermal_runaway ?? false;
-    const sensorDropout  = d.sensor_dropout  ?? false;
+    // Part 1.2: badge visibility now agrees with the popover's detail-lookup
+    // — both keyed off there being an actual, specifically-identifiable
+    // dropped entity, not the raw sensor_dropout boolean alone (which is
+    // also true when no primary sensor is mapped at all — a configuration
+    // gap, not a genuine hardware dropout — leaving the popover with
+    // nothing real to show underneath a visible badge).
+    const dropoutSensorEntities  = d.sensor_dropout_entities   || [];
+    const dropoutActuatorEntities = d.actuator_dropout_entities || [];
+    const sensorDropout   = dropoutSensorEntities.length > 0;
+    const actuatorDropout = dropoutActuatorEntities.length > 0;
 
     const condEnabled  = d.enable_conditioning_room  ?? (topology === 'coordinated');
     const dryingEnabled = d.enable_drying_environment ?? false;
@@ -736,9 +783,13 @@ class HelixTabTelemetry extends HTMLElement {
 
     const alerts = [];
     if (thermalRunaway) alerts.push(`<span class="badge bg-red">🔥 Thermal Runaway</span>`);
-    if (sensorDropout) {
+    if (sensorDropout || actuatorDropout) {
+      // Actuator dropout (can't heat/cool/exhaust) escalates to red — losing
+      // control of hardware is more urgent than losing a passive reading.
+      const badgeClass = actuatorDropout ? 'bg-red' : 'bg-amber';
+      const badgeLabel = actuatorDropout ? '⚠ Actuator Dropout' : '⚠ Sensor Dropout';
       alerts.push(
-        `<span class="badge bg-amber" id="sensor-dropout-badge" style="cursor:pointer" title="Click for details">⚠ Sensor Dropout</span>`
+        `<span class="badge ${badgeClass}" id="sensor-dropout-badge" style="cursor:pointer" title="Click for details">${badgeLabel}</span>`
       );
     }
 
@@ -864,8 +915,9 @@ class HelixTabTelemetry extends HTMLElement {
         this._render();
       });
     }
-    if (this._showDropoutPopover && sensorDropout) {
-      const entities = d.sensor_dropout_entities || [];
+    if (this._showDropoutPopover && (sensorDropout || actuatorDropout)) {
+      const sensorEntities = d.sensor_dropout_entities || [];
+      const actuatorEntities = d.actuator_dropout_entities || [];
       const popover = document.createElement('div');
       popover.style.cssText = `position:fixed;z-index:1000;background:var(--hx-surface2);
         border:1px solid var(--hx-border);border-radius:10px;padding:12px;max-width:280px;
@@ -873,14 +925,16 @@ class HelixTabTelemetry extends HTMLElement {
       const rect = dropoutBadge.getBoundingClientRect();
       popover.style.top = `${rect.bottom + 6}px`;
       popover.style.left = `${rect.left}px`;
+      const sectionHtml = (title, entities) => entities.length
+        ? `<div style="margin-bottom:4px;font-weight:600">${title}</div>
+           <ul style="margin:0 0 8px;padding-left:18px">
+             ${entities.map(e => `<li style="font-family:monospace;font-size:.72rem">${e}</li>`).join('')}
+           </ul>`
+        : '';
       popover.innerHTML = `
-        <div style="font-weight:700;margin-bottom:6px">⚠ Sensor Dropout</div>
-        ${entities.length
-          ? `<div style="margin-bottom:8px">Currently unavailable or stale:</div>
-             <ul style="margin:0 0 8px;padding-left:18px">
-               ${entities.map(e => `<li style="font-family:monospace;font-size:.72rem">${e}</li>`).join('')}
-             </ul>`
-          : `<div style="margin-bottom:8px;color:var(--hx-text2)">No specific sensor detail available.</div>`}
+        <div style="font-weight:700;margin-bottom:6px">${actuatorDropout ? '⚠ Actuator Dropout' : '⚠ Sensor Dropout'}</div>
+        ${sectionHtml('Actuators unreachable:', actuatorEntities)}
+        ${sectionHtml('Sensors unavailable or stale:', sensorEntities)}
         <button id="dropout-popover-repairs" style="width:100%;padding:6px;border-radius:6px;border:1px solid var(--hx-border);
           background:none;color:var(--hx-text);cursor:pointer;font-size:.72rem">Open Settings → Repairs</button>
       `;
@@ -923,6 +977,7 @@ class HelixTabTelemetry extends HTMLElement {
         rh_entity_id: `sensor.helix_cultivate_upper_canopy_rh`,
         vpd_entity_id: `sensor.helix_cultivate_leaf_vpd`,
       };
+      tentSpark.timeframe = this._sparklineTimeframes['spark-tent'] || 'live';
     }
     if (condEnabled) {
       const lungSpark = this.shadowRoot.querySelector('#spark-lung');
@@ -942,6 +997,7 @@ class HelixTabTelemetry extends HTMLElement {
           rh_entity_id: `sensor.helix_cultivate_lung_rh`,
           vpd_entity_id: null,
         };
+        lungSpark.timeframe = this._sparklineTimeframes['spark-lung'] || 'live';
       }
     }
     if (dryingEnabled) {
@@ -958,6 +1014,7 @@ class HelixTabTelemetry extends HTMLElement {
           rh_entity_id: null,
           vpd_entity_id: null,
         };
+        drySpark.timeframe = this._sparklineTimeframes['spark-dry'] || 'live';
       }
     }
   }
@@ -1104,6 +1161,15 @@ class HelixTabCycle extends HTMLElement {
     // real harvest, or vice versa.
     this._showAbortConfirm = false;
     this._abortSaving = false;
+    // Space Now Empty / Harvest Complete for a dedicated Drying Room
+    // (v1.4.0 Parts 4.2/9) — genuinely independent of the no-dedicated-room
+    // harvest form above.
+    this._showSpaceEmptyConfirm = false;
+    this._spaceEmptySaving = false;
+    this._showDryingHarvestForm = false;
+    this._dryingHarvestUnit = 'g'; // 'g' | 'oz'
+    this._dryingHarvestError = null;
+    this._dryingHarvestReport = null;
   }
 
   set hass(h) { this._hass = h; }
@@ -1362,6 +1428,105 @@ class HelixTabCycle extends HTMLElement {
       }
     }
 
+    // ── Space Now Empty / Harvest Complete for a dedicated Drying Room
+    // (v1.4.0 Parts 4.2/9) — genuinely independent of the harvest section
+    // above: this room's occupancy and this action exist only when a
+    // dedicated Drying Room is configured, and Harvest Complete here
+    // targets that specific transferred batch's cycle_id, not whatever
+    // Primary Grow Space is doing right now.
+    let dryingHandoffHtml = '';
+    if (dedicatedDryingRoom && d.zone2_occupied && !d.drying_occupied) {
+      dryingHandoffHtml = this._showSpaceEmptyConfirm ? `
+        <div class="card" style="border:1px solid var(--hx-amber,#f0a020)">
+          <div class="card-title">📦 Harvest — Space Now Empty</div>
+          <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px">
+            Confirms the current batch has physically moved to the Drying Room. This transfers
+            occupancy only — it does not touch this batch's stage tracking or accumulated data.
+          </div>
+          <div style="display:flex;gap:8px">
+            <button id="confirm-space-empty-btn" ${this._spaceEmptySaving ? 'disabled' : ''} style="flex:1;padding:10px;
+              border-radius:8px;border:none;background:var(--hx-amber,#f0a020);color:#111;font-weight:700;cursor:pointer">
+              ${this._spaceEmptySaving ? 'Saving…' : 'Yes, Space Is Now Empty'}
+            </button>
+            <button id="cancel-space-empty-btn" style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border);
+              background:none;color:var(--hx-text);cursor:pointer">Cancel</button>
+          </div>
+        </div>` : `
+        <div class="card">
+          <div class="card-title">📦 Harvest — Space Now Empty</div>
+          <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px">
+            Once this batch has physically moved to the Drying Room, mark Primary Grow Space
+            empty so it's free for Deep Calibration or a new cycle — independent of this
+            batch's own Harvest Complete, which stays available for it separately later.
+          </div>
+          <button id="open-space-empty-btn" style="width:100%;padding:10px;border-radius:8px;
+            border:1px solid var(--hx-amber,#f0a020);background:none;color:var(--hx-amber,#f0a020);
+            font-weight:700;cursor:pointer">📦 Space Now Empty…</button>
+        </div>`;
+    }
+
+    let dryingHarvestCompleteHtml = '';
+    if (dedicatedDryingRoom && d.drying_occupied) {
+      if (this._dryingHarvestReport) {
+        const r = this._dryingHarvestReport;
+        dryingHarvestCompleteHtml = `
+          <div class="card" style="border:1px solid var(--hx-green,#3ecf6a)">
+            <div class="card-title">🌾 Drying Room Harvest Complete — ${r.record_id}</div>
+            <div class="metric-row"><span class="metric-label">Dry Weight</span>
+              <span class="metric-val">${fn(r.dry_weight_g,1)} g</span></div>
+            <div class="metric-row"><span class="metric-label">$/gram</span>
+              <span class="metric-val">$${fn(r.dollar_per_g,4)}</span></div>
+            <button id="close-drying-harvest-report-btn" style="margin-top:10px;width:100%;padding:9px;
+              border-radius:8px;border:none;background:var(--hx-accent);color:#fff;font-weight:700;
+              cursor:pointer">Close</button>
+          </div>`;
+      } else if (this._showDryingHarvestForm) {
+        dryingHarvestCompleteHtml = `
+          <div class="card" style="border:1px solid var(--hx-green,#3ecf6a)">
+            <div class="card-title">🌾 Harvest Complete — Drying Room</div>
+            ${this._dryingHarvestError ? `<div class="badge bg-red" style="margin-bottom:8px">${this._dryingHarvestError}</div>` : ''}
+            <div style="display:flex;gap:6px;margin-bottom:8px">
+              <button class="drying-harvest-unit-btn ${this._dryingHarvestUnit === 'g' ? 'active' : ''}" data-unit="g"
+                style="flex:1;padding:6px;border-radius:6px;border:1px solid var(--hx-border);cursor:pointer;
+                background:${this._dryingHarvestUnit === 'g' ? 'var(--hx-accent)' : 'none'};
+                color:${this._dryingHarvestUnit === 'g' ? '#fff' : 'var(--hx-text)'}">Grams</button>
+              <button class="drying-harvest-unit-btn ${this._dryingHarvestUnit === 'oz' ? 'active' : ''}" data-unit="oz"
+                style="flex:1;padding:6px;border-radius:6px;border:1px solid var(--hx-border);cursor:pointer;
+                background:${this._dryingHarvestUnit === 'oz' ? 'var(--hx-accent)' : 'none'};
+                color:${this._dryingHarvestUnit === 'oz' ? '#fff' : 'var(--hx-text)'}">Ounces</button>
+            </div>
+            <div class="slider-row">
+              <span class="slider-lbl">Wet Weight (${this._dryingHarvestUnit})</span>
+              <input type="number" id="drying-wet-weight-input" min="0" step="0.1" style="flex:1;padding:6px;
+                border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+            </div>
+            <div class="slider-row">
+              <span class="slider-lbl">Dry Weight (${this._dryingHarvestUnit})</span>
+              <input type="number" id="drying-dry-weight-input" min="0" step="0.1" style="flex:1;padding:6px;
+                border-radius:6px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <button id="archive-drying-harvest-btn" style="flex:1;padding:10px;border-radius:8px;border:none;
+                background:var(--hx-green,#3ecf6a);color:#fff;font-weight:700;cursor:pointer">Archive This Batch</button>
+              <button id="cancel-drying-harvest-btn" style="flex:1;padding:10px;border-radius:8px;
+                border:1px solid var(--hx-border);background:none;color:var(--hx-text);cursor:pointer">Cancel</button>
+            </div>
+          </div>`;
+      } else {
+        dryingHarvestCompleteHtml = `
+          <div class="card" style="border:1px solid var(--hx-green,#3ecf6a)">
+            <div class="card-title">🌾 Harvest Complete — Drying Room</div>
+            <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px">
+              Closes out the batch currently curing in the Drying Room — independent of
+              whatever Primary Grow Space is doing now, even a fresh new cycle.
+            </div>
+            <button id="open-drying-harvest-form-btn" style="width:100%;padding:10px;border-radius:8px;
+              border:none;background:var(--hx-green,#3ecf6a);color:#fff;font-weight:700;
+              cursor:pointer">🌾 Harvest Complete…</button>
+          </div>`;
+      }
+    }
+
     // Stage timeline
     // Drying is fully absent from the clickable timeline (not disabled) once
     // a dedicated Drying Room exists — matching how disabled canopy tiers
@@ -1428,6 +1593,8 @@ class HelixTabCycle extends HTMLElement {
         </div>
       </div>
       ${harvestSectionHtml}
+      ${dryingHandoffHtml}
+      ${dryingHarvestCompleteHtml}
       <!-- Day/Night stage profile editor -->
       ${dryingHiddenNotice ? `
       <div class="card">
@@ -1894,6 +2061,8 @@ class HelixTabCycle extends HTMLElement {
     });
     const confirmAbortBtn = this.shadowRoot.querySelector('#confirm-abort-btn');
     if (confirmAbortBtn) confirmAbortBtn.addEventListener('click', () => this._doAbortCycle());
+
+    this._bindSpaceEmptyAndDryingHarvest();
   }
 
   async _doAbortCycle() {
@@ -1913,6 +2082,94 @@ class HelixTabCycle extends HTMLElement {
       this._abortSaving = false;
       this._render();
     }
+  }
+
+  // ── Space Now Empty (Part 4.2) ────────────────────────────────────────────
+
+  _bindSpaceEmptyAndDryingHarvest() {
+    const openSpaceEmptyBtn = this.shadowRoot.querySelector('#open-space-empty-btn');
+    if (openSpaceEmptyBtn) openSpaceEmptyBtn.addEventListener('click', () => {
+      this._showSpaceEmptyConfirm = true;
+      this._render();
+    });
+    const cancelSpaceEmptyBtn = this.shadowRoot.querySelector('#cancel-space-empty-btn');
+    if (cancelSpaceEmptyBtn) cancelSpaceEmptyBtn.addEventListener('click', () => {
+      this._showSpaceEmptyConfirm = false;
+      this._render();
+    });
+    const confirmSpaceEmptyBtn = this.shadowRoot.querySelector('#confirm-space-empty-btn');
+    if (confirmSpaceEmptyBtn) confirmSpaceEmptyBtn.addEventListener('click', async () => {
+      if (!this._hass) return;
+      this._spaceEmptySaving = true;
+      this._render();
+      try {
+        await this._hass.callWS({ type: 'helix_cultivate/space_now_empty' });
+        this._showSpaceEmptyConfirm = false;
+        const panel = this.closest('helix-panel');
+        if (panel && typeof panel._update === 'function') panel._update();
+      } catch (e) {
+        console.error('Helix Cultivate: space_now_empty failed', e);
+      } finally {
+        this._spaceEmptySaving = false;
+        this._render();
+      }
+    });
+
+    // Harvest Complete — Drying Room (Part 9)
+    const openDryingHarvestBtn = this.shadowRoot.querySelector('#open-drying-harvest-form-btn');
+    if (openDryingHarvestBtn) openDryingHarvestBtn.addEventListener('click', () => {
+      this._showDryingHarvestForm = true;
+      this._render();
+    });
+    const cancelDryingHarvestBtn = this.shadowRoot.querySelector('#cancel-drying-harvest-btn');
+    if (cancelDryingHarvestBtn) cancelDryingHarvestBtn.addEventListener('click', () => {
+      this._showDryingHarvestForm = false;
+      this._render();
+    });
+    this.shadowRoot.querySelectorAll('.drying-harvest-unit-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this._dryingHarvestUnit = btn.dataset.unit;
+        this._render();
+      });
+    });
+    const archiveDryingHarvestBtn = this.shadowRoot.querySelector('#archive-drying-harvest-btn');
+    if (archiveDryingHarvestBtn) archiveDryingHarvestBtn.addEventListener('click', async () => {
+      const wetInput = this.shadowRoot.querySelector('#drying-wet-weight-input');
+      const dryInput = this.shadowRoot.querySelector('#drying-dry-weight-input');
+      const wetRaw = parseFloat(wetInput ? wetInput.value : '');
+      const dryRaw = parseFloat(dryInput ? dryInput.value : '');
+      if (!(wetRaw >= 0) || !(dryRaw >= 0)) {
+        this._dryingHarvestError = 'Enter valid wet and dry weights.';
+        this._render();
+        return;
+      }
+      // Part 9.1: canonical stored unit is grams regardless of entry unit.
+      const OZ_TO_G = 28.3495;
+      const wetWeightG = this._dryingHarvestUnit === 'oz' ? wetRaw * OZ_TO_G : wetRaw;
+      const dryWeightG = this._dryingHarvestUnit === 'oz' ? dryRaw * OZ_TO_G : dryRaw;
+      if (!this._hass) return;
+      this._dryingHarvestError = null;
+      try {
+        const result = await this._hass.callWS({
+          type: 'helix_cultivate/harvest_complete_drying_batch',
+          wet_weight_g: wetWeightG,
+          dry_weight_g: dryWeightG,
+        });
+        this._dryingHarvestReport = result;
+        this._showDryingHarvestForm = false;
+        this._render();
+      } catch (e) {
+        this._dryingHarvestError = (e && e.message) || 'Failed to archive this batch';
+        this._render();
+      }
+    });
+    const closeDryingHarvestReportBtn = this.shadowRoot.querySelector('#close-drying-harvest-report-btn');
+    if (closeDryingHarvestReportBtn) closeDryingHarvestReportBtn.addEventListener('click', () => {
+      this._dryingHarvestReport = null;
+      this._render();
+      const panel = this.closest('helix-panel');
+      if (panel && typeof panel._update === 'function') panel._update();
+    });
   }
 
   // ── Start New Cycle (Part 1.2 / 1.3) ──────────────────────────────────────
@@ -2018,6 +2275,15 @@ customElements.define('helix-tab-cycle', HelixTabCycle);
 
 // ── Zone hardware-picker key definitions ──────────────────────────────────────
 
+// Part 6 (v1.4.0) hardware-mapping reorder — pure layout, no config-key or
+// mapping changes. Sensors stay first (6.1). exhaust_fan, zone2_grow_light,
+// and dli_sensor are marked `manualPlacement: true` and rendered
+// individually elsewhere in the form (6.2/6.3 — Exhaust Fan gets its own
+// heading immediately above Circulation Fan Mapping; Grow Light/DLI Sensor
+// move into the Fixture Type section) rather than in this flat generic
+// block — but they stay in this array (and are still passed to
+// _bindHwPicker) so domain-filtering and entity-picker binding work
+// identically regardless of where their .hw-entity-slot ends up in the DOM.
 const ZONE2_HW_KEYS = [
   { key: 'upper_canopy_temp_sensor',     label: 'Upper Canopy Temp',      domains: ['sensor'] },
   { key: 'upper_canopy_humidity_sensor', label: 'Upper Canopy Humidity',  domains: ['sensor'] },
@@ -2025,13 +2291,13 @@ const ZONE2_HW_KEYS = [
   { key: 'mid_canopy_humidity_sensor',   label: 'Mid Canopy Humidity',    domains: ['sensor'] },
   { key: 'lower_canopy_temp_sensor',     label: 'Lower Canopy Temp',      domains: ['sensor'] },
   { key: 'lower_canopy_humidity_sensor', label: 'Lower Canopy Humidity',  domains: ['sensor'] },
-  { key: 'exhaust_fan',                  label: 'Exhaust Fan',            domains: ['fan', 'switch'] },
-  { key: 'zone2_ac',                     label: 'Zone 2 AC / Cooler',     domains: ['climate', 'switch'] },
+  { key: 'zone2_ac',                     label: 'Zone 2 AirCon',          domains: ['climate', 'switch'], reverseCycleToggle: 'zone2_is_reverse_cycle' },
   { key: 'zone2_heater',                 label: 'Zone 2 Heater',          domains: ['switch', 'climate'] },
   { key: 'zone2_humidifier',             label: 'Zone 2 Humidifier',      domains: ['switch', 'climate'] },
   { key: 'zone2_dehumidifier',           label: 'Zone 2 Dehumidifier',    domains: ['switch', 'climate'] },
-  { key: 'zone2_grow_light',             label: 'Grow Light',             domains: ['light', 'switch'] },
-  { key: 'dli_sensor',                   label: 'DLI / PAR Sensor',       domains: ['sensor'] },
+  { key: 'exhaust_fan',                  label: 'Exhaust Fan',            domains: ['fan', 'switch'], manualPlacement: true },
+  { key: 'zone2_grow_light',             label: 'Grow Light',             domains: ['light', 'switch'], manualPlacement: true },
+  { key: 'dli_sensor',                   label: 'DLI / PAR Sensor',       domains: ['sensor'], manualPlacement: true },
 ];
 
 // Rendered in its own "Supplemental Lighting" sub-section (see
@@ -2045,7 +2311,7 @@ const ZONE2_SUPPLEMENTAL_HW_KEY = {
 const ZONE1_HW_KEYS = [
   { key: 'lung_temp_sensor',     label: 'Conditioning Room Temp',     domains: ['sensor'] },
   { key: 'lung_humidity_sensor', label: 'Conditioning Room Humidity', domains: ['sensor'] },
-  { key: 'zone1_ac',             label: 'Zone 1 AC / Cooler',         domains: ['climate', 'switch'] },
+  { key: 'zone1_ac',             label: 'Zone 1 AirCon',              domains: ['climate', 'switch'], reverseCycleToggle: 'zone1_is_reverse_cycle' },
   { key: 'zone1_heater',         label: 'Zone 1 Heater',              domains: ['switch', 'climate'] },
   { key: 'zone1_humidifier',     label: 'Zone 1 Humidifier',          domains: ['switch', 'climate'] },
   { key: 'zone1_dehumidifier',   label: 'Zone 1 Dehumidifier',        domains: ['switch', 'climate'] },
@@ -2058,7 +2324,7 @@ const DRYING_HW_KEYS = [
   { key: 'drying_exhaust_fan',     label: 'Drying Exhaust Fan',     domains: ['fan', 'switch'] },
   { key: 'drying_circulation_fan', label: 'Drying Circulation Fan', domains: ['fan', 'switch'] },
   { key: 'drying_dehumidifier',    label: 'Drying Dehumidifier',    domains: ['switch', 'climate'] },
-  { key: 'drying_ac',              label: 'Drying AC',              domains: ['climate', 'switch'] },
+  { key: 'drying_ac',              label: 'Drying AirCon',          domains: ['climate', 'switch'], reverseCycleToggle: 'drying_is_reverse_cycle' },
   { key: 'drying_heater',          label: 'Drying Heater',          domains: ['switch', 'climate'] },
   { key: 'drying_light',           label: 'Inspection Light',       domains: ['light', 'switch'] },
 ];
@@ -2153,11 +2419,16 @@ function _entityPickerEl(keyDef, currentVal, hass, onChange) {
   return wrap;
 }
 
-function _hwPickerRow(keyDef, currentVal) {
+function _hwPickerRow(keyDef, currentVal, toggleDef = null) {
+  // Part 5.2: an optional Reverse Cycle toggle rendered directly beside its
+  // AirCon entity picker — one physical device, one entity slot; the
+  // toggle only changes how that same mapped entity is controlled.
+  const toggleHtml = toggleDef ? _hwLayerToggleRow(toggleDef.key, toggleDef.label, toggleDef.checked) : '';
   return `
     <div class="hw-row" style="display:flex;flex-direction:column;gap:2px;margin-bottom:10px">
       <label style="font-size:.75rem;color:var(--hx-text2)">${keyDef.label}</label>
       <div class="hw-entity-slot" data-key="${keyDef.key}" data-current="${currentVal || ''}"></div>
+      ${toggleHtml}
     </div>`;
 }
 
@@ -2357,11 +2628,16 @@ function _bindSupplementalLightingSection(shadowRoot) {
   }
 }
 
-function _renderHwPicker(hwKeys, hwMap, hass, title, extraHtml = '') {
+function _renderHwPicker(hwKeys, hwMap, hass, title, extraHtml = '', toggleValues = {}) {
   return `
     <div class="card">
       <div class="card-title">⚙ ${title} — Hardware Mapping</div>
-      ${hwKeys.map(k => _hwPickerRow(k, hwMap[k.key] || '')).join('')}
+      ${hwKeys.filter(k => !k.manualPlacement).map(k => _hwPickerRow(
+        k, hwMap[k.key] || '',
+        k.reverseCycleToggle
+          ? { key: k.reverseCycleToggle, label: 'Reverse Cycle Unit (supplies both heat and cool)', checked: toggleValues[k.reverseCycleToggle] === true }
+          : null
+      )).join('')}
       ${extraHtml}
       <div style="display:flex;gap:8px;margin-top:12px">
         <button class="hw-save-btn"
@@ -2572,9 +2848,9 @@ class HelixTabGrowspace extends HTMLElement {
           <span style="margin-left:auto;font-size:.7rem;color:var(--hx-text2)">${count}/4 fans</span>
         </div>
         <div class="slider-row">
-          <span class="slider-lbl">Speed</span>
+          <span class="slider-lbl">Speed${breeze ? ' (base)' : ''}</span>
           <input type="range" class="fan-speed" data-tier="${tier}" min="0" max="100" step="10"
-            value="${speed}" ${breeze ? 'disabled style="opacity:.4"' : ''}/>
+            value="${speed}"/>
           <span class="slider-val" id="spd-${tier}">${fPct(speed)}</span>
         </div>
         <div class="toggle-row" style="padding:4px 0">
@@ -2587,7 +2863,7 @@ class HelixTabGrowspace extends HTMLElement {
         </div>
         <div class="slider-row" style="${breeze ? '' : 'opacity:.4'}">
           <span class="slider-lbl">Variance ±</span>
-          <input type="range" class="fan-var" data-tier="${tier}" min="0" max="50" step="1"
+          <input type="range" class="fan-var" data-tier="${tier}" min="0" max="50" step="5"
             value="${variance}" ${breeze ? '' : 'disabled'}/>
           <span class="slider-val" id="var-${tier}">±${fn(variance,0)}%</span>
         </div>
@@ -2621,6 +2897,17 @@ class HelixTabGrowspace extends HTMLElement {
           to prevent microclimates and add stem-strengthening stress. Growing stages only;
           never active during Drying.
         </div>
+        <div class="sec">Conditioning Room Dependency</div>
+        ${_hwLayerToggleRow('zone2_depends_on_conditioning', 'Depends on Conditioning Room', d.zone2_depends_on_conditioning !== false)}
+        <div style="font-size:.7rem;color:var(--hx-text2);margin:-6px 0 4px">
+          On (the safe default) if this space relies on the Conditioning Room for its own
+          baseline climate rather than having its own independent heater/AirCon/dehumidifier —
+          gates whether Conditioning Room is allowed to run Deep Calibration (Environmental
+          Learning) while this space is occupied. Always an explicit choice — never
+          auto-decided silently, since guessing wrong here risks a ruined harvest.
+        </div>
+        <div class="sec">Exhaust Fan</div>
+        ${_hwPickerRow(ZONE2_HW_KEYS.find(k => k.key === 'exhaust_fan'), (d.hw_map || {}).exhaust_fan || '')}
         ${_renderCanopyFanMappingSection(d)}
         <div class="sec">Grow Light Fixture Type</div>
         <select id="hw-light-type-select" style="width:100%;padding:8px;border-radius:8px;
@@ -2643,12 +2930,14 @@ class HelixTabGrowspace extends HTMLElement {
           At this canopy temperature, light intensity is throttled to 50% — a soft step
           strictly below the hard 32°C thermal-runaway cutoff (which forces the light fully off).
         </div>
+        ${_hwPickerRow(ZONE2_HW_KEYS.find(k => k.key === 'zone2_grow_light'), (d.hw_map || {}).zone2_grow_light || '')}
+        ${_hwPickerRow(ZONE2_HW_KEYS.find(k => k.key === 'dli_sensor'), (d.hw_map || {}).dli_sensor || '')}
         ${_renderSupplementalLightingSection(d)}`;
 
       this.shadowRoot.innerHTML = `<style>${BASE_CSS}:host{display:block;}</style>`
         + _renderHwPicker(
             ZONE2_HW_KEYS, d.hw_map || {}, this._hass,
-            d.zone2_name || 'Primary Grow Space', layerToggles
+            d.zone2_name || 'Primary Grow Space', layerToggles, d
           );
       _bindHwPicker(this.shadowRoot, this, [...ZONE2_HW_KEYS, ZONE2_SUPPLEMENTAL_HW_KEY], () => {
         const fields = {};
@@ -3080,7 +3369,7 @@ class HelixTabConditioning extends HTMLElement {
       this.shadowRoot.innerHTML = `<style>${BASE_CSS}:host{display:block;}</style>`
         + _renderHwPicker(
             ZONE1_HW_KEYS, d.hw_map || {}, this._hass,
-            d.zone1_name || 'Conditioning Room', preheatSectionHtml
+            d.zone1_name || 'Conditioning Room', preheatSectionHtml, d
           );
       _bindHwPicker(this.shadowRoot, this, ZONE1_HW_KEYS, () => {
         const fields = {};
@@ -3223,9 +3512,24 @@ class HelixTabDrying extends HTMLElement {
         // and any open entity-picker dropdown aren't torn down.
         return;
       }
+      const dryingDependencyHtml = `
+        <div class="sec">Conditioning Room Dependency</div>
+        ${_hwLayerToggleRow('drying_depends_on_conditioning', 'Depends on Conditioning Room', d.drying_depends_on_conditioning !== false)}
+        <div style="font-size:.7rem;color:var(--hx-text2);margin:-6px 0 4px">
+          On (the safe default) if this room relies on the Conditioning Room for its own
+          baseline climate rather than having its own independent heater/AirCon/dehumidifier —
+          gates whether Conditioning Room is allowed to run Deep Calibration while curing
+          material occupies this room.
+        </div>`;
       this.shadowRoot.innerHTML = `<style>${BASE_CSS}:host{display:block;}</style>`
-        + _renderHwPicker(DRYING_HW_KEYS, d.hw_map || {}, this._hass, d.drying_zone_name || 'Drying Room');
-      _bindHwPicker(this.shadowRoot, this, DRYING_HW_KEYS);
+        + _renderHwPicker(DRYING_HW_KEYS, d.hw_map || {}, this._hass, d.drying_zone_name || 'Drying Room', dryingDependencyHtml, d);
+      _bindHwPicker(this.shadowRoot, this, DRYING_HW_KEYS, () => {
+        const fields = {};
+        this.shadowRoot.querySelectorAll('.hw-layer-toggle').forEach(el => {
+          fields[el.dataset.layer] = el.checked;
+        });
+        return fields;
+      });
       this._hwFormBuilt = true;
       return;
     }
@@ -3416,12 +3720,18 @@ class HelixTabSettings extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
-    this._section = 'modules'; // modules | zone2 | calibration | safety | drying | energy
+    this._section = 'modules'; // modules | zone2 | calibration | safety | drying | energy | learning
     // Energy & ROI's gear-icon edit mode — the only section here that uses
     // the hardware-mapping form pattern, so these flags only ever matter
     // when this._section === 'energy'.
     this._isEditingHardware = false;
     this._hwFormBuilt = false;
+    // Environmental Learning (Part 10) — fetched on-demand when that
+    // section is selected, since it needs live server-side state
+    // (learning_state, active_test, per-zone eligibility) beyond the
+    // regular coordinator data push.
+    this._learningStatus = null;
+    this._learningActionStatus = '';
   }
 
   set hass(h) { this._hass = h; }
@@ -3645,6 +3955,140 @@ class HelixTabSettings extends HTMLElement {
       </div>`;
   }
 
+  // ── Environmental Learning (v1.4.0 Parts 7-10) ──────────────────────────────
+
+  async _fetchLearningStatus() {
+    if (!this._hass) return;
+    try {
+      this._learningStatus = await this._hass.callWS({ type: 'helix_cultivate/get_learning_status' });
+    } catch (e) {
+      console.warn('Helix Cultivate: could not fetch learning status', e);
+      this._learningStatus = null;
+    }
+    this._render();
+  }
+
+  _renderLearningZoneCard(zoneKey, label, occupied, eligible) {
+    const status = this._learningStatus || {};
+    const active = status.active_test;
+    const testRunningHere = active && active.zone === zoneKey;
+    return `
+      <div class="card card-sm">
+        <div class="card-title">${label}</div>
+        <div style="font-size:.75rem;color:var(--hx-text2);margin-bottom:8px">
+          ${occupied
+            ? 'Occupied — Live Actuator Response Testing only.'
+            : 'Unoccupied — both Deep Calibration and Live Actuator Response Testing available.'}
+        </div>
+        ${testRunningHere ? `
+          <div style="font-size:.75rem;background:rgba(32,156,238,.12);border-radius:6px;padding:6px;margin-bottom:8px">
+            🔬 ${active.type === 'deep_calibration' ? 'Deep Calibration' : 'Live Actuator Test'} in progress…
+          </div>
+        ` : `
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="learning-start-btn" data-zone="${zoneKey}" data-type="deep_calibration"
+              ${occupied || !eligible ? 'disabled' : ''}
+              style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border);
+              background:none;color:var(--hx-text);cursor:pointer;font-size:.75rem;
+              ${occupied || !eligible ? 'opacity:.4;cursor:not-allowed' : ''}">Deep Calibration</button>
+            <button class="learning-start-btn" data-zone="${zoneKey}" data-type="live_actuator"
+              style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-accent);
+              background:none;color:var(--hx-accent);cursor:pointer;font-size:.75rem">Live Actuator Test</button>
+          </div>
+        `}
+      </div>`;
+  }
+
+  _renderLearning() {
+    const d = this._data || {};
+    const enabled = d.thermal_learning_enabled === true;
+
+    if (!enabled) {
+      return `
+        <div class="card">
+          <div class="card-title">🧠 Environmental Learning</div>
+          <div style="font-size:.8rem;color:var(--hx-text2);margin-bottom:12px;line-height:1.5">
+            Opt-in, advanced layer that correlates external conditions, time-of-day, and lighting
+            against actuator behavior to eventually refine predictive pre-conditioning with real,
+            site-specific data. Off by default — while off, nothing runs in the background at all.
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-lbl">Enable Environmental Learning</span>
+            <label class="sw">
+              <input type="checkbox" id="learning-master-toggle" />
+              <span class="sw-track"></span>
+              <span class="sw-thumb"></span>
+            </label>
+          </div>
+        </div>`;
+    }
+
+    const status = this._learningStatus || {};
+    const stateLabel = status.learning_state === 'active' ? '✅ Active' : '📖 Learning';
+    const startedAt = status.started_at ? new Date(status.started_at).toLocaleDateString() : '—';
+
+    return `
+      <div class="card">
+        <div class="card-title">🧠 Environmental Learning</div>
+        <div class="toggle-row">
+          <span class="toggle-lbl">Enable Environmental Learning</span>
+          <label class="sw">
+            <input type="checkbox" id="learning-master-toggle" checked />
+            <span class="sw-track"></span>
+            <span class="sw-thumb"></span>
+          </label>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">State</span>
+          <span class="metric-val">${stateLabel}</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-label">Started</span>
+          <span class="metric-val">${startedAt}</span>
+        </div>
+        <div class="sec">Learning Duration</div>
+        <div class="slider-row">
+          <span class="slider-lbl">Days</span>
+          <input type="range" id="learning-duration-slider" min="7" max="30" step="1"
+            value="${d.thermal_learning_duration_days ?? 18}"/>
+          <span class="slider-val" id="learning-duration-val">${d.thermal_learning_duration_days ?? 18}d</span>
+        </div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:2px">
+          Graduates to Active unconditionally after this many days, regardless of what conditions
+          were observed — the model keeps refitting indefinitely afterward, it never freezes.
+        </div>
+        <div id="learning-action-status" style="font-size:.75rem;color:var(--hx-text2);margin-top:8px">
+          ${this._learningActionStatus}
+        </div>
+      </div>
+      <div class="sec">Per-Zone Testing</div>
+      <div class="g3">
+        ${this._renderLearningZoneCard('zone2', '🌱 Primary Grow Space', status.zone2_occupied, true)}
+        ${status.drying_enabled ? this._renderLearningZoneCard('drying', '🍃 Drying Room', status.drying_occupied, true) : ''}
+        ${this._renderLearningZoneCard('conditioning', '🌬 Conditioning Room', false, status.conditioning_eligible !== false)}
+      </div>
+      <div class="card" style="margin-top:10px">
+        <div class="card-title">📡 Optional Data Export</div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-bottom:8px">
+          Best-effort, one-way mirror to an InfluxDB (or InfluxDB-line-protocol-compatible, e.g.
+          VictoriaMetrics) endpoint for building your own Grafana dashboards. Never a dependency —
+          the core learning system is unaffected if this is unset or unreachable.
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-lbl">Enable Export</span>
+          <label class="sw">
+            <input type="checkbox" id="learning-export-toggle" ${d.thermal_learning_export_enabled ? 'checked' : ''} />
+            <span class="sw-track"></span>
+            <span class="sw-thumb"></span>
+          </label>
+        </div>
+        <input type="text" id="learning-export-url" placeholder="http://influxdb.local:8086/api/v2/write?..."
+          value="${d.thermal_learning_export_url || ''}"
+          style="width:100%;padding:8px;border-radius:8px;margin-top:6px;
+          border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+      </div>`;
+  }
+
   _renderEnergy() {
     const h = this._hass;
     const d = this._data || {};
@@ -3705,12 +4149,6 @@ class HelixTabSettings extends HTMLElement {
       : `<div><div style="font-size:.7rem;color:var(--hx-text2)">Previous Cycle</div>
           <div style="font-size:.85rem;color:var(--hx-text2)">No reset yet</div></div>`;
 
-    const roiHtml = d.harvest_value_per_oz != null
-      ? `<div style="margin-top:8px;padding:8px;background:rgba(72,199,142,.1);border-radius:8px;border:1px solid var(--hx-green)">
-           💰 Harvest ROI Target: <b style="color:var(--hx-green)">$${fn(d.harvest_value_per_oz, 2)}/oz</b>
-           &nbsp;·&nbsp; Cycle Cost to Date: <b style="color:var(--hx-amber)">${d.cycle_cost ?? '—'}</b>
-         </div>` : '';
-
     return `
       <div class="card">
         <div class="card-title" style="display:flex;align-items:center">⚡ Energy & ROI ${_gearBtnHtml()}</div>
@@ -3744,7 +4182,6 @@ class HelixTabSettings extends HTMLElement {
             </div>
           </div>
         </div>
-        ${roiHtml}
         <div style="display:flex;align-items:center;gap:10px;margin-top:12px">
           <button id="energy-reset-btn" style="padding:9px 16px;border-radius:8px;border:1px solid var(--hx-border);
             background:none;color:var(--hx-text);font-weight:600;cursor:pointer">♻ Reset Cycle Totals</button>
@@ -3945,6 +4382,7 @@ class HelixTabSettings extends HTMLElement {
       safety:      this._renderSafety(),
       drying:      this._renderDryingSettings(),
       energy:      this._renderEnergy(),
+      learning:    this._renderLearning(),
     }[this._section] || '';
 
     this.shadowRoot.innerHTML = `
@@ -3967,6 +4405,7 @@ class HelixTabSettings extends HTMLElement {
         ${this._sectionBtn('safety',      '🛡 Safety')}
         ${this._sectionBtn('drying',      '🍃 Drying')}
         ${this._sectionBtn('energy',      '⚡ Energy & ROI')}
+        ${this._sectionBtn('learning',    '🧠 Environmental Learning')}
       </div>
       ${sectionContent}
       <!-- Export / Import Config -->
@@ -4028,6 +4467,7 @@ class HelixTabSettings extends HTMLElement {
     this.shadowRoot.querySelectorAll('.sec-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         this._section = btn.dataset.sec;
+        if (this._section === 'learning') this._fetchLearningStatus();
         this._render();
       });
     });
@@ -4142,6 +4582,88 @@ class HelixTabSettings extends HTMLElement {
         }
       });
     }
+
+    // Environmental Learning (Part 10) — only present when
+    // this._section === 'learning'; querySelector is a safe no-op otherwise.
+    const learningToggle = this.shadowRoot.querySelector('#learning-master-toggle');
+    if (learningToggle) {
+      learningToggle.addEventListener('change', async e => {
+        const entryId = (this._data || {}).entry_id;
+        if (!this._hass || !entryId) return;
+        try {
+          await this._hass.callWS({
+            type: 'helix_cultivate/update_settings_fields',
+            entry_id: entryId,
+            fields: { thermal_learning_enabled: e.target.checked },
+          });
+          if (e.target.checked) this._fetchLearningStatus();
+        } catch (err) {
+          console.error('Helix Cultivate: thermal_learning_enabled save failed', err);
+        }
+      });
+    }
+    const durationSl = this.shadowRoot.querySelector('#learning-duration-slider');
+    const durationVl = this.shadowRoot.querySelector('#learning-duration-val');
+    if (durationSl) {
+      durationSl.addEventListener('input', e => {
+        if (durationVl) durationVl.textContent = `${e.target.value}d`;
+      });
+      durationSl.addEventListener('change', async e => {
+        const entryId = (this._data || {}).entry_id;
+        if (!this._hass || !entryId) return;
+        try {
+          await this._hass.callWS({
+            type: 'helix_cultivate/update_settings_fields',
+            entry_id: entryId,
+            fields: { thermal_learning_duration_days: parseInt(e.target.value, 10) },
+          });
+        } catch (err) {
+          console.error('Helix Cultivate: thermal_learning_duration_days save failed', err);
+        }
+      });
+    }
+    const exportToggle = this.shadowRoot.querySelector('#learning-export-toggle');
+    const exportUrlInput = this.shadowRoot.querySelector('#learning-export-url');
+    const saveExportFields = async () => {
+      const entryId = (this._data || {}).entry_id;
+      if (!this._hass || !entryId) return;
+      try {
+        await this._hass.callWS({
+          type: 'helix_cultivate/update_settings_fields',
+          entry_id: entryId,
+          fields: {
+            thermal_learning_export_enabled: exportToggle ? exportToggle.checked : false,
+            thermal_learning_export_url: exportUrlInput ? exportUrlInput.value : '',
+          },
+        });
+      } catch (err) {
+        console.error('Helix Cultivate: learning export settings save failed', err);
+      }
+    };
+    if (exportToggle) exportToggle.addEventListener('change', saveExportFields);
+    if (exportUrlInput) exportUrlInput.addEventListener('change', saveExportFields);
+
+    this.shadowRoot.querySelectorAll('.learning-start-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!this._hass || btn.disabled) return;
+        const zone = btn.dataset.zone;
+        const type = btn.dataset.type;
+        this._learningActionStatus = 'Starting…';
+        this._render();
+        try {
+          await this._hass.callWS({
+            type: type === 'deep_calibration'
+              ? 'helix_cultivate/start_deep_calibration'
+              : 'helix_cultivate/start_live_actuator_test',
+            zone,
+          });
+          this._learningActionStatus = '✅ Test started';
+        } catch (err) {
+          this._learningActionStatus = `❌ ${err.message || 'Could not start test'}`;
+        }
+        await this._fetchLearningStatus();
+      });
+    });
 
     // Energy & ROI — gear icon and Reset button (only present when
     // this._section === 'energy'; querySelector is a safe no-op otherwise).
@@ -4390,6 +4912,22 @@ class HelixPanel extends HTMLElement {
       zone2_height_m:   this._attr('exhaust_speed', 'sensor', 'zone2_height_m')   ?? 2.0,
       zone2_plant_count: this._attr('exhaust_speed', 'sensor', 'zone2_plant_count') ?? 4,
 
+      // Reverse Cycle Unit toggles (v1.4.0 Part 5.2)
+      zone1_is_reverse_cycle: this._attr('exhaust_speed', 'sensor', 'zone1_is_reverse_cycle') === true,
+      zone2_is_reverse_cycle: this._attr('exhaust_speed', 'sensor', 'zone2_is_reverse_cycle') === true,
+      drying_is_reverse_cycle: this._attr('exhaust_speed', 'sensor', 'drying_is_reverse_cycle') === true,
+      // Cross-zone dependency flags (v1.4.0 Part 3.1)
+      zone2_depends_on_conditioning: this._attr('exhaust_speed', 'sensor', 'zone2_depends_on_conditioning') !== false,
+      drying_depends_on_conditioning: this._attr('exhaust_speed', 'sensor', 'drying_depends_on_conditioning') !== false,
+      // Environmental Learning System (v1.4.0 Parts 7-10)
+      thermal_learning_enabled: this._attr('exhaust_speed', 'sensor', 'thermal_learning_enabled') === true,
+      thermal_learning_duration_days: this._attr('exhaust_speed', 'sensor', 'thermal_learning_duration_days') ?? 18,
+      thermal_learning_export_enabled: this._attr('exhaust_speed', 'sensor', 'thermal_learning_export_enabled') === true,
+      thermal_learning_export_url: this._attr('exhaust_speed', 'sensor', 'thermal_learning_export_url') ?? '',
+      // Zone occupancy (v1.4.0 Part 4)
+      zone2_occupied: this._attr('exhaust_speed', 'sensor', 'zone2_occupied') === true,
+      drying_occupied: this._attr('exhaust_speed', 'sensor', 'drying_occupied') === true,
+
       // Independent canopy sensor/fan layer toggles (mid/lower only — upper
       // is the mandatory primary layer for both, no toggle)
       mid_canopy_sensor_enabled: this._attr('exhaust_speed', 'sensor', 'mid_canopy_sensor_enabled') ?? true,
@@ -4488,6 +5026,8 @@ class HelixPanel extends HTMLElement {
 
       // Sensor Dropout badge detail (Part 2.1)
       sensor_dropout_entities: this._attr('upper_canopy_temp', 'sensor', 'sensor_dropout_entities') ?? [],
+      // Actuator dropout badge detail/severity (Part 1.2, v1.4.0)
+      actuator_dropout_entities: this._attr('upper_canopy_temp', 'sensor', 'actuator_dropout_entities') ?? [],
 
       // v1.2.8 feature settings, now exposed for editing (Part 3)
       light_high_temp_dim_c: this._attr('exhaust_speed', 'sensor', 'light_high_temp_dim_c') ?? 29.0,

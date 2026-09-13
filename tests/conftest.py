@@ -82,6 +82,11 @@ def mock_coord():
     coord._is_fan_tier_enabled = MagicMock(return_value=True)
     coord._apply_fan_speed_to_tier = AsyncMock()
 
+    # ── Environmental Learning (Part 7) — disabled by default in tests, so
+    # existing control-loop tests aren't short-circuited by a MagicMock's
+    # default truthy return value. ─────────────────────────────────────────
+    coord.is_deep_calibration_active = MagicMock(return_value=False)
+
     # ── fire-once-per-episode notification guards ──────────────────────────
     # Real explicit bools (not left to MagicMock auto-vivification, which
     # would return a truthy child Mock and silently skip the "not yet

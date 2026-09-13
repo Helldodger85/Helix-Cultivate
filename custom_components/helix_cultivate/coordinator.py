@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import uuid
 from collections import deque
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Optional
@@ -31,8 +32,12 @@ from .const import (
     CONF_EM_ZONE1_ENABLED, CONF_EM_ZONE2_ENABLED, CONF_EM_DRYING_ENABLED,
     DEFAULT_EM_ZONE_ENABLED,
     CONF_ENABLE_CONDITIONING_ROOM,
+    CONF_THERMAL_LEARNING_ENABLED,
+    DEFAULT_THERMAL_LEARNING_ENABLED,
     CONF_ENABLE_DRYING_ENVIRONMENT,
     CONF_EXHAUST_FAN,
+    CONF_ZONE2_AC,
+    CONF_ZONE2_HEATER,
     CONF_EXHAUST_MIN_PCT,
     CONF_GROW_CAMERA,
     CONF_ZONE2_GROW_LIGHT,
@@ -174,6 +179,15 @@ from .const import (
     STAGE_TRANSITION_TIPS,
     # Cycle lifecycle (Part 1)
     CONF_CYCLE_STATE,
+    CONF_DRYING_CYCLE_ID,
+    CONF_DRYING_DEPENDS_ON_CONDITIONING,
+    CONF_DRYING_OCCUPIED,
+    CONF_ZONE2_CYCLE_ID,
+    CONF_ZONE2_DEPENDS_ON_CONDITIONING,
+    CONF_ZONE2_OCCUPIED,
+    DEFAULT_DEPENDS_ON_CONDITIONING,
+    DEFAULT_DRYING_OCCUPIED,
+    DEFAULT_ZONE2_OCCUPIED,
     CONF_STAGE_START_DATE,
     CYCLE_STATE_ACTIVE,
     CYCLE_STATE_NOT_STARTED,
@@ -273,10 +287,16 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._breeze_tasks: dict[str, asyncio.Task] = {}
 
         # ── Fan speed state per tier (0–100) ──────────────────────────────────
+        # Part 1.6: read the persisted base speed back from config (matching
+        # the breeze_variance_{tier} convention) — previously this always
+        # started at the coded default and set_fan_speed() never persisted
+        # its writes, so ANY unrelated settings change that triggered a
+        # config-entry reload (rebuilding this coordinator from scratch)
+        # silently reverted a manually-set fan speed back to 50%.
         self._fan_speeds: dict[str, float] = {
-            FAN_TIER_UPPER: float(DEFAULT_FAN_SPEED_PCT),
-            FAN_TIER_MID: float(DEFAULT_FAN_SPEED_PCT),
-            FAN_TIER_LOWER: float(DEFAULT_FAN_SPEED_PCT),
+            FAN_TIER_UPPER: float(self._config.get(f"fan_speed_{FAN_TIER_UPPER}", DEFAULT_FAN_SPEED_PCT)),
+            FAN_TIER_MID: float(self._config.get(f"fan_speed_{FAN_TIER_MID}", DEFAULT_FAN_SPEED_PCT)),
+            FAN_TIER_LOWER: float(self._config.get(f"fan_speed_{FAN_TIER_LOWER}", DEFAULT_FAN_SPEED_PCT)),
         }
 
         # ── Anti-short-cycle compressor timers ────────────────────────────────
@@ -328,6 +348,13 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._humid_on_since: dict[str, Optional[datetime]] = {
             "zone1": None, "zone2": None, "drying": None,
         }
+        # Part 5.5 (v1.4.0): dwell timer for the backup heater's "primary
+        # source is falling behind" condition — same pattern as
+        # _dehumid_on_since/_humid_on_since above.
+        self._backup_heater_falling_behind_since: Optional[datetime] = None
+        # Part 7.5 (v1.4.0): last passive-log timestamp per zone, keyed by
+        # zone label — rate-limits Environmental Learning's hourly logging.
+        self._learning_last_log: dict[str, datetime] = {}
 
         # ── Appliance dropout watchdog (Phase 10B) ────────────────────────────
         # Keys are role strings: "zone1_heater", "zone1_dehumid", etc.
@@ -1362,6 +1389,31 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._appliance_dropout_alerted[role] = False
         return False
 
+    def _actuator_dropout_status(self) -> tuple[bool, list[str]]:
+        """Part 1.2: whether any Primary Grow Space actuator — heater, AC/
+        Reverse Cycle, or exhaust fan — is currently past the 5-minute
+        dropout threshold, and which mapped entity IDs are affected.
+
+        Used to escalate the dashboard's sensor-dropout badge from amber to
+        red: losing control of hardware (can't heat/cool/exhaust) is more
+        urgent than losing a passive reading. Recomputed fresh from
+        `_appliance_unavail_since` rather than cached, since that dict is
+        only ever written from within climate_engine's own control calls.
+        """
+        role_to_conf = {
+            "zone2_heater": CONF_ZONE2_HEATER,
+            "zone2_ac": CONF_ZONE2_AC,
+            "exhaust": CONF_EXHAUST_FAN,
+        }
+        entities: list[str] = []
+        for role, conf_key in role_to_conf.items():
+            since = self._appliance_unavail_since.get(role)
+            if since is not None and (dt_util.utcnow() - since) >= timedelta(minutes=5):
+                entity_id = self._get(conf_key)
+                if entity_id:
+                    entities.append(entity_id)
+        return bool(entities), entities
+
     async def _raise_appliance_dropout_notification(self, role: str, entity_id: str) -> None:
         """Raise a critical notification for a dropped-out appliance entity."""
         await self._notify_critical(
@@ -1571,6 +1623,73 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Helix Cultivate: failed to set fan %s to %.0f%%: %s",
                     entity_id, clamped, exc,
                 )
+
+    def _current_zone_temp_for_learning(self, zone: str) -> Optional[float]:
+        """Current temperature reading for a learning-system zone label,
+        read from the last-assembled tick data — used to snapshot a Deep
+        Calibration test's starting point without a second live sensor read."""
+        climate = (self.data or {}).get(NS_CLIMATE, {})
+        return {
+            "zone2": climate.get("upper_temp_c"),
+            "conditioning": climate.get("lung_temp_c"),
+            "drying": climate.get("drying_temp_c"),
+        }.get(zone)
+
+    def is_deep_calibration_active(self, zone: str) -> bool:
+        """Cheap, always-safe check used by climate_engine on every tick —
+        False immediately whenever Environmental Learning is disabled, so
+        this costs nothing for the overwhelming majority of installs."""
+        if not self._get(CONF_THERMAL_LEARNING_ENABLED, DEFAULT_THERMAL_LEARNING_ENABLED):
+            return False
+        from .learning_engine import LearningEngine
+
+        return LearningEngine(self).is_deep_calibration_active(zone)
+
+    async def _run_environmental_learning_tick(
+        self,
+        upper_canopy_temp: Optional[float],
+        lung_temp: Optional[float],
+        outdoor_temp: Optional[float],
+    ) -> None:
+        """Part 7: entirely inert (no import even happens meaningfully
+        beyond this early return) whenever the master toggle is off —
+        zero background logging, zero scheduled tests, zero influence."""
+        if not self._get(CONF_THERMAL_LEARNING_ENABLED, DEFAULT_THERMAL_LEARNING_ENABLED):
+            return
+
+        from .learning_engine import LearningEngine
+
+        engine = LearningEngine(self)
+        await engine.ensure_started()
+        engine.maybe_graduate_to_active()
+
+        drying_temp: Optional[float] = None
+        if self._get(CONF_ENABLE_DRYING_ENVIRONMENT, False):
+            drying_temp = self._read_sensor(self._get(CONF_DRYING_TEMP_SENSOR))
+
+        lights_on = bool((self.data or {}).get(NS_CLIMATE, {}).get("lights_on", False))
+        light_pct = float(self.light_intensity_pct or 0.0)
+
+        await engine.maybe_log_hourly(
+            "zone2", outdoor_temp, upper_canopy_temp,
+            self._fan_speeds.get(FAN_TIER_UPPER, 0.0), lights_on, light_pct,
+            self._get(CONF_ZONE2_CYCLE_ID),
+        )
+        if self._get(CONF_ENABLE_CONDITIONING_ROOM, False):
+            await engine.maybe_log_hourly(
+                "conditioning", outdoor_temp, lung_temp, 0.0, lights_on, light_pct, None,
+            )
+        if drying_temp is not None:
+            await engine.maybe_log_hourly(
+                "drying", outdoor_temp, drying_temp, 0.0, lights_on, light_pct,
+                self._get(CONF_DRYING_CYCLE_ID),
+            )
+
+        await engine.tick_active_test({
+            "zone2": upper_canopy_temp,
+            "conditioning": lung_temp,
+            "drying": drying_temp,
+        })
 
     def _manage_breeze_tasks(self) -> None:
         """Start/stop each tier's breeze loop to match its enabled state
@@ -1800,6 +1919,13 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # just (re)started for a tier it's about to take over, rather than
         # the two fighting over the same fan.
         await self._manage_wind_sweep()
+
+        # ── Environmental Learning System (Part 7) — fully inert when the
+        # master toggle is off; nothing below this line runs at all in
+        # that case.
+        await self._run_environmental_learning_tick(
+            upper_canopy_temp, lung_temp, climate_state.get("outdoor_temp_c")
+        )
 
         # ── Lights-off day boundary: DLI target alert + reset ───────────────────
         # Must run BEFORE _lights_state_prev is overwritten below — the
@@ -2063,8 +2189,16 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ── Public setpoint mutators (called by number/select entities) ───────────
 
     def set_fan_speed(self, tier: str, speed_pct: float) -> None:
-        """Update the base fan speed for a tier and apply immediately."""
+        """Update the base fan speed for a tier, persist it, and apply
+        immediately unless Breeze is currently driving this tier's speed."""
         self._fan_speeds[tier] = max(0.0, min(100.0, speed_pct))
+        # Part 1.6: persist so this survives a config-entry reload triggered
+        # by an unrelated settings change elsewhere in the panel — this was
+        # previously an in-memory-only coordinator attribute, exactly the
+        # bug pattern already fixed for the Breeze switches last session.
+        config_key = f"fan_speed_{tier}"
+        self._config[config_key] = self._fan_speeds[tier]
+        self.queue_option_write(config_key, self._fan_speeds[tier])
         if not getattr(self, f"breeze_{tier}_enabled", False):
             self.hass.async_create_task(
                 self._apply_fan_speed_to_tier(tier, self._fan_speeds[tier])
@@ -2145,18 +2279,36 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return round((in_range / len(self._vpd_history)) * 100.0, 1)
 
-    async def close_out_harvest(self, wet_weight_g: float, dry_weight_g: float) -> dict[str, Any]:
-        """Archive the completed grow cycle, reset all cycle counters and the
-        stage machine, and return the full harvest record (including the
-        newly-assigned record_id) for the frontend Harvest Report.
-
-        Raises ValueError on schema violation (propagated from journal_store).
+    async def _finalize_harvest_record(
+        self,
+        wet_weight_g: float,
+        dry_weight_g: float,
+        *,
+        cycle_id: Optional[str] = None,
+        cycle_kwh: Optional[float] = None,
+        cycle_cost: Optional[float] = None,
+        stage_durations: Optional[dict[str, int]] = None,
+    ) -> dict[str, Any]:
+        """Shared record-building/archiving logic for both close_out_harvest()
+        (no dedicated Drying Room — the only cycle ever in flight) and
+        harvest_complete_drying_batch() (Part 4.4: closing out one specific
+        batch that may be concurrent with a newer, unrelated cycle already
+        running in Primary Grow Space). Deliberately does NOT touch
+        occupancy flags or stage-machine state — callers own that, since
+        the two paths differ there. cycle_kwh/cycle_cost/stage_durations
+        default to the live global counters/current stage (the
+        no-dedicated-room case, where there is only ever one cycle) but
+        accept explicit overrides so a concurrent drying batch is costed
+        and duration-tracked from its own isolated snapshot instead.
         """
         harvest_value_oz = float(self._get(CONF_HARVEST_VALUE_PER_OZ, DEFAULT_HARVEST_VALUE))
         dry_oz = dry_weight_g / 28.3495 if dry_weight_g else 0.0
         revenue = dry_oz * harvest_value_oz
-        cost = (self.data or {}).get(NS_ENERGY, {}).get("cycle_cost_usd", self._cycle_cost)
-        dollar_per_g = (cost / dry_weight_g) if dry_weight_g > 0 else 0.0
+        if cycle_kwh is None:
+            cycle_kwh = self._cycle_kwh
+        if cycle_cost is None:
+            cycle_cost = (self.data or {}).get(NS_ENERGY, {}).get("cycle_cost_usd", self._cycle_cost)
+        dollar_per_g = (cycle_cost / dry_weight_g) if dry_weight_g > 0 else 0.0
 
         journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
         if journal is None:
@@ -2179,11 +2331,15 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timelapse_gif_url = f"/local/{rel_dir}/{gif_filename}"
 
         harvest_data: dict[str, Any] = {
+            "cycle_id": cycle_id,
             "wet_weight_g": wet_weight_g,
             "dry_weight_g": dry_weight_g,
-            "cycle_kwh": self._cycle_kwh,
-            "cycle_cost_usd": cost,
-            "stage_durations": self.stage_manager.actual_stage_durations(),
+            "cycle_kwh": cycle_kwh,
+            "cycle_cost_usd": cycle_cost,
+            "stage_durations": (
+                stage_durations if stage_durations is not None
+                else self.stage_manager.actual_stage_durations()
+            ),
             "vpd_in_range_pct": self._vpd_in_range_pct(),
             "dollar_per_g": round(dollar_per_g, 4),
             "revenue_usd": round(revenue, 2),
@@ -2200,8 +2356,9 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "helix_cultivate_harvest_complete",
             {
                 "entry_id": self._entry.entry_id,
+                "cycle_id": cycle_id,
                 "dry_weight_g": dry_weight_g,
-                "cycle_cost_usd": cost,
+                "cycle_cost_usd": cycle_cost,
                 "dollars_per_gram": round(dollar_per_g, 4),
             },
         )
@@ -2209,7 +2366,38 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Archive this cycle's energy totals as Previous Cycle (2.7) — a full
         # harvest close-out counts as "the last reset" for that display, same
         # as the dedicated Reset button.
-        await journal.async_set_previous_cycle_energy(self._entry.entry_id, self._cycle_kwh, cost)
+        await journal.async_set_previous_cycle_energy(self._entry.entry_id, cycle_kwh, cycle_cost)
+
+        await self._notify_critical(
+            title="Helix Cultivate — Harvest Archived",
+            message=(
+                f"Cycle archived as {record_id}. {dry_weight_g:.1f}g dry at "
+                f"${dollar_per_g:.2f}/g."
+            ),
+            level="info",
+        )
+
+        return {**harvest_data, "record_id": record_id}
+
+    async def close_out_harvest(self, wet_weight_g: float, dry_weight_g: float) -> dict[str, Any]:
+        """Archive the completed grow cycle, reset all cycle counters and the
+        stage machine, and return the full harvest record (including the
+        newly-assigned record_id) for the frontend Harvest Report.
+
+        The no-dedicated-Drying-Room path (Part 4.5) — material never
+        physically leaves Primary Grow Space during Drying, so there is
+        only ever one cycle in flight and this resets every global counter.
+        See harvest_complete_drying_batch() for the dedicated-room path,
+        which must NOT reset these since an unrelated, concurrent cycle may
+        already be running in Primary Grow Space by the time this fires.
+
+        Raises ValueError on schema violation (propagated from journal_store).
+        """
+        cycle_id = self._get(CONF_ZONE2_CYCLE_ID)
+        harvest_data = await self._finalize_harvest_record(
+            wet_weight_g, dry_weight_g, cycle_id=cycle_id
+        )
+        cost = harvest_data["cycle_cost_usd"]
 
         # Reset cycle counters. _cycle_cost must be reset explicitly here too
         # (not just _cycle_kwh) — _accumulate_energy() now accumulates cost
@@ -2235,23 +2423,20 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # grower action is always an explicit Start New Cycle, never a
         # silent Germination Day-0 reactivation the instant this closes.
         self.stage_manager.return_to_not_started()
+        self._config[CONF_ZONE2_OCCUPIED] = False
         new_options = {
             **self._entry.options,
             CONF_CYCLE_STATE: CYCLE_STATE_NOT_STARTED,
             "current_stage": self.stage_manager.current_stage,
+            # Part 4.5: this is the no-dedicated-Drying-Room path — material
+            # never physically leaves Primary Grow Space during Drying, so
+            # this close-out is the only point at which the space actually
+            # becomes empty again.
+            CONF_ZONE2_OCCUPIED: False,
         }
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
 
-        await self._notify_critical(
-            title="Helix Cultivate — Harvest Archived",
-            message=(
-                f"Cycle archived as {record_id}. {dry_weight_g:.1f}g dry at "
-                f"${dollar_per_g:.2f}/g."
-            ),
-            level="info",
-        )
-
-        return {**harvest_data, "record_id": record_id}
+        return harvest_data
 
     # ── Cycle lifecycle (Part 1) ─────────────────────────────────────────────
 
@@ -2286,12 +2471,22 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._config[CONF_GROWTH_MODE] = growth_mode
         self.stage_manager.start_new_cycle(starting_stage, parsed_date)
 
+        # Part 4.1: a fresh cycle_id per cycle, and Primary Grow Space is now
+        # physically occupied — independent of cycle_state, which tracks
+        # whether a batch is being tracked at all, not whether the space
+        # itself currently holds plant material.
+        new_cycle_id = uuid.uuid4().hex[:12]
+        self._config[CONF_ZONE2_CYCLE_ID] = new_cycle_id
+        self._config[CONF_ZONE2_OCCUPIED] = True
+
         new_options = {
             **self._entry.options,
             CONF_GROWTH_MODE: growth_mode,
             "current_stage": starting_stage,
             CONF_STAGE_START_DATE: parsed_date.isoformat(),
             CONF_CYCLE_STATE: CYCLE_STATE_ACTIVE,
+            CONF_ZONE2_CYCLE_ID: new_cycle_id,
+            CONF_ZONE2_OCCUPIED: True,
         }
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
 
@@ -2313,10 +2508,12 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         "not_started" so the next action is an explicit Start New Cycle.
         """
         self.stage_manager.return_to_not_started()
+        self._config[CONF_ZONE2_OCCUPIED] = False
         new_options = {
             **self._entry.options,
             CONF_CYCLE_STATE: CYCLE_STATE_NOT_STARTED,
             "current_stage": self.stage_manager.current_stage,
+            CONF_ZONE2_OCCUPIED: False,
         }
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
 
@@ -2324,6 +2521,167 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "helix_cultivate_cycle_aborted",
             {"entry_id": self._entry.entry_id},
         )
+
+    # ── Zone occupancy (Part 4) ─────────────────────────────────────────────────
+
+    def is_zone2_occupied(self) -> bool:
+        """Primary Grow Space occupancy — physically holds plant material
+        right now, independent of cycle_state (which only tracks whether a
+        batch is being tracked at all)."""
+        return bool(self._get(CONF_ZONE2_OCCUPIED, DEFAULT_ZONE2_OCCUPIED))
+
+    def is_drying_occupied(self) -> bool:
+        """Dedicated Drying Room occupancy — only ever meaningful when
+        enable_drying_environment is True; always False otherwise (there is
+        no separate room to be occupied)."""
+        if not self._get(CONF_ENABLE_DRYING_ENVIRONMENT, False):
+            return False
+        return bool(self._get(CONF_DRYING_OCCUPIED, DEFAULT_DRYING_OCCUPIED))
+
+    # ── Conditioning Room calibration eligibility (Part 3) ──────────────────────
+    #
+    # Corrects an earlier design that gated Conditioning Room's own Deep
+    # Calibration eligibility on ITS OWN occupancy — but Conditioning Room
+    # never has plants, so that gate was always trivially true and missed
+    # the actual risk: a dependent zone (Primary Grow Space, or a
+    # dependent Drying Room) being destabilized by Conditioning Room
+    # deliberately cutting its own actuator control during calibration.
+    # Consumed by the Environmental Learning System (Part 7) — nothing
+    # calls this yet on its own, since Deep Calibration doesn't exist
+    # until Part 7 builds it, but the gating rule is correct and testable
+    # in isolation now.
+
+    def conditioning_room_dependent_zones(self) -> list[str]:
+        """Return which zones (by FAN_TIER-style identifier: "zone2",
+        "drying") are flagged as depending on Conditioning Room for their
+        own baseline climate — per Part 3.1, always an explicit, confirmed
+        per-zone toggle, never silently inferred at read-time. Drying is
+        only ever included when a dedicated Drying Room actually exists."""
+        dependents: list[str] = []
+        if self._get(CONF_ZONE2_DEPENDS_ON_CONDITIONING, DEFAULT_DEPENDS_ON_CONDITIONING):
+            dependents.append("zone2")
+        if self._get(CONF_ENABLE_DRYING_ENVIRONMENT, False) and self._get(
+            CONF_DRYING_DEPENDS_ON_CONDITIONING, DEFAULT_DEPENDS_ON_CONDITIONING
+        ):
+            dependents.append("drying")
+        return dependents
+
+    def is_conditioning_room_calibration_eligible(self) -> bool:
+        """Part 3.2: Conditioning Room may only run Deep Calibration when
+        EVERY zone flagged as depending on it (per conditioning_room_
+        dependent_zones()) is currently unoccupied. If Drying Room depends
+        on Conditioning Room and is currently occupied by curing material,
+        Conditioning Room is restricted to Live Actuator Response Testing
+        only, regardless of Primary Grow Space's own occupancy state.
+        Always re-evaluated fresh from current occupancy — never cached.
+        """
+        occupancy_by_zone = {
+            "zone2": self.is_zone2_occupied(),
+            "drying": self.is_drying_occupied(),
+        }
+        return not any(
+            occupancy_by_zone[zone] for zone in self.conditioning_room_dependent_zones()
+        )
+
+    async def space_now_empty(self) -> None:
+        """"Harvest — Space Now Empty" (Part 4.2). Only valid when a
+        dedicated Drying Room is configured — without one, material never
+        physically leaves Primary Grow Space during Drying, so there is
+        nothing to transfer (the frontend never shows this action in that
+        topology; this check is the backend's own defense-in-depth copy of
+        that same rule).
+
+        Transfers occupancy — Primary Grow Space becomes unoccupied and
+        Drying Room becomes occupied by this same batch — WITHOUT touching
+        the batch's cycle_id, its stage tracking (current_stage/
+        stage_start_date keep advancing exactly as before — this is not a
+        reset), or any accumulated data. The only lasting record of the
+        transfer is CONF_DRYING_CYCLE_ID, so harvest_complete_drying_batch()
+        later knows which cycle_id it's closing out.
+        """
+        if not self._get(CONF_ENABLE_DRYING_ENVIRONMENT, False):
+            raise ValueError(
+                "space_now_empty() requires a dedicated Drying Room "
+                "(enable_drying_environment) — without one, drying happens "
+                "in Primary Grow Space itself and there is nothing to "
+                "transfer."
+            )
+        cycle_id = self._get(CONF_ZONE2_CYCLE_ID)
+
+        # Snapshot this batch's stage-duration history now, while
+        # stage_manager still represents it — by the time
+        # harvest_complete_drying_batch() runs, Primary Grow Space may
+        # already be tracking a different, newer cycle_id, so reading
+        # stage_manager live at that point would attribute the wrong
+        # batch's durations to this one.
+        journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
+        if journal is not None:
+            await journal.open_drying_batch(cycle_id, {
+                "stage_durations_snapshot": self.stage_manager.actual_stage_durations(),
+                "moved_to_drying_at": dt_util.utcnow().isoformat(),
+            })
+
+        self._config[CONF_ZONE2_OCCUPIED] = False
+        self._config[CONF_DRYING_OCCUPIED] = True
+        self._config[CONF_DRYING_CYCLE_ID] = cycle_id
+        new_options = {
+            **self._entry.options,
+            CONF_ZONE2_OCCUPIED: False,
+            CONF_DRYING_OCCUPIED: True,
+            CONF_DRYING_CYCLE_ID: cycle_id,
+        }
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+
+        self.hass.bus.async_fire(
+            "helix_cultivate_space_now_empty",
+            {"entry_id": self._entry.entry_id, "cycle_id": cycle_id},
+        )
+
+    async def harvest_complete_drying_batch(
+        self, wet_weight_g: float, dry_weight_g: float
+    ) -> dict[str, Any]:
+        """"Harvest Complete" (Part 9) for the batch currently occupying the
+        dedicated Drying Room — closes out CONF_DRYING_CYCLE_ID specifically
+        and frees Drying Room's occupancy (Part 4.3: this is the only thing
+        that clears it — never stage-tracking completion alone). Entirely
+        independent of whatever Primary Grow Space is doing at the moment
+        this is called — a fresh cycle_id may already be germinating there
+        concurrently.
+        """
+        if not self.is_drying_occupied():
+            raise ValueError(
+                "No batch is currently occupying the Drying Room — nothing to close out."
+            )
+        cycle_id = self._get(CONF_DRYING_CYCLE_ID)
+
+        journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
+        snapshot = journal.get_open_drying_batch(cycle_id) if journal is not None else None
+        stage_durations = (
+            snapshot.get("stage_durations_snapshot") if snapshot is not None else None
+        )
+
+        # Uses the Drying-specific energy accumulators, not the global
+        # zone2 ones — an unrelated, concurrent cycle may already be
+        # running in Primary Grow Space and must not be affected by this.
+        harvest_data = await self._finalize_harvest_record(
+            wet_weight_g, dry_weight_g,
+            cycle_id=cycle_id,
+            cycle_kwh=self._drying_cycle_kwh,
+            cycle_cost=self._drying_cycle_cost,
+            stage_durations=stage_durations,
+        )
+        self._drying_cycle_kwh = 0.0
+        self._drying_cycle_cost = 0.0
+
+        self._config[CONF_DRYING_OCCUPIED] = False
+        new_options = {
+            **self._entry.options,
+            CONF_DRYING_OCCUPIED: False,
+        }
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+        if journal is not None:
+            await journal.close_open_drying_batch(cycle_id)
+        return harvest_data
 
     # ── Debounced option persistence ────────────────────────────────────────────
 

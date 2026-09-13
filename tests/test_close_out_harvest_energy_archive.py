@@ -64,6 +64,11 @@ def fake_coord():
     coord._last_energy_tick = object()
     coord.data = {NS_ENERGY: {"cycle_kwh": 5.0, "cycle_cost_usd": 1.5, "dli_today_mol": 12.0}}
 
+    # Part 4.4 extracted the record-building/archiving logic shared with
+    # harvest_complete_drying_batch() into this helper — close_out_harvest
+    # now calls it internally, so the mock must route through the real
+    # implementation too rather than auto-generating a non-awaitable stub.
+    coord._finalize_harvest_record = lambda *a, **kw: HelixCoordinator._finalize_harvest_record(coord, *a, **kw)
     coord.close_out_harvest = lambda wet, dry: HelixCoordinator.close_out_harvest(coord, wet, dry)
     return coord
 

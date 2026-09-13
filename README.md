@@ -31,11 +31,16 @@ Built as a free alternative to commercial cultivation controllers, using the sen
 - **High-temperature graduated light dimming** — throttles light intensity as a soft step strictly below the hard thermal-runaway cutoff, rather than only having a single all-or-nothing cutoff.
 - **Supplemental Lighting** — a second, independent light (UV, far-red, or other targeted spectra) with its own fixture type and either Synced (follows Main Lighting) or Targeted (specific stages, its own schedule) mode.
 
+### HVAC
+- **Reverse Cycle AirCon support** — when a mapped AirCon entity actually reports supporting `heat_cool`/`auto` mode, it's driven via real thermostat control (`climate.set_hvac_mode` + `climate.set_temperature`), letting the unit's own onboard thermostat regulate continuously. Falls back to discrete heat/cool/off switching for entities that don't report support — never assumed either way.
+- **Independent Backup Heater staging** — available alongside a Reverse Cycle unit in the same zone (never a substitute for it), engaging only after the primary heat source has been continuously falling behind setpoint for a sustained dwell period, with an optional outdoor-temperature confirming floor.
+
 ### Safety
 - **Configurable safety interlocks** — high/low temperature cutoffs, high/low humidity cutoffs, and a sensor-dropout failsafe timeout, each exposed as both an initial Options Flow field and a live, ongoing-tunable number entity.
 - **Thermal runaway / heater over-temp cutoffs** — hard "always wins" overrides that take priority over normal setpoint control.
-- **Sensor dropout detection** — falls back to a safe exhaust floor and suspends VPD control if the primary sensor goes stale beyond its configured timeout, with a Home Assistant Repairs entry surfaced for visibility.
+- **Sensor dropout detection** — falls back to a safe exhaust floor and suspends VPD control if the primary sensor goes stale beyond its configured timeout, with a Home Assistant Repairs entry surfaced for visibility, and escalates the dashboard badge to red specifically when it's an actuator (not just a sensor) that's gone unreachable.
 - **Anti-short-cycle protection** — a minimum dwell timer between compressor on/off transitions.
+- **Explicit, confirmed cross-zone dependency flags** — whether a grow space or Drying Room depends on Conditioning Room for its own baseline climate is a real, always-visible toggle (defaulting to the conservative "depends"), gating whether Conditioning Room is ever allowed to destabilize its own output for calibration testing while a dependent zone is occupied.
 
 ### Drying
 - **Locked 60/60 drying profile by default** (15.5°C / 60% RH) — a safe, standard cure profile that stays locked until you explicitly unlock custom day/night targets.
@@ -44,8 +49,14 @@ Built as a free alternative to commercial cultivation controllers, using the sen
 ### Cycle & stage management
 - **Full stage lifecycle** — Germination → Seedling → Early Veg → Late Veg → Stretch → Peak Flower → Ripening → Drying, each with its own day/night temperature anchor and VPD range.
 - **Explicit cycle lifecycle** — a cycle is either not-started or active; starting one and closing out a harvest are deliberate actions rather than an always-on implicit state.
+- **Independent zone occupancy** — separate from cycle tracking: with a dedicated Drying Room, "Harvest — Space Now Empty" transfers occupancy from the grow space to the Drying Room (without resetting that batch's own stage tracking or data) so a fresh cycle can start in the freed space while the previous batch finishes curing and closes out its own Harvest Complete independently — two cycles genuinely running at once.
 - **Stage-progression heads-up warnings** — flags when a stage is running unusually long against its planned duration.
 - **Recipe sharing** — export your tuned stage profiles as YAML and import someone else's.
+
+### Environmental Learning (opt-in)
+- **Confidence-weighted learning from real conditions** — off by default; when enabled, correlates external weather, time-of-day, lighting, and an approximate occupied-hours schedule against actuator behavior. A fixed-duration Learning phase graduates unconditionally to an Active phase that keeps refitting indefinitely — its influence on future predictive feedforward is always blended in proportion to how much data actually exists for a given condition, never a hard replacement of the generic default.
+- **Deep Calibration & Live Actuator Response Testing** — Deep Calibration deliberately cuts a zone's actuator control for a bounded window to measure free thermal decay (only when that zone, and anything depending on it, is unoccupied); Live Actuator Response Testing nudges a setpoint or steps an actuator through its range to measure response, available regardless of occupancy. Both durably survive a restart mid-test.
+- **Self-contained storage, optional export** — the same lightweight, no-external-database storage pattern used elsewhere in this integration, with an optional, off-by-default, best-effort InfluxDB/VictoriaMetrics line-protocol export for building your own Grafana dashboards on top.
 
 ### Energy & monitoring
 - **Energy & ROI tracking** — live power draw, per-cycle energy cost against a configurable tariff (anytime/peak-shoulder-offpeak), and a harvest report with $/g yield efficiency, with a previous-cycle archive.
@@ -95,6 +106,9 @@ Known, honestly-scoped caveats as of this release:
 
 - Frontend (dashboard panel) behavior — layout, dynamic hardware-mapping forms, and live control wiring — is verified through code review and syntax checking rather than an automated browser test suite; the automated test suite (`tests/`, run via `pytest`) covers backend logic only (coordinator, climate engine, config migrations, entity platforms).
 - The Breeze engine's random re-modulation interval (roughly 8-25 seconds) is on the shorter end of what feels like natural gusting for some fan hardware; there's no UI to tune this interval yet.
+- Environmental Learning's confidence-weighted model is a running-mean-per-condition-bucket, not a fitted statistical regression — a genuine, working starting point, not a claim of higher predictive precision than that approach can honestly provide.
+- Live Actuator Response Testing's test lifecycle (starting, durability across a restart, cross-zone lag/magnitude tracking) is fully implemented, but the actual step-through-increments / setpoint-nudge-and-time action is currently triggered manually from the Environmental Learning Settings tab rather than fully autonomous end-to-end.
+- A dedicated-Drying-Room batch's stage-duration history is snapshotted at the moment "Space Now Empty" is pressed rather than tracked live afterward — there's one live stage tracker (freed immediately for the next cycle), not yet a second one running concurrently for the transferred batch.
 
 Current and historical issues are tracked on [GitHub Issues](https://github.com/helix-cultivate/helix_cultivate/issues) — that's the authoritative list, not a static snapshot here that would inevitably go stale.
 

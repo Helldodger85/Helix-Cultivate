@@ -137,6 +137,11 @@ EXHAUST_PID_KD: float = 0.3
 
 # ── Actuator interaction rules (Phase 9) ───────────────────────────────────────
 SATURATION_DWELL_MIN: float = 8.0    # Minutes of continuous appliance runtime = saturated
+# Part 5.5 (v1.4.0): minutes the primary heat source must be continuously
+# "falling behind" setpoint before the backup heater actually engages — same
+# dwell-timer pattern as SATURATION_DWELL_MIN above, so a brief demand spike
+# alone can't trigger it.
+BACKUP_HEATER_DWELL_MIN: float = 10.0
 VPD_ASSIST_STEP_C: float = 0.3       # Per-tick bias step applied to effective temp setpoint
 VPD_ASSIST_MAX_BIAS_C: float = 1.5   # Maximum single-tick bias magnitude
 THERMAL_PURGE_MARGIN_C: float = 1.5      # °C band below thermal_runaway_c where purge ramps
@@ -154,6 +159,12 @@ ACTUATOR_RETRY_BACKOFF_SEC: tuple[float, ...] = (2.0, 5.0)
 HVAC_MODE_HEAT: str = "heat"
 HVAC_MODE_COOL: str = "cool"
 HVAC_MODE_OFF: str = "off"
+# Part 5.3 (v1.4.0): true thermostat mode — used when the mapped entity's own
+# reported hvac_modes actually supports it, letting the unit's onboard
+# thermostat regulate continuously via climate.set_temperature rather than
+# HA flipping it between discrete heat/cool/off.
+HVAC_MODE_HEAT_COOL: str = "heat_cool"
+HVAC_MODE_AUTO: str = "auto"
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -528,28 +539,70 @@ class ClimateEngine:
         )
 
     async def _set_reverse_cycle(
-        self, entity_id: Optional[str], mode: Optional[str], role: str = "unknown"
+        self,
+        entity_id: Optional[str],
+        mode: Optional[str],
+        role: str = "unknown",
+        target_temp: Optional[float] = None,
     ) -> None:
-        """Set a climate entity to the specified hvac_mode (heat / cool / off).
+        """Set a climate entity's reverse-cycle state.
 
         Gracefully no-ops when entity_id is None or entity is unavailable.
-        Uses climate.set_hvac_mode for reverse-cycle heat pumps and split systems.
-        """
-        if not entity_id or not mode:
-            if entity_id:
-                # mode is None — turn off the unit
-                state = self._coord.hass.states.get(entity_id)
-                if state is None or state.state == "unavailable":
-                    return
-                await self._call_service_with_retry(
-                    "climate", "set_hvac_mode",
-                    {"entity_id": entity_id, "hvac_mode": HVAC_MODE_OFF},
-                    role=role,
-                )
-            return
 
+        Part 5.3 (v1.4.0): when `target_temp` is given, checks the entity's
+        own reported `hvac_modes` attribute for real thermostat-mode support
+        (heat_cool, or auto as a fallback name some integrations use) —
+        never assumed. If supported, ensures hvac_mode is that thermostat
+        mode (once — idempotent) and pushes `target_temp` via
+        climate.set_temperature, letting the unit's own onboard thermostat
+        regulate continuously instead of HA flipping it between discrete
+        heat/cool/off. A thermostat-capable unit is simply left running in
+        this mode at the live target — including when `mode` is None (no
+        current heat/cool demand): a real thermostat idles at its own
+        setpoint on its own, it doesn't need to be "turned off" between
+        ticks the way a discrete heat/cool/off flip does.
+
+        If the entity does NOT report thermostat-mode support (or no
+        target_temp is given at all), falls back unchanged to the original
+        discrete heat/cool/off hvac_mode switching.
+        """
+        if not entity_id:
+            return
         state = self._coord.hass.states.get(entity_id)
         if state is None or state.state == "unavailable":
+            return
+
+        if target_temp is not None:
+            supported_modes = state.attributes.get("hvac_modes") or []
+            thermostat_mode = (
+                HVAC_MODE_HEAT_COOL if HVAC_MODE_HEAT_COOL in supported_modes
+                else HVAC_MODE_AUTO if HVAC_MODE_AUTO in supported_modes
+                else None
+            )
+            if thermostat_mode is not None:
+                if state.state != thermostat_mode:
+                    await self._call_service_with_retry(
+                        "climate", "set_hvac_mode",
+                        {"entity_id": entity_id, "hvac_mode": thermostat_mode},
+                        role=role,
+                    )
+                current_target = state.attributes.get("temperature")
+                if current_target != target_temp:
+                    await self._call_service_with_retry(
+                        "climate", "set_temperature",
+                        {"entity_id": entity_id, "temperature": target_temp},
+                        role=role,
+                    )
+                return
+
+        if not mode:
+            # mode is None and this entity is not thermostat-capable (or no
+            # target_temp was given) — turn off the unit.
+            await self._call_service_with_retry(
+                "climate", "set_hvac_mode",
+                {"entity_id": entity_id, "hvac_mode": HVAC_MODE_OFF},
+                role=role,
+            )
             return
 
         # Only call the service if the mode actually needs to change
@@ -1411,6 +1464,7 @@ class ClimateEngine:
         entity_id: Optional[str],
         want_heat: bool,
         want_cool: bool,
+        target_temp: Optional[float] = None,
     ) -> Optional[str]:
         """Drive a reverse-cycle climate unit based on heat/cool demand.
 
@@ -1427,6 +1481,25 @@ class ClimateEngine:
         """
         if not entity_id:
             return None
+
+        # Part 5.3 (v1.4.0): a genuinely thermostat-capable unit (reports
+        # heat_cool/auto in hvac_modes) is simply left running in that mode
+        # with the live target temperature — its own onboard thermostat
+        # decides whether to heat, cool, or idle. This bypasses the
+        # discrete-mode anti-short-cycle gating below entirely, since that
+        # exists specifically to protect against HA-driven hard heat/cool
+        # flips, which a thermostat-capable unit's own control loop handles
+        # internally. Non-capable entities fall through unchanged to the
+        # existing discrete want_heat/want_cool dispatch.
+        if target_temp is not None:
+            state = self._coord.hass.states.get(entity_id)
+            supported_modes = (state.attributes.get("hvac_modes") or []) if state else []
+            if HVAC_MODE_HEAT_COOL in supported_modes or HVAC_MODE_AUTO in supported_modes:
+                await self._set_reverse_cycle(
+                    entity_id, None, role=f"{zone_label}_ac", target_temp=target_temp
+                )
+                zone.request_reverse_cycle_mode(HVAC_MODE_HEAT_COOL)
+                return HVAC_MODE_HEAT_COOL
 
         if want_heat and not want_cool:
             if not self._compressor_allowed(f"{zone_label}_rc_heat"):
@@ -1478,10 +1551,15 @@ class ClimateEngine:
 
         Backup heater stages on when ALL of the following are true:
         1. A backup heater entity is configured
-        2. The outdoor temperature is below the user-defined threshold
-        3. The primary heat source (discrete heater OR reverse-cycle in HEAT mode) is
-           already running (demand confirmed) AND the zone temp is still below setpoint
-           minus a tighter deadband — i.e. the primary source is "falling behind"
+        2. The outdoor temperature is below the user-defined threshold (an
+           optional, confirming floor — Part 5.5 — so a brief indoor demand
+           spike alone can't trigger it on an otherwise mild day)
+        3. The primary heat source (discrete heater OR reverse-cycle in HEAT
+           mode) has been running CONTINUOUSLY, with the zone temp still
+           below setpoint minus a tighter deadband ("falling behind"), for
+           at least BACKUP_HEATER_DWELL_MIN minutes — the same dwell-timer
+           pattern already used for VPD-assist saturation detection, so a
+           momentary dip doesn't stage the backup on immediately.
 
         Returns True if backup heater was turned on.
         """
@@ -1497,6 +1575,7 @@ class ClimateEngine:
 
         if not outdoor_below_threshold:
             # Outdoor temperature is acceptable — backup heater not needed
+            self._coord._backup_heater_falling_behind_since = None
             await self._set_switch(backup_id, False, role="zone1_backup_heater")
             return False
 
@@ -1508,20 +1587,35 @@ class ClimateEngine:
         primary_heat_active = primary_heat_on or (primary_rc_mode == HVAC_MODE_HEAT)
 
         if reference_temp is None or not primary_heat_active:
+            self._coord._backup_heater_falling_behind_since = None
             await self._set_switch(backup_id, False, role="zone1_backup_heater")
             return False
 
         # Tighter deadband for backup staging — only kick in if primary is clearly insufficient
         falling_behind = reference_temp < (setpoint - TEMP_DEADBAND_C * 2.0)
 
-        if falling_behind:
+        if not falling_behind:
+            self._coord._backup_heater_falling_behind_since = None
+            await self._set_switch(backup_id, False, role="zone1_backup_heater")
+            return False
+
+        # ── Condition 3: sustained dwell, not a momentary dip ───────────────────
+        if self._coord._backup_heater_falling_behind_since is None:
+            self._coord._backup_heater_falling_behind_since = dt_util.utcnow()
+        elapsed_min = (
+            dt_util.utcnow() - self._coord._backup_heater_falling_behind_since
+        ).total_seconds() / 60.0
+
+        if elapsed_min >= BACKUP_HEATER_DWELL_MIN:
             _LOGGER.info(
                 "Helix Cultivate [Zone1]: Backup heater staging ON — "
-                "outdoor=%.1f°C (threshold=%.1f°C), zone=%.1f°C (setpoint=%.1f°C).",
+                "outdoor=%.1f°C (threshold=%.1f°C), zone=%.1f°C (setpoint=%.1f°C), "
+                "falling behind for %.1f min.",
                 outdoor_temp,
                 threshold,
                 reference_temp,
                 setpoint,
+                elapsed_min,
             )
             await self._set_switch(backup_id, True, role="zone1_backup_heater")
             return True
@@ -1573,6 +1667,14 @@ class ClimateEngine:
 
         Returns the hvac_mode string applied to the reverse-cycle unit (or None).
         """
+        # Part 7.4 (Environmental Learning — Deep Calibration): while a
+        # calibration test is actively cutting this zone's actuator
+        # control, skip driving it entirely so the free thermal decay
+        # being measured isn't disturbed by normal control action.
+        learning_zone = "conditioning" if zone_label == "zone1" else zone_label
+        if self._coord.is_deep_calibration_active(learning_zone):
+            return zone.reverse_cycle_mode
+
         bias = self._vpd_assist_bias(zone_label, leaf_vpd)
         effective_setpoint = (
             self._coord.temp_setpoint
@@ -1648,12 +1750,17 @@ class ClimateEngine:
             self._record_compressor_off(f"{zone_label}_dehumid")
 
         # ── Reverse-cycle control (heat pump via hvac_mode) ────────────────────
+        # Part 5.3: effective_setpoint (the same VPD-assist-biased target
+        # that want_heat/want_cool's deadband decision was computed from)
+        # doubles as the thermostat-mode target_temp for a unit that
+        # actually reports supporting heat_cool/auto.
         rc_mode = await self._control_reverse_cycle(
             zone=zone,
             zone_label=zone_label,
             entity_id=effective_rc_id,
             want_heat=want_heat,
             want_cool=want_cool,
+            target_temp=effective_setpoint if is_reverse_cycle else None,
         )
 
         # ── Issue discrete appliance service calls ─────────────────────────────
@@ -1820,6 +1927,12 @@ class ClimateEngine:
 
         HVAC follows the same is_reverse_cycle model as cultivation zones.
         """
+        # Part 7.4 (Environmental Learning — Deep Calibration): skip
+        # driving Drying's actuators entirely while a calibration test is
+        # cutting its control to measure free thermal decay.
+        if self._coord.is_deep_calibration_active("drying"):
+            return
+
         ac_id: Optional[str] = self._get(CONF_DRYING_AC)
         heater_id: Optional[str] = self._get(CONF_DRYING_HEATER)
         dehumid_id: Optional[str] = self._get(CONF_DRYING_DEHUMIDIFIER)

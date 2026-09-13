@@ -401,6 +401,13 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
                 else []
             )
             attrs["primary_sensor_ok"] = climate.get("primary_sensor_ok", True)
+            # Part 1.2 — actuator dropout (heater/AC/exhaust unavailable),
+            # surfaced separately from the sensor dropout above so the
+            # dashboard badge can escalate to red: losing control of
+            # hardware is more urgent than losing a passive reading.
+            actuator_dropout, actuator_entities = self.coordinator._actuator_dropout_status()
+            attrs["actuator_dropout"] = actuator_dropout
+            attrs["actuator_dropout_entities"] = actuator_entities
 
         if key == "exhaust_speed":
             attrs["thermal_runaway_active"] = climate.get("thermal_runaway", False)
@@ -416,6 +423,36 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             attrs["zone2_depth_m"] = self.coordinator._get("zone2_depth_m", 1.2)
             attrs["zone2_height_m"] = self.coordinator._get("zone2_height_m", 2.0)
             attrs["zone2_plant_count"] = self.coordinator._get("zone2_plant_count", 4)
+            # Reverse Cycle Unit toggles (v1.4.0 Part 5.2) — one per zone,
+            # read here so the gear-icon form's checkbox reflects the
+            # actually-persisted state when it opens.
+            attrs["zone1_is_reverse_cycle"] = self.coordinator._get("zone1_is_reverse_cycle", False)
+            attrs["zone2_is_reverse_cycle"] = self.coordinator._get("zone2_is_reverse_cycle", False)
+            attrs["drying_is_reverse_cycle"] = self.coordinator._get("drying_is_reverse_cycle", False)
+            # Cross-zone dependency flags (v1.4.0 Part 3.1)
+            attrs["zone2_depends_on_conditioning"] = self.coordinator._get(
+                "zone2_depends_on_conditioning", True
+            )
+            attrs["drying_depends_on_conditioning"] = self.coordinator._get(
+                "drying_depends_on_conditioning", True
+            )
+            # Environmental Learning System (v1.4.0 Parts 7-10)
+            attrs["thermal_learning_enabled"] = self.coordinator._get(
+                "thermal_learning_enabled", False
+            )
+            attrs["thermal_learning_duration_days"] = self.coordinator._get(
+                "thermal_learning_duration_days", 18
+            )
+            attrs["thermal_learning_export_enabled"] = self.coordinator._get(
+                "thermal_learning_export_enabled", False
+            )
+            attrs["thermal_learning_export_url"] = self.coordinator._get(
+                "thermal_learning_export_url", ""
+            )
+            # Zone occupancy (v1.4.0 Part 4) — drives "Space Now Empty" and
+            # "Harvest Complete" (dedicated Drying Room) visibility.
+            attrs["zone2_occupied"] = self.coordinator.is_zone2_occupied()
+            attrs["drying_occupied"] = self.coordinator.is_drying_occupied()
             # Outdoor conditions (local weather station override applied
             # server-side if mapped)
             attrs["outdoor_weather_entity"] = self.coordinator._get(CONF_OUTDOOR_WEATHER_ENTITY)

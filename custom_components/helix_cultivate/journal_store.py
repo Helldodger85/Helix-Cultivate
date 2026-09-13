@@ -71,6 +71,15 @@ EMPTY_STORE: dict[str, Any] = {
     # surfaced as "Previous Cycle". See coordinator.py's reset_energy_cycle()/
     # close_out_harvest().
     "previous_cycle_energy": {},
+    # Batches currently occupying a dedicated Drying Room, keyed by
+    # cycle_id — opened by HelixCoordinator.space_now_empty() (Part 4.2)
+    # with a snapshot of that batch's stage-duration history taken at the
+    # moment of transfer (since Primary Grow Space may go on to track a
+    # different, newer cycle_id before this batch's own Harvest Complete),
+    # closed by harvest_complete_drying_batch() (Part 4.3/4.4). Supports
+    # more than one concurrently open batch in principle, though in
+    # practice a single dedicated Drying Room only ever holds one at a time.
+    "open_drying_batches": {},
 }
 
 
@@ -298,6 +307,28 @@ class JournalStore:
         """Return the archived Previous Cycle energy record for entry_id, or
         None if neither a Reset nor a harvest close-out has ever happened."""
         return self._data.get("previous_cycle_energy", {}).get(entry_id)
+
+    # ── Open drying batches (Part 4.2/4.3/4.4) ────────────────────────────────
+
+    async def open_drying_batch(self, cycle_id: str, snapshot: dict[str, Any]) -> None:
+        """Record a batch as now occupying a dedicated Drying Room, keyed
+        by cycle_id, with whatever snapshot data the caller captured at the
+        moment of transfer (e.g. stage_durations_snapshot, moved_to_drying_at)."""
+        self._data.setdefault("open_drying_batches", {})[cycle_id] = dict(snapshot)
+        await self._save()
+
+    def get_open_drying_batch(self, cycle_id: str) -> Optional[dict[str, Any]]:
+        """Return the snapshot for an open drying batch, or None if
+        cycle_id isn't currently open (already closed, or never opened)."""
+        batch = self._data.get("open_drying_batches", {}).get(cycle_id)
+        return dict(batch) if batch is not None else None
+
+    async def close_open_drying_batch(self, cycle_id: str) -> None:
+        """Remove a batch from the open-drying-batches tracking once its
+        Harvest Complete has been recorded — it's now in cycles_archive
+        instead, this dict is only ever "currently occupying the room"."""
+        self._data.setdefault("open_drying_batches", {}).pop(cycle_id, None)
+        await self._save()
 
     @staticmethod
     def _build_timelapse_gif_sync(image_paths: list[str], out_path: str) -> bool:

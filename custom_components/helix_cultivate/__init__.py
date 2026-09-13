@@ -14,11 +14,13 @@ from homeassistant.components.frontend import add_extra_js_url, async_register_b
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.helpers import entity_registry as er
 from homeassistant.loader import async_get_integration
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, CONFIG_VERSION, CONFIG_MINOR_VERSION
 from .coordinator import HelixCoordinator
 from .intents import async_register_intents
 from .journal_store import async_setup_journal
+from .learning_store import async_setup_learning_store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,6 +35,11 @@ WS_CMD_UPDATE_SETTINGS_FIELDS: str = "helix_cultivate/update_settings_fields"
 WS_CMD_RESET_ENERGY_CYCLE: str = "helix_cultivate/reset_energy_cycle"
 WS_CMD_START_CYCLE: str = "helix_cultivate/start_cycle"
 WS_CMD_ABORT_CYCLE: str = "helix_cultivate/abort_cycle"
+WS_CMD_SPACE_NOW_EMPTY: str = "helix_cultivate/space_now_empty"
+WS_CMD_HARVEST_COMPLETE_DRYING_BATCH: str = "helix_cultivate/harvest_complete_drying_batch"
+WS_CMD_START_DEEP_CALIBRATION: str = "helix_cultivate/start_deep_calibration"
+WS_CMD_START_LIVE_ACTUATOR_TEST: str = "helix_cultivate/start_live_actuator_test"
+WS_CMD_GET_LEARNING_STATUS: str = "helix_cultivate/get_learning_status"
 
 VALID_STAGE_TARGET_KEYS: frozenset[str] = frozenset({
     "day_temp_c", "night_temp_c",
@@ -79,6 +86,17 @@ VALID_SETTINGS_FIELD_KEYS: frozenset[str] = frozenset({
     # backend-only with no settings-flow or gear-icon control surface.
     "light_high_temp_dim_c", "wind_sweep_enabled", "dew_point_margin_c",
     "preheat_lead_min", "stage_warning_lead_days",
+    # Cross-zone dependency flags (v1.4.0 Part 3.1) — explicit, confirmed
+    # per-zone toggles, never silently inferred.
+    "zone2_depends_on_conditioning", "drying_depends_on_conditioning",
+    # Reverse Cycle Unit toggles (v1.4.0 Part 5.2) — one boolean per zone,
+    # beside that zone's AirCon entity picker; the mapped entity itself
+    # stays a single hardware-mapping key (zone1_ac/zone2_ac/drying_ac),
+    # this only changes how it's controlled.
+    "zone1_is_reverse_cycle", "zone2_is_reverse_cycle", "drying_is_reverse_cycle",
+    # Environmental Learning System (v1.4.0 Parts 7-10)
+    "thermal_learning_enabled", "thermal_learning_duration_days",
+    "thermal_learning_export_enabled", "thermal_learning_export_url",
 })
 
 PLATFORMS: list[Platform] = [
@@ -375,6 +393,37 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                 renamed_number,
                 renamed_switch,
             )
+
+        if current_minor < 9:
+            # v1.8 → v1.9: the v1.6 -> v1.7 migration above set cycle_state
+            # to "active" for every already-existing entry but never wrote
+            # CONF_STAGE_START_DATE into persisted options — its own comment
+            # claimed day-count was preserved, but StageManager.__init__
+            # re-reads this value fresh from config on every reload and
+            # falls back to no start date (0 elapsed days) when absent, so
+            # every reload since v1.7 shipped has silently reset an
+            # already-affected install's day-count reference point. There is
+            # no way to recover the true original start date retroactively
+            # (it was never recorded) — this writes today, this migration's
+            # execution date, as the new stable reference point so
+            # day-counting starts working correctly from here on. Entries
+            # that already have a real CONF_STAGE_START_DATE (new installs
+            # via start_cycle(), or anything migrated after this fix ships)
+            # are left untouched.
+            from .const import CONF_STAGE_START_DATE
+
+            if not new_opts.get(CONF_STAGE_START_DATE) and not new_data.get(CONF_STAGE_START_DATE):
+                new_opts[CONF_STAGE_START_DATE] = dt_util.now().date().isoformat()
+                _LOGGER.warning(
+                    "Helix Cultivate: migrated entry to v1.9 — stage_start_date "
+                    "was never persisted by the v1.7 migration, so day-count "
+                    "has been silently frozen since; set to today (%s) as the "
+                    "new reference point going forward. The true original "
+                    "start date could not be recovered.",
+                    new_opts[CONF_STAGE_START_DATE],
+                )
+            else:
+                _LOGGER.info("Helix Cultivate: migrated entry to v1.9 (no data changes)")
 
         hass.config_entries.async_update_entry(
             config_entry,
@@ -734,6 +783,184 @@ async def ws_abort_cycle(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): WS_CMD_SPACE_NOW_EMPTY,
+    }
+)
+@websocket_api.async_response
+async def ws_space_now_empty(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """"Harvest — Space Now Empty" (Part 4.2) — only meaningful with a
+    dedicated Drying Room configured; coordinator.space_now_empty() raises
+    ValueError otherwise, which this surfaces as invalid_input rather than
+    letting the frontend's own topology check be the only guard.
+    """
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    try:
+        await coordinator.space_now_empty()
+        connection.send_result(msg["id"], {"success": True})
+    except ValueError as exc:
+        connection.send_error(msg["id"], "invalid_input", str(exc))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_CMD_HARVEST_COMPLETE_DRYING_BATCH,
+        vol.Required("wet_weight_g"): vol.Coerce(float),
+        vol.Required("dry_weight_g"): vol.Coerce(float),
+    }
+)
+@websocket_api.async_response
+async def ws_harvest_complete_drying_batch(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """"Harvest Complete" (Part 9) for the batch currently occupying the
+    dedicated Drying Room — closes out CONF_DRYING_CYCLE_ID specifically,
+    independent of whatever Primary Grow Space is doing concurrently.
+    """
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    try:
+        result = await coordinator.harvest_complete_drying_batch(
+            msg["wet_weight_g"], msg["dry_weight_g"]
+        )
+        connection.send_result(msg["id"], result)
+    except ValueError as exc:
+        connection.send_error(msg["id"], "invalid_input", str(exc))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_CMD_START_DEEP_CALIBRATION,
+        vol.Required("zone"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_start_deep_calibration(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Part 7.4/7.10: start a Deep Calibration test for one zone
+    ("zone2"/"drying"/"conditioning") — rejected with the specific reason
+    if that zone isn't currently eligible.
+    """
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    from .learning_engine import LearningEngine
+
+    try:
+        engine = LearningEngine(coordinator)
+        current_temp = coordinator._current_zone_temp_for_learning(msg["zone"])
+        outdoor_temp = (coordinator.data or {}).get("climate", {}).get("outdoor_temp_c")
+        test = await engine.start_deep_calibration(msg["zone"], current_temp, outdoor_temp)
+        connection.send_result(msg["id"], test)
+    except ValueError as exc:
+        connection.send_error(msg["id"], "invalid_input", str(exc))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_CMD_START_LIVE_ACTUATOR_TEST,
+        vol.Required("zone"): str,
+        vol.Optional("thermostat_controlled", default=False): bool,
+    }
+)
+@websocket_api.async_response
+async def ws_start_live_actuator_test(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Part 7.4/7.10: start Live Actuator Response Testing for one zone —
+    available regardless of occupancy."""
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    from .learning_engine import LearningEngine
+
+    try:
+        engine = LearningEngine(coordinator)
+        test = await engine.start_live_actuator_test(msg["zone"], msg["thermostat_controlled"])
+        connection.send_result(msg["id"], test)
+    except ValueError as exc:
+        connection.send_error(msg["id"], "invalid_input", str(exc))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_CMD_GET_LEARNING_STATUS,
+    }
+)
+@websocket_api.async_response
+async def ws_get_learning_status(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Returns the Environmental Learning Settings tab's display state:
+    current learning_state, per-zone eligibility, and any active test."""
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        connection.send_error(msg["id"], "no_entry", "No Helix Cultivate config entry found")
+        return
+    coordinator = hass.data.get(DOMAIN, {}).get(entries[0].entry_id)
+    if coordinator is None:
+        connection.send_error(msg["id"], "no_coordinator", "Coordinator not initialised")
+        return
+
+    from .const import CONF_ENABLE_DRYING_ENVIRONMENT, CONF_LEARNING_STARTED_AT
+    from .learning_engine import LearningEngine
+
+    engine = LearningEngine(coordinator)
+    store = hass.data.get(DOMAIN, {}).get("learning_store")
+    connection.send_result(msg["id"], {
+        "learning_state": engine.learning_state(),
+        "started_at": coordinator._get(CONF_LEARNING_STARTED_AT),
+        "zone2_occupied": coordinator.is_zone2_occupied(),
+        "drying_occupied": coordinator.is_drying_occupied(),
+        "drying_enabled": bool(coordinator._get(CONF_ENABLE_DRYING_ENVIRONMENT, False)),
+        "conditioning_eligible": coordinator.is_conditioning_room_calibration_eligible(),
+        "active_test": store.get_active_test() if store else None,
+    })
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): WS_CMD_EXPORT_RECIPE,
     }
 )
@@ -824,6 +1051,11 @@ def _async_register_zone_device_ws_commands(hass: HomeAssistant) -> None:
         websocket_api.async_register_command(hass, ws_reset_energy_cycle)
         websocket_api.async_register_command(hass, ws_start_cycle)
         websocket_api.async_register_command(hass, ws_abort_cycle)
+        websocket_api.async_register_command(hass, ws_space_now_empty)
+        websocket_api.async_register_command(hass, ws_harvest_complete_drying_batch)
+        websocket_api.async_register_command(hass, ws_start_deep_calibration)
+        websocket_api.async_register_command(hass, ws_start_live_actuator_test)
+        websocket_api.async_register_command(hass, ws_get_learning_status)
         hass.data.setdefault(DOMAIN, {})["_zone_ws_registered"] = True
         _LOGGER.info("Helix Cultivate: zone-device WebSocket commands registered")
     except Exception:  # noqa: BLE001
@@ -853,6 +1085,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Initialise journal store + register WebSocket commands (idempotent on reload)
     await async_setup_journal(hass)
+
+    # Initialise Environmental Learning System store (idempotent on reload)
+    await async_setup_learning_store(hass)
 
     # Register zone hardware-mapping WebSocket commands (idempotent on reload)
     _async_register_zone_device_ws_commands(hass)
