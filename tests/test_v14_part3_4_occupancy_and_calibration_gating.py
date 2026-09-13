@@ -178,6 +178,7 @@ def fake_full_coord():
         "harvest_complete_drying_batch",
         "_vpd_in_range_pct",
         "_finalize_harvest_record",
+        "_drying_batch_live_days",
     )
     return coord
 

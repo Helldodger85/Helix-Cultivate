@@ -34,14 +34,24 @@ EMPTY_LEARNING_STORE: dict[str, Any] = {
     # actuator_duty_pct, lights_on, light_pct, occupied_hours_weight,
     # cycle_id}. This is Part 7.5/7.6's passive continuous logging.
     "hourly_logs": [],
-    # Regression state keyed by "{zone}|{bucket_key}" (e.g. an outdoor-temp
-    # bucket) — {count, mean_response, updated_at}. This is what
-    # confidence-weighted blending (7.3) reads from.
+    # Simple running-mean state keyed by "{zone}|{bucket_key}" (e.g. an
+    # outdoor-temp bucket, or the fixed "lights_off_response" key) —
+    # {count, mean_response, updated_at}. Used only by Deep Calibration's
+    # own decay tracking and the lights-off preheat bucket — both
+    # inherently single-condition measurements a multi-variable fit
+    # wouldn't add anything to. See regression_models below for the
+    # multi-variable model behind confidence-weighted blending (7.3).
     "regression_buckets": {},
     # Cross-zone (Conditioning Room -> dependent zone) response
     # observations from Live Actuator Response Testing (7.4) — keyed by
     # dependent zone name — {count, mean_lag_min, mean_magnitude_ratio}.
     "cross_zone_response": {},
+    # Fitted multi-variable OLS regression per zone (v1.4.1 Part 4) — the
+    # actual model behind confidence-weighted blending now; regression_
+    # buckets above remains a separate, simpler running-mean dataset used
+    # only by Deep Calibration's own decay tracking and the lights-off
+    # response bucket, neither of which need a multi-variable fit.
+    "regression_models": {},
     # Durable in-progress test state (7.7) — None when no test is running.
     "active_test": None,
     "test_history": [],
@@ -114,6 +124,15 @@ class LearningStore:
 
     def get_regression_bucket(self, zone: str, bucket_key: str) -> Optional[dict[str, Any]]:
         return self._data.get("regression_buckets", {}).get(self._bucket_id(zone, bucket_key))
+
+    # ── Fitted multi-variable regression model (v1.4.1 Part 4) ─────────────────
+
+    async def set_regression_model(self, zone: str, model: dict[str, Any]) -> None:
+        self._data.setdefault("regression_models", {})[zone] = model
+        await self._save()
+
+    def get_regression_model(self, zone: str) -> Optional[dict[str, Any]]:
+        return self._data.get("regression_models", {}).get(zone)
 
     # ── Cross-zone response (7.4) ──────────────────────────────────────────────
 

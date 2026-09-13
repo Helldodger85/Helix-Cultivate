@@ -21,7 +21,6 @@ from custom_components.helix_cultivate.const import (
     CONF_THERMAL_LEARNING_ENABLED,
     CONF_ZONE2_OCCUPIED,
     DEFAULT_LEARNING_DURATION_DAYS,
-    LEARNING_CONFIDENT_SAMPLE_COUNT,
     LEARNING_STATE_ACTIVE,
     LEARNING_STATE_LEARNING,
 )
@@ -157,53 +156,55 @@ class TestLearningStateMachine:
 
     async def test_model_keeps_refitting_after_active_not_frozen(self, fake_coord, learning_store):
         """Active does not mean logging/regression updates stop — they
-        continue indefinitely (Part 7.2's "never freezes" requirement)."""
+        continue indefinitely (Part 7.2's "never freezes" requirement).
+        A single sample isn't enough to fit the v1.4.1 regression, but the
+        raw hourly log row itself (with the new setpoint_gap_c/month/
+        occupied fields the regression trains on) must still be recorded
+        every time, unconditionally."""
         engine = LearningEngine(fake_coord)
         fake_coord._config[CONF_LEARNING_STATE] = LEARNING_STATE_ACTIVE
         fake_coord._config[CONF_LEARNING_STARTED_AT] = dt_util.utcnow().isoformat()
 
         await engine.maybe_log_hourly("zone2", 10.0, 22.0, 50.0, True, 100.0, "cyc1")
 
-        assert len(learning_store.get_hourly_logs("zone2")) == 1
-        bucket = learning_store.get_regression_bucket("zone2", outdoor_temp_bucket(10.0))
-        assert bucket is not None and bucket["count"] == 1
+        logs = learning_store.get_hourly_logs("zone2")
+        assert len(logs) == 1
+        assert logs[0]["setpoint_gap_c"] == pytest.approx(24.0 - 22.0)
+        assert logs[0]["occupied"] is True
+        assert logs[0]["month"] is not None
+        # Below the minimum sample threshold — no fitted model yet.
+        assert learning_store.get_regression_model("zone2") is None
 
 
 @pytest.mark.asyncio
 class TestConfidenceWeightedBlending:
+    """v1.4.1 Part 4: confidence-weighted blending is now backed by a
+    fitted multi-variable regression (learning_regression.py) rather than
+    bucketed averaging — see test_v141_part4_regression.py for the
+    regression math itself. These tests cover the engine-level wiring:
+    zero bias with no fitted model, and independence across zones."""
+
     async def test_zero_bias_with_no_data(self, fake_coord):
         engine = LearningEngine(fake_coord)
         assert engine.get_confidence_blended_bias("zone2", 10.0) == 0.0
 
-    async def test_bias_scales_with_sample_count(self, fake_coord, learning_store):
+    async def test_zero_bias_below_minimum_sample_count(self, fake_coord, learning_store):
+        """Part 4.4: too little data to fit at all -> no model saved ->
+        blended bias stays exactly 0.0, deferring entirely to the generic
+        fallback rather than guessing from a handful of points."""
         engine = LearningEngine(fake_coord)
-        bucket_key = outdoor_temp_bucket(10.0)
+        for i in range(5):
+            fake_coord._learning_last_log["zone2"] = None
+            await engine.maybe_log_hourly("zone2", 10.0 + i, 22.0, 50.0, True, 100.0, "cyc1")
 
-        # Few samples -> low confidence -> small blended bias even though
-        # the raw learned response itself is large.
-        await learning_store.update_regression_bucket("zone2", bucket_key, 2.0)
-        low_confidence_bias = engine.get_confidence_blended_bias("zone2", 10.0)
-        assert 0.0 < low_confidence_bias < 2.0
-
-        for _ in range(LEARNING_CONFIDENT_SAMPLE_COUNT * 2):
-            await learning_store.update_regression_bucket("zone2", bucket_key, 2.0)
-        high_confidence_bias = engine.get_confidence_blended_bias("zone2", 10.0)
-
-        assert high_confidence_bias > low_confidence_bias
-        assert high_confidence_bias == pytest.approx(2.0, abs=0.01)
-
-    async def test_confidence_never_exceeds_full_weight(self, fake_coord, learning_store):
-        engine = LearningEngine(fake_coord)
-        bucket_key = outdoor_temp_bucket(5.0)
-        for _ in range(LEARNING_CONFIDENT_SAMPLE_COUNT * 10):
-            await learning_store.update_regression_bucket("zone2", bucket_key, 3.0)
-
-        bias = engine.get_confidence_blended_bias("zone2", 5.0)
-        assert bias == pytest.approx(3.0, abs=0.01)
+        assert learning_store.get_regression_model("zone2") is None
+        assert engine.get_confidence_blended_bias("zone2", 10.0) == 0.0
 
     async def test_different_zones_are_independent(self, fake_coord, learning_store):
         engine = LearningEngine(fake_coord)
-        await learning_store.update_regression_bucket("zone2", outdoor_temp_bucket(10.0), 5.0)
+        await learning_store.set_regression_model(
+            "zone2", {"coefficients": [1.0] * 9, "xtx_inv": [[0.0] * 9 for _ in range(9)], "sigma": 0.0, "n": 100}
+        )
 
         assert engine.get_confidence_blended_bias("drying", 10.0) == 0.0
 

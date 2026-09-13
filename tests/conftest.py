@@ -86,6 +86,12 @@ def mock_coord():
     # existing control-loop tests aren't short-circuited by a MagicMock's
     # default truthy return value. ─────────────────────────────────────────
     coord.is_deep_calibration_active = MagicMock(return_value=False)
+    coord.active_live_actuator_test_for_zone = MagicMock(return_value=None)
+
+    # ── v1.4.1 Part 1.2: real dict (not a MagicMock auto-attribute), same
+    # reasoning as _learning_last_log above — follow_me's rate-limit compares
+    # a float against the "last sent" value, which must be able to be None.
+    coord._follow_me_last_sent = {}
 
     # ── fire-once-per-episode notification guards ──────────────────────────
     # Real explicit bools (not left to MagicMock auto-vivification, which

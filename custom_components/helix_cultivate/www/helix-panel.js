@@ -1516,6 +1516,9 @@ class HelixTabCycle extends HTMLElement {
         dryingHarvestCompleteHtml = `
           <div class="card" style="border:1px solid var(--hx-green,#3ecf6a)">
             <div class="card-title">🌾 Harvest Complete — Drying Room</div>
+            ${d.drying_batch_elapsed_days != null ? `<div style="font-size:.85rem;font-weight:700;margin-bottom:6px">
+              Day ${d.drying_batch_elapsed_days} of drying
+            </div>` : ''}
             <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px">
               Closes out the batch currently curing in the Drying Room — independent of
               whatever Primary Grow Space is doing now, even a fresh new cycle.
@@ -4927,6 +4930,7 @@ class HelixPanel extends HTMLElement {
       // Zone occupancy (v1.4.0 Part 4)
       zone2_occupied: this._attr('exhaust_speed', 'sensor', 'zone2_occupied') === true,
       drying_occupied: this._attr('exhaust_speed', 'sensor', 'drying_occupied') === true,
+      drying_batch_elapsed_days: this._attr('exhaust_speed', 'sensor', 'drying_batch_elapsed_days') ?? null,
 
       // Independent canopy sensor/fan layer toggles (mid/lower only — upper
       // is the mandatory primary layer for both, no toggle)

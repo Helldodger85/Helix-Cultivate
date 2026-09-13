@@ -20,9 +20,14 @@ from typing import TYPE_CHECKING, Any, Optional
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_DRYING_IS_REVERSE_CYCLE,
+    CONF_ENABLE_CONDITIONING_ROOM,
+    CONF_ENABLE_DRYING_ENVIRONMENT,
     CONF_LEARNING_DURATION_DAYS,
     CONF_LEARNING_STARTED_AT,
     CONF_LEARNING_STATE,
+    CONF_ZONE1_IS_REVERSE_CYCLE,
+    CONF_ZONE2_IS_REVERSE_CYCLE,
     DEEP_CALIBRATION_MAX_MIN,
     DEEP_CALIBRATION_MIN_MIN,
     DEFAULT_LEARNING_DURATION_DAYS,
@@ -31,7 +36,10 @@ from .const import (
     LEARNING_LOG_INTERVAL_MIN,
     LEARNING_STATE_ACTIVE,
     LEARNING_STATE_LEARNING,
+    LIVE_ACTUATOR_TEST_INTERVAL_ACTIVE_HOURS,
+    LIVE_ACTUATOR_TEST_INTERVAL_LEARNING_HOURS,
     LIVE_TEST_MAX_WAIT_MIN,
+    LIVE_TEST_REACHED_TOLERANCE_C,
     LIVE_TEST_SETPOINT_NUDGE_C,
 )
 
@@ -41,8 +49,10 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 # Deep Calibration and Live Actuator Response Testing are mutually exclusive
-# with each other (one test per zone at a time) but independent across
-# zones — tracked as a dict keyed by zone in the durable store.
+# with each other — the durable store holds a single `active_test` slot, so
+# only one test (of either type, for one zone) can be in progress
+# system-wide at any moment. Cross-zone response data is nonetheless
+# tracked independently per dependent zone (see update_cross_zone_response).
 TEST_TYPE_DEEP_CALIBRATION: str = "deep_calibration"
 TEST_TYPE_LIVE_ACTUATOR: str = "live_actuator"
 
@@ -112,27 +122,50 @@ class LearningEngine:
             return True
         return False
 
-    # ── Confidence-weighted blending (7.3) ─────────────────────────────────────
+    # ── Confidence-weighted blending (7.3, upgraded in v1.4.1 Part 4) ───────────
 
     def get_confidence_blended_bias(
-        self, zone: str, outdoor_temp_c: Optional[float]
+        self,
+        zone: str,
+        outdoor_temp_c: Optional[float],
+        hour_of_day: Optional[int] = None,
+        month: Optional[int] = None,
+        lights_on: bool = False,
+        light_pct: float = 0.0,
+        occupied: bool = False,
     ) -> float:
-        """Returns a small additional setpoint bias (°C) derived from this
-        zone's learned regression bucket for the current outdoor-temp
-        condition, weighted by how much data actually exists for it — 0.0
-        whenever there's no store, no bucket, or (necessarily) while still
-        disabled. This never replaces the generic weather feedforward; it's
-        summed on top of it, and its own weight is what keeps a thin-data
-        condition from being treated as confidently known.
+        """Returns a small additional setpoint bias (°C) from this zone's
+        fitted multi-variable regression (Part 4) for the given
+        conditions — combining outdoor temperature, time-of-day, season,
+        lighting, and occupancy rather than requiring this exact
+        combination to have been observed before (the old bucketed model's
+        limitation). Weighted by the regression's own prediction-interval-
+        based confidence: 0.0 whenever there's no store, no fitted model
+        yet (Part 4.4's safe fallback — insufficient or degenerate data
+        must never look confidently known), or a query missing
+        outdoor_temp_c. This never replaces the generic weather
+        feedforward; it's summed on top of it, exactly as before — only
+        what feeds the blending changed, not the blending mechanism.
         """
         store = self._store
         if store is None:
             return 0.0
-        bucket = store.get_regression_bucket(zone, outdoor_temp_bucket(outdoor_temp_c))
-        if bucket is None or not bucket.get("count"):
+        model = store.get_regression_model(zone)
+        if model is None:
             return 0.0
-        confidence = min(1.0, bucket["count"] / LEARNING_CONFIDENT_SAMPLE_COUNT)
-        return float(bucket["mean_response"]) * confidence
+
+        from .learning_regression import build_feature_vector, predict_with_confidence
+
+        x0 = build_feature_vector(
+            outdoor_temp_c=outdoor_temp_c, hour_of_day=hour_of_day, month=month,
+            lights_on=lights_on, light_pct=light_pct, occupied=occupied,
+        )
+        if x0 is None:
+            return 0.0
+        predicted, confidence = predict_with_confidence(model, x0)
+        if confidence <= 0.0:
+            return 0.0
+        return predicted * confidence
 
     # ── Passive continuous logging (7.5/7.6) ────────────────────────────────────
 
@@ -160,6 +193,20 @@ class LearningEngine:
             return
         last_log[zone] = now
 
+        # The response a learned bias should correct is how far below/
+        # above the zone's own setpoint it's running under these
+        # conditions — computed once, here, at log time (using today's
+        # real setpoint) and stored directly on the row, since a later
+        # refit must not recompute it against whatever setpoint happens to
+        # be configured at REFIT time (which could be a different growth
+        # stage entirely).
+        setpoint = getattr(self._coord, "temp_setpoint", None)
+        setpoint_gap_c: Optional[float] = (
+            setpoint - indoor_temp_c
+            if setpoint is not None and indoor_temp_c is not None else None
+        )
+        occupied = cycle_id is not None
+
         await store.record_hourly_log({
             "zone": zone,
             "outdoor_temp_c": outdoor_temp_c,
@@ -169,19 +216,58 @@ class LearningEngine:
             "light_pct": light_pct,
             "cycle_id": cycle_id,
             "hour_of_day": now.hour,
+            "month": now.month,
+            "setpoint_gap_c": setpoint_gap_c,
+            "occupied": occupied,
         })
 
-        if indoor_temp_c is not None and outdoor_temp_c is not None:
-            # The observation folded into the regression bucket is how far
-            # below/above the zone's own setpoint it's running under this
-            # outdoor condition — the thing a learned bias should correct.
-            setpoint = getattr(self._coord, "temp_setpoint", None)
-            if setpoint is not None:
-                await store.update_regression_bucket(
-                    zone, outdoor_temp_bucket(outdoor_temp_c), setpoint - indoor_temp_c
-                )
+        if setpoint_gap_c is not None:
+            await self._refit_regression(zone)
 
         await self._maybe_export(zone, outdoor_temp_c, indoor_temp_c, actuator_duty_pct)
+
+    async def _refit_regression(self, zone: str) -> None:
+        """Part 4.2: refit on the same rolling cadence as before — every
+        time a new usable hourly log lands for this zone (never stops
+        refitting). Trains on every historical row for this zone that
+        carries setpoint_gap_c; rows logged before this upgrade (v1.4.0)
+        lack that field and are simply skipped rather than fabricated —
+        the model naturally starts building real confidence from zero new
+        data after an upgrade instead of guessing.
+        """
+        store = self._store
+        if store is None:
+            return
+        from .learning_regression import build_feature_vector, fit_ols
+
+        rows: list[list[float]] = []
+        targets: list[float] = []
+        for row in store.get_hourly_logs(zone):
+            gap = row.get("setpoint_gap_c")
+            if gap is None:
+                continue
+            vector = build_feature_vector(
+                outdoor_temp_c=row.get("outdoor_temp_c"),
+                hour_of_day=row.get("hour_of_day"),
+                month=row.get("month"),
+                lights_on=bool(row.get("lights_on")),
+                light_pct=float(row.get("light_pct") or 0.0),
+                occupied=bool(row.get("occupied")),
+            )
+            if vector is None:
+                continue
+            rows.append(vector)
+            targets.append(float(gap))
+
+        model = fit_ols(rows, targets)
+        if model is not None:
+            model["updated_at"] = dt_util.utcnow().isoformat()
+            await store.set_regression_model(zone, model)
+        # else: not enough usable data yet, or a degenerate fit — leave
+        # any previously-fitted model untouched rather than discarding it
+        # over what would have to be a transient numerical hiccup (real
+        # sample counts only grow, so a fit that has already succeeded
+        # once should keep succeeding).
 
     # ── Optional InfluxDB / VictoriaMetrics line-protocol export (8.2) ─────────
 
@@ -290,10 +376,14 @@ class LearningEngine:
         """Called every coordinator tick when learning is enabled — checks
         whether an in-progress Deep Calibration has run its full duration
         and, if so, logs the observed free-decay and resumes normal
-        control. Also enforces LIVE_TEST_MAX_WAIT_MIN as a safety cap for
-        live actuator tests so a real fault can't hang a test forever.
-        current_temps maps zone -> current temperature reading, so decay
-        can be measured without a second live sensor lookup here.
+        control. For a thermostat-controlled Live Actuator Test, finishes
+        early as soon as the zone's own dedicated sensor reaches the nudged
+        target (measuring real lag rather than always waiting out the full
+        window); LIVE_TEST_MAX_WAIT_MIN remains a safety cap either way so a
+        real fault (stuck actuator, sensor dropout) can't hang a test
+        forever. current_temps maps zone -> current temperature reading (a
+        dedicated sensor value, never an actuator's own attribute), so
+        decay/lag can be measured without a second live sensor lookup here.
         """
         store = self._store
         if store is None:
@@ -308,11 +398,24 @@ class LearningEngine:
         if active["type"] == TEST_TYPE_DEEP_CALIBRATION:
             if elapsed_min >= active["duration_min"]:
                 await self._finish_deep_calibration(active, current_temps.get(active["zone"]))
-        elif active["type"] == TEST_TYPE_LIVE_ACTUATOR:
-            if elapsed_min >= LIVE_TEST_MAX_WAIT_MIN:
-                await self._finish_live_actuator_test(
-                    active, current_temps.get(active["zone"]), timed_out=True
-                )
+            return
+
+        if active["type"] == TEST_TYPE_LIVE_ACTUATOR:
+            current_temp = current_temps.get(active["zone"])
+            reached_target = False
+            if (
+                active.get("thermostat_controlled")
+                and active.get("nudge_c")
+                and current_temp is not None
+                and active.get("started_temp_c") is not None
+            ):
+                target = active["started_temp_c"] + active["nudge_c"]
+                reached_target = abs(current_temp - target) <= LIVE_TEST_REACHED_TOLERANCE_C
+
+            if reached_target:
+                await self._finish_live_actuator_test(active, current_temps, timed_out=False)
+            elif elapsed_min >= LIVE_TEST_MAX_WAIT_MIN:
+                await self._finish_live_actuator_test(active, current_temps, timed_out=True)
 
     async def _finish_deep_calibration(
         self, test: dict[str, Any], ended_temp: Optional[float]
@@ -338,14 +441,27 @@ class LearningEngine:
     # ── Live Actuator Response Testing (7.4) ────────────────────────────────────
 
     async def start_live_actuator_test(
-        self, zone: str, thermostat_controlled: bool
+        self,
+        zone: str,
+        thermostat_controlled: bool,
+        current_temp: Optional[float] = None,
+        dependent_temps: Optional[dict[str, float]] = None,
     ) -> dict[str, Any]:
         """Available regardless of occupancy (stays within safe bounds).
         For a directly-controlled actuator (e.g. a circulation fan), the
         caller is expected to step it through its increments itself and
         just use this to record the test window; for a thermostat-
-        controlled zone (Reverse Cycle in heat_cool), this nudges the
-        target setpoint and times how long the zone takes to reach it.
+        controlled zone (Reverse Cycle in heat_cool), climate_engine reads
+        this active test back (via the coordinator) and nudges its own
+        effective setpoint by nudge_c for the duration, so the whole nudge/
+        measure/revert cycle runs autonomously on the normal control tick.
+
+        `current_temp`/`dependent_temps` are this zone's (and, for
+        Conditioning Room, its dependents') dedicated-sensor readings AT
+        THE MOMENT the test starts — supplied explicitly by the caller
+        (the coordinator already has them fresh each tick), never read
+        from an actuator's own attributes, so the eventual lag/magnitude
+        measurement compares like-for-like real ambient readings.
         """
         if zone == "conditioning":
             # Cross-zone: eligibility always allowed (Live Actuator Testing
@@ -364,18 +480,26 @@ class LearningEngine:
             "dependent_zones": dependents,
             "started_at": dt_util.utcnow().isoformat(),
             "nudge_c": LIVE_TEST_SETPOINT_NUDGE_C if thermostat_controlled else None,
-            "started_temp_c": None,
-            "started_dependent_temps": {},
+            "started_temp_c": current_temp,
+            "started_dependent_temps": dependent_temps or {},
         }
         await store.set_active_test(test)
+        _LOGGER.info(
+            "Helix Cultivate: Live Actuator Response Test started for zone=%s "
+            "(thermostat_controlled=%s)", zone, thermostat_controlled,
+        )
         return test
 
     async def _finish_live_actuator_test(
-        self, test: dict[str, Any], ended_temp: Optional[float], timed_out: bool
+        self,
+        test: dict[str, Any],
+        current_temps: dict[str, Optional[float]],
+        timed_out: bool,
     ) -> None:
         store = self._require_store()
         started_at = datetime.fromisoformat(test["started_at"])
         lag_min = (dt_util.utcnow() - started_at).total_seconds() / 60.0
+        ended_temp = current_temps.get(test["zone"])
         record = {
             **test, "ended_at": dt_util.utcnow().isoformat(),
             "ended_temp_c": ended_temp, "lag_min": lag_min, "timed_out": timed_out,
@@ -384,16 +508,110 @@ class LearningEngine:
 
         # Cross-zone lag/magnitude — Part 7.4's explicit requirement that
         # this is tracked as its own dataset, distinct from same-zone data.
-        for dependent in test.get("dependent_zones", []):
-            started_dep = test.get("started_dependent_temps", {}).get(dependent)
-            if started_dep is not None and ended_temp is not None and test.get("started_temp_c"):
-                magnitude_ratio = (
-                    abs(ended_temp - started_dep) / abs(test["started_temp_c"] - (test.get("nudge_c") or 1))
-                    if test.get("nudge_c") else 0.0
-                )
-                await store.update_cross_zone_response(dependent, lag_min, magnitude_ratio)
+        # magnitude_ratio compares how far the DEPENDENT zone's own ending
+        # reading moved against how far the SOURCE zone was forced to move
+        # (the nudge) — both sides read from dedicated sensors only.
+        nudge_c = test.get("nudge_c")
+        if nudge_c:
+            for dependent in test.get("dependent_zones", []):
+                started_dep = test.get("started_dependent_temps", {}).get(dependent)
+                ended_dep = current_temps.get(dependent)
+                if started_dep is not None and ended_dep is not None:
+                    magnitude_ratio = abs(ended_dep - started_dep) / abs(nudge_c)
+                    await store.update_cross_zone_response(dependent, lag_min, magnitude_ratio)
 
         await store.set_active_test(None)
+        _LOGGER.info(
+            "Helix Cultivate: Live Actuator Response Test finished for zone=%s — "
+            "lag=%.1f min, timed_out=%s.", test["zone"], lag_min, timed_out,
+        )
+
+    # ── Autonomous scheduling (v1.4.1 Part 2) ───────────────────────────────────
+
+    _LIVE_TEST_CANDIDATE_ZONES: tuple[tuple[str, str], ...] = (
+        ("zone2", CONF_ZONE2_IS_REVERSE_CYCLE),
+        ("conditioning", CONF_ZONE1_IS_REVERSE_CYCLE),
+        ("drying", CONF_DRYING_IS_REVERSE_CYCLE),
+    )
+
+    def _zone_enabled(self, zone: str) -> bool:
+        if zone == "zone2":
+            return True
+        if zone == "conditioning":
+            return bool(self._get(CONF_ENABLE_CONDITIONING_ROOM, False))
+        if zone == "drying":
+            return bool(self._get(CONF_ENABLE_DRYING_ENVIRONMENT, False))
+        return False
+
+    def _last_live_actuator_test_at(self, zone: str) -> Optional[datetime]:
+        store = self._store
+        if store is None:
+            return None
+        matches = [
+            record for record in store.get_test_history()
+            if record.get("type") == TEST_TYPE_LIVE_ACTUATOR and record.get("zone") == zone
+        ]
+        if not matches:
+            return None
+        try:
+            return max(datetime.fromisoformat(r["ended_at"]) for r in matches if r.get("ended_at"))
+        except (TypeError, ValueError):
+            return None
+
+    async def maybe_schedule_live_actuator_test(
+        self, zone_temps: dict[str, Optional[float]]
+    ) -> Optional[dict[str, Any]]:
+        """Part 2 (v1.4.1): decides WHEN to run a Live Actuator Response
+        Test on its own, on the normal coordinator tick — this test type
+        is "available regardless of occupancy" by design (unlike Deep
+        Calibration), so no occupancy check gates it here; a sensible
+        per-zone interval is all that's needed, shorter while still
+        Learning and longer once Active, matching the same "no fixed rigid
+        schedule, just happens naturally in the background" philosophy
+        already used for passive logging. Manual triggering (the Settings
+        tab's own start action) remains available alongside this — both
+        ultimately call start_live_actuator_test() above.
+
+        Never starts a new test while ANY test (either type) is already
+        active — there is a single active-test slot system-wide. Starts at
+        most one test per tick even when several zones are overdue, so a
+        fresh install catching up on several zones at once doesn't try to
+        start them all simultaneously.
+        """
+        store = self._store
+        if store is None:
+            return None
+        if store.get_active_test() is not None:
+            return None
+
+        interval_hours = (
+            LIVE_ACTUATOR_TEST_INTERVAL_LEARNING_HOURS
+            if self.learning_state() == LEARNING_STATE_LEARNING
+            else LIVE_ACTUATOR_TEST_INTERVAL_ACTIVE_HOURS
+        )
+        now = dt_util.utcnow()
+
+        for zone, rc_flag in self._LIVE_TEST_CANDIDATE_ZONES:
+            if not self._zone_enabled(zone):
+                continue
+            last_at = self._last_live_actuator_test_at(zone)
+            if last_at is not None and (now - last_at).total_seconds() < interval_hours * 3600:
+                continue
+
+            thermostat_controlled = bool(self._get(rc_flag, False))
+            current_temp = zone_temps.get(zone)
+            dependent_temps: dict[str, float] = {}
+            if zone == "conditioning":
+                for dependent in self._coord.conditioning_room_dependent_zones():
+                    dep_temp = zone_temps.get(dependent)
+                    if dep_temp is not None:
+                        dependent_temps[dependent] = dep_temp
+
+            return await self.start_live_actuator_test(
+                zone, thermostat_controlled,
+                current_temp=current_temp, dependent_temps=dependent_temps,
+            )
+        return None
 
     def _require_store(self):
         store = self._store

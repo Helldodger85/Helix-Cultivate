@@ -467,6 +467,18 @@ class StageManager:
         return self._elapsed_days()
 
     @property
+    def stage_start_date(self) -> Optional[date]:
+        """The reference date the current stage began — the same value
+        `_elapsed_days()` computes against. Exposed so a caller (e.g. a
+        Space Now Empty transfer to a dedicated Drying Room) can snapshot
+        the true onset-of-stage date for a batch this StageManager is about
+        to stop tracking, so that batch's day-count can keep being derived
+        live (`date.today() - stage_start_date`) after the transfer instead
+        of freezing at whatever elapsed_days happened to read at that
+        moment."""
+        return self._stage_start_date
+
+    @property
     def stage_duration(self) -> int:
         """Target duration (days) of the current stage."""
         return self._duration(self._current_stage)

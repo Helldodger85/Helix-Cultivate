@@ -453,6 +453,11 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             # "Harvest Complete" (dedicated Drying Room) visibility.
             attrs["zone2_occupied"] = self.coordinator.is_zone2_occupied()
             attrs["drying_occupied"] = self.coordinator.is_drying_occupied()
+            # v1.4.1 Part 3: live day-count for a Drying-Room batch,
+            # recomputed on every read from its own unchanging
+            # drying_stage_start_date — never a value frozen at the moment
+            # "Space Now Empty" was pressed.
+            attrs["drying_batch_elapsed_days"] = self.coordinator.drying_batch_elapsed_days()
             # Outdoor conditions (local weather station override applied
             # server-side if mapped)
             attrs["outdoor_weather_entity"] = self.coordinator._get(CONF_OUTDOOR_WEATHER_ENTITY)

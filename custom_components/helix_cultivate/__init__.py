@@ -915,7 +915,17 @@ async def ws_start_live_actuator_test(
 
     try:
         engine = LearningEngine(coordinator)
-        test = await engine.start_live_actuator_test(msg["zone"], msg["thermostat_controlled"])
+        current_temp = coordinator._current_zone_temp_for_learning(msg["zone"])
+        dependent_temps: dict[str, float] = {}
+        if msg["zone"] == "conditioning":
+            for dependent in coordinator.conditioning_room_dependent_zones():
+                dep_temp = coordinator._current_zone_temp_for_learning(dependent)
+                if dep_temp is not None:
+                    dependent_temps[dependent] = dep_temp
+        test = await engine.start_live_actuator_test(
+            msg["zone"], msg["thermostat_controlled"],
+            current_temp=current_temp, dependent_temps=dependent_temps,
+        )
         connection.send_result(msg["id"], test)
     except ValueError as exc:
         connection.send_error(msg["id"], "invalid_input", str(exc))

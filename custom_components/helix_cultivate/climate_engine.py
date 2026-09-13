@@ -86,6 +86,7 @@ from .const import (
     FAN_TIER_MID,
     FAN_TIER_UPPER,
     FEEDFORWARD_PRECONDITIONING_MIN,
+    FOLLOW_ME_MIN_DELTA_C,
     LIGHTS_OFF_PURGE_DURATION_MIN,
     NS_CLIMATE,
     STAGE_DRYING,
@@ -538,12 +539,43 @@ class ClimateEngine:
             domain, service, {"entity_id": entity_id}, role=role
         )
 
+    async def _try_follow_me(
+        self, entity_id: str, current_temp: Optional[float], role: str
+    ) -> None:
+        """Part 1.2 (v1.4.1): best-effort `midea_ac.follow_me` call feeding
+        this zone's own dedicated sensor reading to a Midea/ESPHome unit's
+        onboard regulation — never a substitute for climate.set_temperature
+        above, and never routed through the retry/dropout-alert machinery,
+        since most installs simply don't have this exact hardware and a
+        missing service must never surface as an actuator dropout or any
+        other alert. Only re-sent when the reading has moved meaningfully.
+        """
+        if current_temp is None:
+            return
+        last = self._coord._follow_me_last_sent.get(entity_id)
+        if last is not None and abs(current_temp - last) < FOLLOW_ME_MIN_DELTA_C:
+            return
+        try:
+            await self._coord.hass.services.async_call(
+                "midea_ac", "follow_me",
+                {"entity_id": entity_id, "temperature": current_temp},
+            )
+            self._coord._follow_me_last_sent[entity_id] = current_temp
+        except Exception as exc:  # noqa: BLE001
+            # Quiet — this hardware-specific service simply doesn't exist
+            # for most mapped entities, and that is completely expected.
+            _LOGGER.debug(
+                "Helix Cultivate: midea_ac.follow_me on %s not applied (%s): %s",
+                entity_id, role, exc,
+            )
+
     async def _set_reverse_cycle(
         self,
         entity_id: Optional[str],
         mode: Optional[str],
         role: str = "unknown",
         target_temp: Optional[float] = None,
+        current_temp: Optional[float] = None,
     ) -> None:
         """Set a climate entity's reverse-cycle state.
 
@@ -593,6 +625,10 @@ class ClimateEngine:
                         {"entity_id": entity_id, "temperature": target_temp},
                         role=role,
                     )
+                # Part 1.2 (v1.4.1): independent of the set_temperature call
+                # above — follow_me feeds the unit's own onboard regulation
+                # loop the real current reading, it does not set a target.
+                await self._try_follow_me(entity_id, current_temp, role)
                 return
 
         if not mode:
@@ -1465,6 +1501,7 @@ class ClimateEngine:
         want_heat: bool,
         want_cool: bool,
         target_temp: Optional[float] = None,
+        current_temp: Optional[float] = None,
     ) -> Optional[str]:
         """Drive a reverse-cycle climate unit based on heat/cool demand.
 
@@ -1496,7 +1533,8 @@ class ClimateEngine:
             supported_modes = (state.attributes.get("hvac_modes") or []) if state else []
             if HVAC_MODE_HEAT_COOL in supported_modes or HVAC_MODE_AUTO in supported_modes:
                 await self._set_reverse_cycle(
-                    entity_id, None, role=f"{zone_label}_ac", target_temp=target_temp
+                    entity_id, None, role=f"{zone_label}_ac",
+                    target_temp=target_temp, current_temp=current_temp,
                 )
                 zone.request_reverse_cycle_mode(HVAC_MODE_HEAT_COOL)
                 return HVAC_MODE_HEAT_COOL
@@ -1681,6 +1719,17 @@ class ClimateEngine:
             + max(-VPD_ASSIST_MAX_BIAS_C, min(VPD_ASSIST_MAX_BIAS_C, bias))
             + extra_setpoint_bias_c
         )
+
+        # Part 2 (v1.4.1): an active, thermostat-controlled Live Actuator
+        # Response Test autonomously nudges this zone's own effective
+        # setpoint for its duration — climate_engine's normal tick applies
+        # and later (once the test finishes) naturally reverts it, so the
+        # whole nudge/measure cycle needs no separate execution path.
+        if is_reverse_cycle:
+            live_test = self._coord.active_live_actuator_test_for_zone(learning_zone)
+            if live_test and live_test.get("thermostat_controlled"):
+                effective_setpoint += live_test.get("nudge_c") or 0.0
+
         want_heat, want_cool = self._bang_bang_temp(
             current_temp, setpoint_override=effective_setpoint
         )
@@ -1761,6 +1810,7 @@ class ClimateEngine:
             want_heat=want_heat,
             want_cool=want_cool,
             target_temp=effective_setpoint if is_reverse_cycle else None,
+            current_temp=current_temp if is_reverse_cycle else None,
         )
 
         # ── Issue discrete appliance service calls ─────────────────────────────

@@ -1027,3 +1027,43 @@ LEARNING_LOG_INTERVAL_MIN: float = 60.0
 CONF_LEARNING_EXPORT_ENABLED: str = "thermal_learning_export_enabled"
 CONF_LEARNING_EXPORT_URL: str = "thermal_learning_export_url"
 DEFAULT_LEARNING_EXPORT_ENABLED: bool = False
+
+# ── v1.4.1 Part 1.2: Midea `follow_me` wiring ────────────────────────────────
+# ESPHome's `platform: midea` climate component exposes a `midea_ac.follow_me`
+# service that feeds the unit an external ambient reading so its own onboard
+# regulation works from accurate data — this does NOT correct what the
+# entity's own current_temperature attribute reports back (a confirmed
+# ESPHome limitation), so Helix Cultivate must still never read that
+# attribute for its own control decisions, exactly as everywhere else. Only
+# re-sent when the dedicated sensor's reading has moved meaningfully, to
+# avoid spamming the service every tick. Best-effort, quiet failure — most
+# installs won't have this exact hardware, and that must never surface as an
+# actuator dropout or any other alert.
+FOLLOW_ME_MIN_DELTA_C: float = 0.3
+
+# ── v1.4.1 Part 2: autonomous Live Actuator Response Testing scheduling ─────
+# No fixed rigid schedule — a sensible default cadence per zone, more
+# frequent while still building the model (Learning), less frequent once
+# graduated (Active), matching how passive logging already just happens in
+# the background rather than needing a person to trigger it.
+LIVE_ACTUATOR_TEST_INTERVAL_LEARNING_HOURS: float = 6.0
+LIVE_ACTUATOR_TEST_INTERVAL_ACTIVE_HOURS: float = 24.0
+# How close a thermostat-controlled zone's dedicated sensor must read to the
+# nudged target before the test is considered to have "reached it" and can
+# finish early, rather than always waiting out the full LIVE_TEST_MAX_WAIT_MIN.
+LIVE_TEST_REACHED_TOLERANCE_C: float = 0.3
+
+# ── v1.4.1 Part 4: fitted multi-variable regression ─────────────────────────
+# A zone needs at least this many (post-upgrade, fully-populated) hourly log
+# rows before a fit is attempted at all — below this, even a "successful"
+# least-squares solve would be so underdetermined it's not trustworthy.
+MIN_REGRESSION_SAMPLES: int = 15
+# Approximate one-sided z-value for a ~90% prediction interval — used
+# instead of an exact Student's-t quantile (which would need scipy) since
+# this is deliberately an inspectable approximation, not a claim of formal
+# statistical precision.
+REGRESSION_CONFIDENCE_Z: float = 1.645
+# Prediction-interval half-width (°C) at or beyond which confidence is
+# treated as fully zero — wider than this, the interval is too uncertain to
+# usefully inform even a small setpoint bias.
+REGRESSION_PI_SATURATION_C: float = 3.0

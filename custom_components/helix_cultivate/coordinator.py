@@ -355,6 +355,10 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Part 7.5 (v1.4.0): last passive-log timestamp per zone, keyed by
         # zone label — rate-limits Environmental Learning's hourly logging.
         self._learning_last_log: dict[str, datetime] = {}
+        # Part 1.2 (v1.4.1): last dedicated-sensor reading sent via
+        # midea_ac.follow_me per entity_id — only re-sent on a meaningful
+        # change (FOLLOW_ME_MIN_DELTA_C).
+        self._follow_me_last_sent: dict[str, float] = {}
 
         # ── Appliance dropout watchdog (Phase 10B) ────────────────────────────
         # Keys are role strings: "zone1_heater", "zone1_dehumid", etc.
@@ -1645,6 +1649,28 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return LearningEngine(self).is_deep_calibration_active(zone)
 
+    def active_live_actuator_test_for_zone(self, zone: str) -> Optional[dict[str, Any]]:
+        """Cheap, always-safe check mirroring is_deep_calibration_active
+        above — returns the active test dict when a Live Actuator Response
+        Test is currently running for `zone`, else None. Consumed by
+        climate_engine to autonomously apply (and later revert) the
+        setpoint nudge for a thermostat-controlled zone's test, so the
+        whole nudge/measure cycle needs no manual intervention once
+        started (Part 2, v1.4.1)."""
+        if not self._get(CONF_THERMAL_LEARNING_ENABLED, DEFAULT_THERMAL_LEARNING_ENABLED):
+            return None
+        store = self.hass.data.get(DOMAIN, {}).get("learning_store")
+        if store is None:
+            return None
+        active = store.get_active_test()
+        if not active:
+            return None
+        from .learning_engine import TEST_TYPE_LIVE_ACTUATOR
+
+        if active.get("type") == TEST_TYPE_LIVE_ACTUATOR and active.get("zone") == zone:
+            return active
+        return None
+
     async def _run_environmental_learning_tick(
         self,
         upper_canopy_temp: Optional[float],
@@ -1685,11 +1711,17 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._get(CONF_DRYING_CYCLE_ID),
             )
 
-        await engine.tick_active_test({
+        zone_temps = {
             "zone2": upper_canopy_temp,
             "conditioning": lung_temp,
             "drying": drying_temp,
-        })
+        }
+        await engine.tick_active_test(zone_temps)
+        # Part 2 (v1.4.1): decide autonomously whether it's time to run a
+        # Live Actuator Response Test — a no-op most ticks (interval not
+        # elapsed yet, or a test is already active). Manual triggering (the
+        # Settings tab's start action) remains available alongside this.
+        await engine.maybe_schedule_live_actuator_test(zone_temps)
 
     def _manage_breeze_tasks(self) -> None:
         """Start/stop each tier's breeze loop to match its enabled state
@@ -2614,10 +2646,19 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # already be tracking a different, newer cycle_id, so reading
         # stage_manager live at that point would attribute the wrong
         # batch's durations to this one.
+        # v1.4.1 Part 3 fix: also snapshot the Drying stage's own true
+        # start date (not just its elapsed-days-so-far total). Primary Grow
+        # Space's single live stage_manager is about to be freed for a new
+        # cycle, so this batch's day-count in Drying needs its own
+        # unchanging reference point to keep computing live from — the
+        # transfer itself never touches this date, it only carries forward
+        # whatever stage_manager already had for the current (Drying) stage.
         journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
         if journal is not None:
+            drying_start = self.stage_manager.stage_start_date
             await journal.open_drying_batch(cycle_id, {
                 "stage_durations_snapshot": self.stage_manager.actual_stage_durations(),
+                "drying_stage_start_date": drying_start.isoformat() if drying_start else None,
                 "moved_to_drying_at": dt_util.utcnow().isoformat(),
             })
 
@@ -2636,6 +2677,38 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "helix_cultivate_space_now_empty",
             {"entry_id": self._entry.entry_id, "cycle_id": cycle_id},
         )
+
+    def _drying_batch_live_days(self, snapshot: Optional[dict[str, Any]]) -> Optional[int]:
+        """Recompute the Drying stage's own elapsed-days live from the
+        unchanging `drying_stage_start_date` captured at transfer time —
+        the same `date.today() - stage_start_date` pattern every other
+        stage's day-count already uses. Returns None when the snapshot
+        predates this field (an in-progress v1.4.0 batch) or carries no
+        start date, rather than fabricating a number.
+        """
+        if not snapshot:
+            return None
+        raw = snapshot.get("drying_stage_start_date")
+        if not raw:
+            return None
+        try:
+            start = date.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return None
+        return max(0, (date.today() - start).days)
+
+    def drying_batch_elapsed_days(self) -> Optional[int]:
+        """Live day-count for the batch currently occupying the dedicated
+        Drying Room — for the dashboard. None when nothing is occupying it
+        or no snapshot exists yet."""
+        if not self.is_drying_occupied():
+            return None
+        journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
+        if journal is None:
+            return None
+        cycle_id = self._get(CONF_DRYING_CYCLE_ID)
+        snapshot = journal.get_open_drying_batch(cycle_id)
+        return self._drying_batch_live_days(snapshot)
 
     async def harvest_complete_drying_batch(
         self, wet_weight_g: float, dry_weight_g: float
@@ -2657,8 +2730,18 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         journal = self.hass.data.get(DOMAIN, {}).get("journal_store")
         snapshot = journal.get_open_drying_batch(cycle_id) if journal is not None else None
         stage_durations = (
-            snapshot.get("stage_durations_snapshot") if snapshot is not None else None
+            dict(snapshot.get("stage_durations_snapshot")) if snapshot is not None
+            and snapshot.get("stage_durations_snapshot") is not None else None
         )
+        # v1.4.1 Part 3 fix: the snapshot's own "drying" entry was frozen at
+        # whatever elapsed_days read at transfer time (typically ~0) — the
+        # archived harvest record must reflect the real, final number of
+        # days actually spent drying, recomputed live right now rather than
+        # reusing that stale transfer-time value.
+        if stage_durations is not None:
+            live_drying_days = self._drying_batch_live_days(snapshot)
+            if live_drying_days is not None:
+                stage_durations[STAGE_DRYING] = live_drying_days
 
         # Uses the Drying-specific energy accumulators, not the global
         # zone2 ones — an unrelated, concurrent cycle may already be
