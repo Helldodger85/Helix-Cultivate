@@ -4,6 +4,14 @@ All notable changes to Helix Cultivate are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.5.1] - 2026-09-14
+
+A small, precise correction to v1.5.0's Temporary Override section.
+
+### Fixed
+
+- **Light Intensity's override slider is now entirely absent — not disabled — when the Night context is selected.** The v1.5.0 spec explicitly required this control to be hidden for Night (it has no live effect there: the grow light is forced fully off outside its scheduled on-window regardless of ceiling/override), but the shipped code rendered the slider unconditionally in both contexts, with the limitation only documented rather than the control being hidden as specified. Temp Setpoint and VPD Target are unaffected — both remain fully available and meaningful in either Day or Night context.
+
 ## [1.5.0] - 2026-09-14
 
 This release fixes a real architectural conflict: each grow stage's Profile Card previously showed its own independent, hardcoded lighting-hours value regardless of what Growth Mode (Autoflower/Photoperiod) was actually configured to — meaning the displayed schedule could directly contradict the schedule genuinely being run. It also adds two capabilities that were entirely missing: a genuinely editable per-stage day-count wired to real auto-advance timing, and a proper Day/Night-aware Temporary Override system on Primary Grow Space.
@@ -21,8 +29,9 @@ This release fixes a real architectural conflict: each grow stage's Profile Card
 
 ### Known limitations in this release
 
-- A Light Intensity override for the "Night" context has no live effect under the standard lighting schedule — the grow light is forced fully off outside its scheduled on-window regardless of what ceiling/override is configured, since there is no genuine "night light intensity" concept in this system's actual control loop. The slot exists for structural consistency with Temp/VPD (which are both meaningfully day/night-differentiated) rather than because it does anything for most installs.
 - A dedicated Drying Room's own Reverse Cycle unit still doesn't get the real thermostat-mode upgrade Conditioning Room and Primary Grow Space received in earlier releases (noted previously, unrelated to this release's actual scope, still not addressed here).
+
+> **Note (v1.5.1):** this release originally shipped the Light Intensity override slider rendering unconditionally in the Night context too, with its lack of live effect there only documented as a known limitation rather than the control being hidden as the spec required. See [1.5.1] below — it's now hidden entirely for Night, not merely disclosed.
 
 ## [1.4.1] - 2026-09-13
 

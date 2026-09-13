@@ -69,6 +69,42 @@ function fRH(v) { return v != null ? `${fn(v, 0)}%` : '—'; }
 function fVPD(v) { return v != null ? `${fn(v, 2)} kPa` : '—'; }
 function fPct(v) { return v != null ? `${fn(v, 0)}%` : '—'; }
 
+const OVERRIDE_BADGE = '<span style="font-size:.68rem;color:var(--hx-amber);white-space:nowrap">🔧 Temporary override — reverts at next stage change</span>';
+
+// v1.5.1: the Temporary Override section's three slider rows, pulled into
+// their own pure function so this exact behavior — Light Intensity's
+// slider entirely absent (not merely disabled) for the Night context,
+// since it has no live effect there (the grow light is forced off outside
+// its scheduled on-window regardless of ceiling/override) — is directly
+// testable without needing a full DOM/custom-element harness. Temp
+// Setpoint and VPD Target are unaffected: both remain fully available and
+// meaningful in either context.
+function _renderOverrideSlidersHtml(
+  overrideCtx, tempSP, vpdT, lightP, overrideTempActive, overrideVpdActive, overrideLightActive
+) {
+  const lightBlock = overrideCtx === 'day' ? `
+        <div class="slider-row">
+          <span class="slider-lbl">Light Intensity</span>
+          <input type="range" id="override-light-sl" min="0" max="100" step="1" value="${fn(overrideLightActive ?? lightP, 0)}"/>
+          <span class="slider-val" id="override-light-val">${fPct(overrideLightActive ?? lightP)}</span>
+        </div>
+        ${overrideLightActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}` : '';
+  return `
+        <div class="slider-row">
+          <span class="slider-lbl">Temp Setpoint</span>
+          <input type="range" id="override-temp-sl" min="15" max="35" step="0.5" value="${fn(overrideTempActive ?? tempSP, 1)}"/>
+          <span class="slider-val" id="override-temp-val">${fT(overrideTempActive ?? tempSP)}</span>
+        </div>
+        ${overrideTempActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}
+        <div class="slider-row">
+          <span class="slider-lbl">VPD Target</span>
+          <input type="range" id="override-vpd-sl" min="0.3" max="2.0" step="0.05" value="${fn(overrideVpdActive ?? vpdT, 2)}"/>
+          <span class="slider-val" id="override-vpd-val">${fVPD(overrideVpdActive ?? vpdT)}</span>
+        </div>
+        ${overrideVpdActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}
+        ${lightBlock}`;
+}
+
 // Mirrors coordinator.py's midnight-safe schedule math — used only for the
 // read-only "Lights on HH:MM -> off HH:MM" preview; the coordinator is the
 // actual authority on the applied schedule.
@@ -2949,8 +2985,13 @@ class HelixTabGrowspace extends HTMLElement {
     const values = [
       ['temp', parseFloat(q('#override-temp-sl').value)],
       ['vpd', parseFloat(q('#override-vpd-sl').value)],
-      ['light', parseFloat(q('#override-light-sl').value)],
     ];
+    // v1.5.1: Light Intensity's slider is entirely absent for the Night
+    // context (it has no live effect there — the grow light is forced off
+    // outside its scheduled on-window regardless of ceiling), so there's
+    // nothing to read from the DOM in that case.
+    const lightSl = q('#override-light-sl');
+    if (lightSl) values.push(['light', parseFloat(lightSl.value)]);
     this._overrideStatus = 'Applying…';
     if (statusEl) statusEl.textContent = this._overrideStatus;
     const attrKey = { temp: 'temp_c', vpd: 'vpd', light: 'light_pct' };
@@ -3199,7 +3240,6 @@ class HelixTabGrowspace extends HTMLElement {
     const overrideTempActive = overrideCtx === 'day' ? d.override_day_temp_c : d.override_night_temp_c;
     const overrideVpdActive = overrideCtx === 'day' ? d.override_day_vpd : d.override_night_vpd;
     const overrideLightActive = overrideCtx === 'day' ? d.override_day_light_pct : d.override_night_light_pct;
-    const OVERRIDE_BADGE = '<span style="font-size:.68rem;color:var(--hx-amber);white-space:nowrap">🔧 Temporary override — reverts at next stage change</span>';
 
     // Appliance state chips
     const applianceRow = `
@@ -3452,24 +3492,7 @@ class HelixTabGrowspace extends HTMLElement {
             style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
             background:${overrideCtx === 'night' ? 'var(--hx-blue,#209cee)' : 'none'};color:${overrideCtx === 'night' ? '#fff' : 'var(--hx-text)'};font-weight:600">🌙 Night</button>
         </div>
-        <div class="slider-row">
-          <span class="slider-lbl">Temp Setpoint</span>
-          <input type="range" id="override-temp-sl" min="15" max="35" step="0.5" value="${fn(overrideTempActive ?? tempSP, 1)}"/>
-          <span class="slider-val" id="override-temp-val">${fT(overrideTempActive ?? tempSP)}</span>
-        </div>
-        ${overrideTempActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}
-        <div class="slider-row">
-          <span class="slider-lbl">VPD Target</span>
-          <input type="range" id="override-vpd-sl" min="0.3" max="2.0" step="0.05" value="${fn(overrideVpdActive ?? vpdT, 2)}"/>
-          <span class="slider-val" id="override-vpd-val">${fVPD(overrideVpdActive ?? vpdT)}</span>
-        </div>
-        ${overrideVpdActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}
-        <div class="slider-row">
-          <span class="slider-lbl">Light Intensity</span>
-          <input type="range" id="override-light-sl" min="0" max="100" step="1" value="${fn(overrideLightActive ?? lightP, 0)}"/>
-          <span class="slider-val" id="override-light-val">${fPct(overrideLightActive ?? lightP)}</span>
-        </div>
-        ${overrideLightActive != null ? `<div style="margin:-6px 0 8px">${OVERRIDE_BADGE}</div>` : ''}
+        ${_renderOverrideSlidersHtml(overrideCtx, tempSP, vpdT, lightP, overrideTempActive, overrideVpdActive, overrideLightActive)}
         <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
           <button id="apply-override-btn" style="padding:9px 16px;border-radius:8px;border:none;
             background:var(--hx-amber,#e6a817);color:#111;font-weight:700;cursor:pointer">🔧 Apply Override</button>
