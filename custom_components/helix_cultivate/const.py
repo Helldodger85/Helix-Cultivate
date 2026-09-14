@@ -616,6 +616,18 @@ CONF_ZONE1_BACKUP_HEATER_THRESHOLD_C: str = "zone1_backup_heater_threshold_c"
 # Legacy key kept for backward-compat (separate climate entity)
 CONF_ZONE1_REVERSE_CYCLE: str = "zone1_reverse_cycle"
 
+# v1.5.2 Part 2: Conditioning Room's own Humidity Setpoint — a genuine,
+# adjustable target its dehumidifier (and humidifier, if mapped) is
+# actually driven against, via its own dedicated RH sensor. Conditioning
+# Room has no stage concept the way Primary Grow Space does, so this is a
+# single flat constant, not a per-stage value.
+CONF_ZONE1_RH_SETPOINT: str = "zone1_rh_setpoint"
+DEFAULT_ZONE1_RH_SETPOINT_PCT: float = 55.0
+# Fixed bang-bang deadband (°%RH) for Conditioning Room's humidity control —
+# a reasonable constant, matching the pattern used elsewhere in this app
+# for a value that doesn't need to be user-adjustable (e.g. TEMP_DEADBAND_C).
+ZONE1_RH_DEADBAND_PCT: float = 3.0
+
 # ── Zone 2 appliances (all Optional → None) ───────────────────────────────────
 CONF_ZONE2_HEATER: str = "zone2_heater"
 CONF_ZONE2_AC: str = "zone2_ac"
@@ -737,6 +749,14 @@ NUMBER_SAFETY_LOW_TEMP: str = "safety_low_temp"
 NUMBER_SAFETY_HIGH_RH: str = "safety_high_rh"
 NUMBER_SAFETY_LOW_RH: str = "safety_low_rh"
 NUMBER_SENSOR_DROPOUT_MIN: str = "sensor_dropout_min"
+# v1.5.2 Part 2: Conditioning Room's own genuine, adjustable Humidity
+# Setpoint — previously nonexistent, which is why its dehumidifier was
+# wrongly driven by Primary Grow Space's leaf_vpd instead. No stage
+# concept the way Primary Grow Space has, so one constant target is
+# correct — not a per-stage value, and not part of the Temporary Override
+# system either (that system exists for day/night-differentiated values;
+# this one isn't).
+NUMBER_ZONE1_RH_SETPOINT: str = "zone1_rh_setpoint"
 
 SELECT_TOPOLOGY: str = "topology"
 SELECT_GROW_STAGE: str = "grow_stage"

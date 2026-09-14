@@ -1421,14 +1421,13 @@ class HelixTabCycle extends HTMLElement {
   _render() {
     const d = this._data || {};
 
-    // No Active Cycle (Part 1.3) — the Plant Cycle tab is the primary home
-    // for the Start New Cycle form; replaces the entire stage timeline/
-    // profile-editor view rather than showing a stage that was never
-    // actually begun.
-    if (d.cycle_state === 'not_started') {
-      this._renderNoActiveCycle();
-      return;
-    }
+    // v1.5.2 Part 1: cycle_state now only ever changes the compact status
+    // panel at the very top of the page (see statusPanelHtml below) — the
+    // full Grow Stage Timeline/Profile Card editor beneath it is always
+    // visible and always fully editable regardless of state, so a grower
+    // can view, plan, and tune every stage's targets before ever pressing
+    // Start New Cycle, not only afterward.
+    const cycleActive = d.cycle_state !== 'not_started';
 
     const activeStage = d.grow_stage_slug || 'germination';
     const dedicatedDryingRoom = d.enable_drying_environment === true;
@@ -1721,19 +1720,60 @@ class HelixTabCycle extends HTMLElement {
         </div>` : ''}
       </div>`;
 
-    this.shadowRoot.innerHTML = `
-      <style>${BASE_CSS}:host{display:block;}</style>
-      <!-- Part 6 (v1.5.0): explanatory copy, verbatim -->
-      <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px;line-height:1.5">
-        This is where you set up each growth stage's targets — temperature, VPD, lighting, and
-        how many days it should typically run. Use the recommended defaults as-is, or adjust
-        them to match your own strain and setup. Changes here are permanent and apply
-        immediately, even to the stage you're currently in.
-      </div>
-      <!-- Stage timeline -->
+    // v1.5.2 Part 1.1: the ONLY part of this page that varies with
+    // cycle_state — always rendered first, above the (now always-visible)
+    // Grow Stage Timeline, never below it or interleaved with it.
+    const targetableStages = Object.keys(STAGE_META).filter(s => s !== 'drying');
+    const statusPanelHtml = !cycleActive ? `
       <div class="card">
-        <div class="card-title">🌱 Grow Stage Timeline</div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px">${timelineItems}</div>
+        <div style="text-align:center;padding:20px 10px 24px">
+          <div style="font-size:2.4rem;margin-bottom:8px">🌱</div>
+          <div style="font-size:1.2rem;font-weight:800;margin-bottom:6px">No Active Cycle</div>
+          <div style="font-size:.85rem;color:var(--hx-text2);max-width:420px;margin:0 auto;line-height:1.5">
+            Start a new cycle to begin day-counting, stage progression, and environmental
+            control targets. Every stage's targets below can still be viewed and tuned right
+            now — whichever values are in place when you press Start New Cycle are exactly
+            what that stage will run with.
+          </div>
+        </div>
+        <div class="sec">Growth Mode</div>
+        <div style="display:flex;gap:6px;margin-bottom:14px">
+          <button class="start-growth-mode-btn ${this._startGrowthMode === 'photoperiod' ? 'active' : ''}" data-mode="photoperiod"
+            style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${this._startGrowthMode === 'photoperiod' ? 'var(--hx-blue,#209cee)' : 'none'};
+            color:${this._startGrowthMode === 'photoperiod' ? '#fff' : 'var(--hx-text)'};font-weight:600">Photoperiod</button>
+          <button class="start-growth-mode-btn ${this._startGrowthMode === 'autoflower' ? 'active' : ''}" data-mode="autoflower"
+            style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
+            background:${this._startGrowthMode === 'autoflower' ? 'var(--hx-blue,#209cee)' : 'none'};
+            color:${this._startGrowthMode === 'autoflower' ? '#fff' : 'var(--hx-text)'};font-weight:600">Autoflower</button>
+        </div>
+        <div class="sec">Start Date</div>
+        <div style="margin-bottom:14px">
+          <input type="date" id="start-cycle-date" value="${this._startDate}"
+            style="padding:8px;border-radius:8px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
+          <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
+            Backdate this if the plant was already a few days old when you set up the
+            integration — day-counting and stage duration will be calculated from this date.
+          </div>
+        </div>
+        <div class="sec">Starting Stage</div>
+        <div style="margin-bottom:16px">
+          <select id="start-cycle-stage" style="width:100%;padding:8px;border-radius:8px;
+            border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
+            ${targetableStages.map(s => `<option value="${s}" ${this._startStage === s ? 'selected' : ''}>${STAGE_META[s].icon} ${STAGE_META[s].label}</option>`).join('')}
+          </select>
+          <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
+            Defaults to Germination — choose further along (e.g. Early Veg) for clones or
+            plants purchased already established.
+          </div>
+        </div>
+        ${this._startError ? `<div class="badge bg-red" style="margin-bottom:10px">${this._startError}</div>` : ''}
+        <button id="submit-start-cycle-btn" ${this._startSaving ? 'disabled' : ''} style="width:100%;padding:12px;border-radius:10px;border:none;
+          background:var(--hx-accent);color:#fff;font-weight:700;cursor:pointer;font-size:.9rem">
+          ${this._startSaving ? 'Starting…' : '🌱 Start New Cycle'}
+        </button>
+      </div>` : `
+      <div class="card">
         <div class="g2">
           <div class="stat-cell">
             <div class="val" style="font-size:1.3rem">${STAGE_META[activeStage].icon}</div>
@@ -1749,6 +1789,55 @@ class HelixTabCycle extends HTMLElement {
             </div>
           </div>
         </div>
+      </div>
+      <!-- Abort Cycle (Part 1.5) — a second, clearly-distinct destructive
+           action from harvest close-out: no harvest record, no weight
+           entry, no journal archive. -->
+      <div class="card" style="border:1px solid var(--hx-red,#ff5252)">
+        <div class="card-title">⚠ Abort Cycle</div>
+        <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px;line-height:1.5">
+          For a cycle that never reaches harvest — pests, mistakes, or a failed run.
+          This is <b>not</b> the same as closing out a real harvest: it discards the current
+          stage/day-count with no weight entry and no harvest record, and returns to
+          "No Active Cycle". If you actually have a harvest to record, use Close Out Harvest
+          instead.
+        </div>
+        ${this._showAbortConfirm ? `
+          <div style="background:rgba(255,82,82,.1);border-radius:8px;padding:10px;margin-bottom:10px;font-size:.8rem">
+            Are you sure? This cannot be undone — the current cycle's stage and day-count
+            will be lost.
+          </div>
+          <div style="display:flex;gap:8px">
+            <button id="confirm-abort-btn" ${this._abortSaving ? 'disabled' : ''} style="flex:1;padding:10px;border-radius:8px;border:none;
+              background:var(--hx-red,#ff5252);color:#fff;font-weight:700;cursor:pointer">
+              ${this._abortSaving ? 'Aborting…' : 'Yes, Abort This Cycle'}
+            </button>
+            <button id="cancel-abort-btn" style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border);
+              background:none;color:var(--hx-text);cursor:pointer">Cancel</button>
+          </div>
+        ` : `
+          <button id="open-abort-confirm-btn" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--hx-red,#ff5252);
+            background:none;color:var(--hx-red,#ff5252);font-weight:700;cursor:pointer">⚠ Abort Cycle…</button>
+        `}
+      </div>`;
+
+    this.shadowRoot.innerHTML = `
+      <style>${BASE_CSS}:host{display:block;}</style>
+      ${statusPanelHtml}
+      <!-- Part 6 (v1.5.0): explanatory copy, verbatim -->
+      <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px;line-height:1.5">
+        This is where you set up each growth stage's targets — temperature, VPD, lighting, and
+        how many days it should typically run. Use the recommended defaults as-is, or adjust
+        them to match your own strain and setup. Changes here are permanent and apply
+        immediately, even to the stage you're currently in.
+      </div>
+      <!-- Stage timeline — always visible/editable regardless of
+           cycle_state (Part 1.2); the Active Stage/Day-progress summary
+           now lives exclusively in statusPanelHtml above, since it's only
+           meaningful once a cycle is actually running. -->
+      <div class="card">
+        <div class="card-title">🌱 Grow Stage Timeline</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">${timelineItems}</div>
       </div>
       ${harvestSectionHtml}
       ${dryingHandoffHtml}
@@ -1911,36 +2000,6 @@ class HelixTabCycle extends HTMLElement {
           with manual-action suggestions (e.g. check trellis netting). Advisory only — Helix
           Cultivate never advances a stage automatically because of this.
         </div>
-      </div>
-      <!-- Abort Cycle (Part 1.5) — a second, clearly-distinct destructive
-           action from harvest close-out: no harvest record, no weight
-           entry, no journal archive. -->
-      <div class="card" style="border:1px solid var(--hx-red,#ff5252)">
-        <div class="card-title">⚠ Abort Cycle</div>
-        <div style="font-size:.78rem;color:var(--hx-text2);margin-bottom:10px;line-height:1.5">
-          For a cycle that never reaches harvest — pests, mistakes, or a failed run.
-          This is <b>not</b> the same as closing out a real harvest: it discards the current
-          stage/day-count with no weight entry and no harvest record, and returns to
-          "No Active Cycle". If you actually have a harvest to record, use Close Out Harvest
-          instead.
-        </div>
-        ${this._showAbortConfirm ? `
-          <div style="background:rgba(255,82,82,.1);border-radius:8px;padding:10px;margin-bottom:10px;font-size:.8rem">
-            Are you sure? This cannot be undone — the current cycle's stage and day-count
-            will be lost.
-          </div>
-          <div style="display:flex;gap:8px">
-            <button id="confirm-abort-btn" ${this._abortSaving ? 'disabled' : ''} style="flex:1;padding:10px;border-radius:8px;border:none;
-              background:var(--hx-red,#ff5252);color:#fff;font-weight:700;cursor:pointer">
-              ${this._abortSaving ? 'Aborting…' : 'Yes, Abort This Cycle'}
-            </button>
-            <button id="cancel-abort-btn" style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border);
-              background:none;color:var(--hx-text);cursor:pointer">Cancel</button>
-          </div>
-        ` : `
-          <button id="open-abort-confirm-btn" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--hx-red,#ff5252);
-            background:none;color:var(--hx-red,#ff5252);font-weight:700;cursor:pointer">⚠ Abort Cycle…</button>
-        `}
       </div>
       <!-- Recipe export / import -->
       <div class="card">
@@ -2241,6 +2300,7 @@ class HelixTabCycle extends HTMLElement {
     const confirmAbortBtn = this.shadowRoot.querySelector('#confirm-abort-btn');
     if (confirmAbortBtn) confirmAbortBtn.addEventListener('click', () => this._doAbortCycle());
 
+    this._bindStartCycleForm();
     this._bindSpaceEmptyAndDryingHarvest();
   }
 
@@ -2351,59 +2411,13 @@ class HelixTabCycle extends HTMLElement {
     });
   }
 
-  // ── Start New Cycle (Part 1.2 / 1.3) ──────────────────────────────────────
-
-  _renderNoActiveCycle() {
-    const targetableStages = Object.keys(STAGE_META).filter(s => s !== 'drying');
-    this.shadowRoot.innerHTML = `
-      <style>${BASE_CSS}:host{display:block;}</style>
-      <div class="card">
-        <div style="text-align:center;padding:20px 10px 24px">
-          <div style="font-size:2.4rem;margin-bottom:8px">🌱</div>
-          <div style="font-size:1.2rem;font-weight:800;margin-bottom:6px">No Active Cycle</div>
-          <div style="font-size:.85rem;color:var(--hx-text2);max-width:420px;margin:0 auto;line-height:1.5">
-            Start a new cycle to begin day-counting, stage progression, and environmental
-            control targets.
-          </div>
-        </div>
-        <div class="sec">Growth Mode</div>
-        <div style="display:flex;gap:6px;margin-bottom:14px">
-          <button class="start-growth-mode-btn ${this._startGrowthMode === 'photoperiod' ? 'active' : ''}" data-mode="photoperiod"
-            style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
-            background:${this._startGrowthMode === 'photoperiod' ? 'var(--hx-blue,#209cee)' : 'none'};
-            color:${this._startGrowthMode === 'photoperiod' ? '#fff' : 'var(--hx-text)'};font-weight:600">Photoperiod</button>
-          <button class="start-growth-mode-btn ${this._startGrowthMode === 'autoflower' ? 'active' : ''}" data-mode="autoflower"
-            style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border,#333);cursor:pointer;
-            background:${this._startGrowthMode === 'autoflower' ? 'var(--hx-blue,#209cee)' : 'none'};
-            color:${this._startGrowthMode === 'autoflower' ? '#fff' : 'var(--hx-text)'};font-weight:600">Autoflower</button>
-        </div>
-        <div class="sec">Start Date</div>
-        <div style="margin-bottom:14px">
-          <input type="date" id="start-cycle-date" value="${this._startDate}"
-            style="padding:8px;border-radius:8px;border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)"/>
-          <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
-            Backdate this if the plant was already a few days old when you set up the
-            integration — day-counting and stage duration will be calculated from this date.
-          </div>
-        </div>
-        <div class="sec">Starting Stage</div>
-        <div style="margin-bottom:16px">
-          <select id="start-cycle-stage" style="width:100%;padding:8px;border-radius:8px;
-            border:1px solid var(--hx-border);background:var(--hx-surface2);color:var(--hx-text)">
-            ${targetableStages.map(s => `<option value="${s}" ${this._startStage === s ? 'selected' : ''}>${STAGE_META[s].icon} ${STAGE_META[s].label}</option>`).join('')}
-          </select>
-          <div style="font-size:.7rem;color:var(--hx-text2);margin-top:4px">
-            Defaults to Germination — choose further along (e.g. Early Veg) for clones or
-            plants purchased already established.
-          </div>
-        </div>
-        ${this._startError ? `<div class="badge bg-red" style="margin-bottom:10px">${this._startError}</div>` : ''}
-        <button id="submit-start-cycle-btn" ${this._startSaving ? 'disabled' : ''} style="width:100%;padding:12px;border-radius:10px;border:none;
-          background:var(--hx-accent);color:#fff;font-weight:700;cursor:pointer;font-size:.9rem">
-          ${this._startSaving ? 'Starting…' : '🌱 Start New Cycle'}
-        </button>
-      </div>`;
-
+  // ── Start New Cycle (Part 1.2 / 1.3, status-panel-only per v1.5.2) ────────
+  // The status panel's markup itself now lives inline in _render()
+  // (statusPanelHtml) since it's no longer a full-page replacement — only
+  // the bindings are still factored out here, called from _render()'s own
+  // binding tail. Every element queried below simply doesn't exist (and
+  // these all safely no-op) once cycle_state !== 'not_started'.
+  _bindStartCycleForm() {
     this.shadowRoot.querySelectorAll('.start-growth-mode-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         this._startGrowthMode = btn.dataset.mode;
@@ -3702,6 +3716,7 @@ class HelixTabConditioning extends HTMLElement {
     const enthal = d.lung_enthalpy ?? null;
     const vpdT   = d.vpd_target   ?? 1.0;
     const tempSP = d.temp_setpoint ?? 24;
+    const rhSP   = d.zone1_rh_setpoint ?? 55;
 
     this.shadowRoot.innerHTML = `
       <style>${BASE_CSS}:host{display:block;}</style>
@@ -3735,6 +3750,11 @@ class HelixTabConditioning extends HTMLElement {
           <input type="range" id="z1-temp" min="15" max="30" step="0.5" value="${tempSP}"/>
           <span class="slider-val" id="z1-temp-val">${fT(tempSP)}</span>
         </div>
+        <div class="slider-row">
+          <span class="slider-lbl">Humidity Setpoint</span>
+          <input type="range" id="z1-rh" min="30" max="90" step="1" value="${rhSP}"/>
+          <span class="slider-val" id="z1-rh-val">${fRH(rhSP)}</span>
+        </div>
       </div>`;
 
     const sl = this.shadowRoot.querySelector('#z1-temp');
@@ -3744,6 +3764,19 @@ class HelixTabConditioning extends HTMLElement {
       sl.addEventListener('change', e => {
         if (this._hass) this._hass.callService('number', 'set_value', {
           entity_id: 'number.helix_cultivate_temp_setpoint', value: parseFloat(e.target.value)
+        });
+      });
+    }
+
+    // v1.5.2 Part 2.2: Conditioning Room's own genuine Humidity Setpoint —
+    // its own dedicated number entity, not shared with any other zone.
+    const rhSl = this.shadowRoot.querySelector('#z1-rh');
+    const rhVl = this.shadowRoot.querySelector('#z1-rh-val');
+    if (rhSl) {
+      rhSl.addEventListener('input', e => { if (rhVl) rhVl.textContent = fRH(parseFloat(e.target.value)); });
+      rhSl.addEventListener('change', e => {
+        if (this._hass) this._hass.callService('number', 'set_value', {
+          entity_id: 'number.helix_cultivate_zone1_rh_setpoint', value: parseFloat(e.target.value)
         });
       });
     }
@@ -5121,6 +5154,10 @@ class HelixPanel extends HTMLElement {
       temp_setpoint:       this._num('temp_setpoint') ?? 24.0,
       light_intensity_pct: this._num('light_intensity') ?? 100,
       sunrise_ramp_min:    this._num('sunrise_ramp_min') ?? 20,
+      // v1.5.2 Part 2: Conditioning Room's own Humidity Setpoint — a
+      // genuinely separate persisted value, not shared with Zone 2's
+      // vpd_target the way Temp Setpoint currently (still) is.
+      zone1_rh_setpoint:   this._num('zone1_rh_setpoint') ?? 55.0,
 
       // Zone 2 — Primary Grow Space
       zone2_name:    this._attr('exhaust_speed', 'sensor', 'zone2_name') || 'Primary Grow Space',

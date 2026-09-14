@@ -1,4 +1,4 @@
-"""Helix Cultivate — Number platform (22 number entities)."""
+"""Helix Cultivate — Number platform (23 number entities)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -22,6 +22,8 @@ from .const import (
     CONF_SAFETY_LOW_RH_PCT,
     CONF_SAFETY_LOW_TEMP_C,
     CONF_SENSOR_DROPOUT_MIN,
+    CONF_ZONE1_RH_SETPOINT,
+    DEFAULT_ZONE1_RH_SETPOINT_PCT,
     DEFAULT_ANTI_SHORT_CYCLE_MIN,
     DEFAULT_EXHAUST_MIN_PCT,
     DEFAULT_FAN_SPEED_PCT,
@@ -65,6 +67,7 @@ from .const import (
     NUMBER_UPPER_FAN_SPEED,
     NUMBER_UPPER_FAN_VARIANCE,
     NUMBER_VPD_TARGET,
+    NUMBER_ZONE1_RH_SETPOINT,
 )
 from .coordinator import HelixCoordinator
 
@@ -145,6 +148,23 @@ NUMBER_DESCRIPTIONS: tuple[HelixNumberDescription, ...] = (
         mode=NumberMode.SLIDER,
         value_fn=lambda c: c.rh_setpoint,
         set_fn=lambda c, v: setattr(c, "rh_setpoint", v),
+    ),
+    # v1.5.2 Part 2: Conditioning Room's own genuine, adjustable Humidity
+    # Setpoint — a simple persisted config value (not a live day/night
+    # Temporary Override; Conditioning Room has no stage or day/night
+    # concept for this), matching the Safety-cutoff numbers' pattern below.
+    HelixNumberDescription(
+        key=NUMBER_ZONE1_RH_SETPOINT,
+        name="Conditioning Room Humidity Setpoint",
+        native_unit_of_measurement="%",
+        device_class=NumberDeviceClass.HUMIDITY,
+        native_min_value=30.0,
+        native_max_value=90.0,
+        native_step=1.0,
+        mode=NumberMode.SLIDER,
+        icon="mdi:water-percent",
+        value_fn=lambda c: float(c._config.get(CONF_ZONE1_RH_SETPOINT, DEFAULT_ZONE1_RH_SETPOINT_PCT)),
+        set_fn=_persistent_setter(CONF_ZONE1_RH_SETPOINT, float),
     ),
     # ── Safety cutoffs ────────────────────────────────────────────────────────
     HelixNumberDescription(

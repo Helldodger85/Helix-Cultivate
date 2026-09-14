@@ -61,6 +61,7 @@ from .const import (
     CONF_ZONE1_HUMIDIFIER,
     CONF_ZONE1_IS_REVERSE_CYCLE,
     CONF_ZONE1_REVERSE_CYCLE,
+    CONF_ZONE1_RH_SETPOINT,
     CONF_ZONE2_AC,
     CONF_ZONE2_DEHUMIDIFIER,
     CONF_ZONE2_HEATER,
@@ -72,6 +73,8 @@ from .const import (
     DEFAULT_EXHAUST_MIN_PCT,
     DEFAULT_EXHAUST_SAFE_FLOOR_PCT,
     DEFAULT_HEATER_CUTOFF_C,
+    DEFAULT_ZONE1_RH_SETPOINT_PCT,
+    ZONE1_RH_DEADBAND_PCT,
     DEFAULT_SAFETY_HIGH_RH_PCT,
     DEFAULT_SAFETY_HIGH_TEMP_C,
     DEFAULT_SAFETY_LOW_RH_PCT,
@@ -1491,6 +1494,25 @@ class ClimateEngine:
             return False, True
         return False, False
 
+    def _bang_bang_rh(
+        self, current_rh: Optional[float], rh_setpoint: float
+    ) -> tuple[bool, bool]:
+        """Return (want_humidify, want_dehumidify) for Conditioning Room's
+        own Humidity Setpoint (Part 2, v1.5.2) — a fixed deadband around a
+        single flat target, deliberately independent of leaf_vpd/
+        _bang_bang_vpd above. Conditioning Room has no canopy of its own,
+        so there is no leaf VPD signal that means anything for it; its own
+        dedicated RH sensor against its own Humidity Setpoint is the
+        correct — and only — input for this decision.
+        """
+        if current_rh is None:
+            return False, False
+        if current_rh > rh_setpoint + ZONE1_RH_DEADBAND_PCT:
+            return False, True
+        if current_rh < rh_setpoint - ZONE1_RH_DEADBAND_PCT:
+            return True, False
+        return False, False
+
     # ── Reverse-cycle appliance control ──────────────────────────────────────
 
     async def _control_reverse_cycle(
@@ -1677,6 +1699,7 @@ class ClimateEngine:
         reverse_cycle_id: Optional[str] = None,
         enable_heat_cutoff: bool = False,
         extra_setpoint_bias_c: float = 0.0,
+        humidity_demand: Optional[tuple[bool, bool]] = None,
     ) -> Optional[str]:
         """Evaluate and apply appliance states for a single zone.
 
@@ -1733,7 +1756,16 @@ class ClimateEngine:
         want_heat, want_cool = self._bang_bang_temp(
             current_temp, setpoint_override=effective_setpoint
         )
-        want_humid, want_dehumid = self._bang_bang_vpd(leaf_vpd)
+        # Part 2.3 (v1.5.2): a caller-supplied humidity_demand (Conditioning
+        # Room's own dedicated-RH-sensor-vs-Humidity-Setpoint decision, see
+        # _bang_bang_rh) takes priority over the default leaf_vpd-driven
+        # bang-bang — a genuinely separate decision path, never blended
+        # with it. Primary Grow Space never passes this, so it keeps using
+        # its own real leaf VPD exactly as before.
+        if humidity_demand is not None:
+            want_humid, want_dehumid = humidity_demand
+        else:
+            want_humid, want_dehumid = self._bang_bang_vpd(leaf_vpd)
 
         # ── Thermal cutoffs ────────────────────────────────────────────────────
         if enable_heat_cutoff and current_temp is not None:
@@ -2216,6 +2248,14 @@ class ClimateEngine:
                     zone1_heater_on = not z1_is_rc
                     zone1_reverse_cycle_mode = HVAC_MODE_HEAT if z1_is_rc else None
                 else:
+                    # Part 2 (v1.5.2): Conditioning Room's own dedicated RH
+                    # sensor against its own Humidity Setpoint — never
+                    # leaf_vpd, which is the tent's own canopy VPD and has
+                    # nothing to do with Conditioning Room's actual humidity.
+                    zone1_rh_setpoint = float(
+                        self._get(CONF_ZONE1_RH_SETPOINT, DEFAULT_ZONE1_RH_SETPOINT_PCT)
+                    )
+                    zone1_humidity_demand = self._bang_bang_rh(lung_rh, zone1_rh_setpoint)
                     zone1_reverse_cycle_mode = await self._control_zone(
                         zone=self._z1,
                         zone_label="zone1",
@@ -2229,6 +2269,7 @@ class ClimateEngine:
                         reverse_cycle_id=self._get(CONF_ZONE1_REVERSE_CYCLE),
                         enable_heat_cutoff=True,
                         extra_setpoint_bias_c=self._preheat_bias_c(),
+                        humidity_demand=zone1_humidity_demand,
                     )
                     zone1_heater_on = self._z1.heater_on
                     zone1_ac_on = self._z1.ac_on

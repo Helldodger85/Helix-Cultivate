@@ -4,6 +4,15 @@ All notable changes to Helix Cultivate are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.5.2] - 2026-09-14
+
+Two fixes: a design correction to a genuine mistake in the original v1.2.9 spec (not a Claude Code implementation error), and a real control bug in Conditioning Room's humidity handling.
+
+### Fixed
+
+- **The Plant Cycle tab no longer blocks stage configuration behind an active cycle.** The original v1.2.9 "No Active Cycle" empty state was specified too broadly, replacing the entire Grow Stage Timeline with the Start New Cycle form — so a grower could not view, plan, or tune any stage's targets (VPD, temperature, lighting, day-count) until a cycle was already running. The tab is now split into a compact status panel at the very top (the only part that varies by `cycle_state` — the Start form when not started, or the live Day X/Y progress and Abort Cycle when active) with the full timeline/profile editor always visible and fully editable beneath it. Stage targets tuned before Start New Cycle is pressed are exactly what that stage runs with once active — `start_cycle()` never touched persisted `stage_targets_{stage}` values, so this was purely a display/access restriction, not a data problem. Growth Mode's existing lock-while-occupied behavior (v1.5.0 Part 1) is unaffected.
+- **Conditioning Room's dehumidifier (and humidifier, if mapped) was being driven by Primary Grow Space's leaf VPD**, not its own humidity — because it had no adjustable humidity target of its own at all, so nothing was ever comparing against a Conditioning-Room-specific value in the first place. Added a genuine Conditioning Room Humidity Setpoint (one flat value — Conditioning Room has no stage concept the way Primary Grow Space does) with its own slider on the Conditioning Room tab's Setpoints card, and a fixed-deadband bang-bang decision driven exclusively by Conditioning Room's own dedicated RH sensor against it. Primary Grow Space's own VPD-driven humidity control is unchanged — this is a genuinely separate decision path, not a shared or blended one.
+
 ## [1.5.1] - 2026-09-14
 
 A small, precise correction to v1.5.0's Temporary Override section.
