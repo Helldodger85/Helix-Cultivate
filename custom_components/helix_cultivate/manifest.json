@@ -1,13 +1,13 @@
 {
   "domain": "helix_cultivate",
   "name": "Helix Cultivate",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "config_flow": true,
   "iot_class": "local_push",
   "dependencies": ["frontend"],
   "requirements": ["Pillow>=10.0.0", "numpy>=1.24.0"],
   "codeowners": ["@helix-cultivate"],
   "homeassistant": "2024.7.0",
-  "documentation": "https://github.com/helix-cultivate/helix_cultivate",
-  "issue_tracker": "https://github.com/helix-cultivate/helix_cultivate/issues"
+  "documentation": "https://github.com/Helldodger85/Helix-Cultivate",
+  "issue_tracker": "https://github.com/Helldodger85/Helix-Cultivate/issues"
 }

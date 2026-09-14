@@ -4,6 +4,20 @@ All notable changes to Helix Cultivate are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.5.3] - 2026-09-14
+
+A documentation accuracy correction, plus a real regression found and fixed along the way — every bullet in the README's Known Issues section was re-verified directly against the current codebase rather than assumed still accurate.
+
+### Fixed
+
+- **`manifest.json`'s `documentation`/`issue_tracker` links had regressed back to the placeholder `helix-cultivate/helix_cultivate` org.** These were correctly fixed to the real repo in an earlier release, but a later, unrelated commit was based on a pre-fix copy of the file and silently reintroduced the placeholder. Re-fixed to `https://github.com/Helldodger85/Helix-Cultivate` — this is what Home Assistant's integration page actually links to for "Documentation" and "Report an issue."
+- **The README's own GitHub Issues link had the same placeholder-org bug**, missed when `manifest.json` was first fixed. Corrected to `https://github.com/Helldodger85/Helix-Cultivate/issues`.
+
+### Changed
+
+- **Rewrote the Known Issues section's frontend-testing claim**, which had gone stale — it previously said frontend behavior was "verified through code review and syntax checking" with no automated coverage at all, which stopped being true as of v1.5.1/v1.5.2's `tests/js/harness.js` (real instantiation and markup inspection for the Plant Cycle status-panel/timeline split and the Temporary Override Day/Night slider visibility). The rewritten bullet states plainly what that harness does and doesn't cover — real output verification for those two areas, not a full browser or live-Home-Assistant test, and not yet extended to the rest of the dashboard panel.
+- Re-verified every other bullet (Breeze re-modulation interval, Environmental Learning's regression still unwired from live control, Drying Room's Reverse Cycle unit still on discrete switching, `midea_ac.follow_me`'s best-effort/IR-transmitter caveat) directly against the current code — all confirmed still genuinely true, none removed, no new limitations found to add.
+
 ## [1.5.2] - 2026-09-14
 
 Two fixes: a design correction to a genuine mistake in the original v1.2.9 spec (not a Claude Code implementation error), and a real control bug in Conditioning Room's humidity handling.
