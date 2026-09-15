@@ -4,6 +4,15 @@ All notable changes to Helix Cultivate are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.5.4] - 2026-09-16
+
+Two real control-loop bugs found via a full simulated grow cycle (all eight stages, germination through drying, plus targeted stress bursts) exercising the actual coordinator/stage-manager/climate-engine code against a live Home Assistant test instance rather than the mocked unit-test fixtures alone. Both are genuine regressions with real operational impact; neither was caught by the existing 463-test suite because each depends on a runtime condition (an uninitialized attribute's first real-world hit; a hardware state left over from a previous tick) that unit tests built around fresh, pre-seeded mocks don't naturally exercise.
+
+### Fixed
+
+- **A fresh dropped-VPD condition could permanently disable all climate control.** `_check_chronic_vpd_drift()` read `self._vpd_drift_since` without it ever being initialized in `HelixCoordinator.__init__`. The first time that method ran while leaf VPD was already outside the target band — a normal situation after a Home Assistant restart, a fresh install, or a stage transition into a tighter band — it raised an unhandled `AttributeError`. Because the failing branch never got the chance to assign the attribute, it re-raised on every subsequent tick too, aborting the coordinator's entire update cycle *before* `ClimateEngine.run()` ever ran — silently disabling heater/AC/humidifier/dehumidifier/exhaust control, the light schedule, and DLI/energy accumulation for as long as the excursion lasted, with no error surfaced anywhere but the log. Fixed by initializing `_vpd_drift_since`/`_chronic_drift_alert_fired` alongside the existing dew-point dwell-timer init (same class of gap as the `_appliance_unavail_since` fix from an earlier release).
+- **The dew point / condensation hard override could leave Zone 1's heater and AC running at the same time.** When a sustained narrow leaf-temp-to-dew-point gap engages the override, it forces Zone 1's heater on directly and — by design (see the function's own docstring) — `run()` skips Zone 1's normal bang-bang control entirely for that tick, since that control would otherwise immediately fight the override. But Zone 1's normal control is also the only place that ever turns its AC off, and Zone 1 can perfectly legitimately have its AC already running the moment a dew point risk develops. The override never told it to stop, so it kept running alongside the heater the override had just forced on, for as long as the override stayed engaged. Fixed by having the override explicitly turn Zone 1's AC off in the same step it forces the heater on. Added a regression test (`test_sustained_override_also_turns_off_stale_ac`) covering this exact scenario.
+
 ## [1.5.3] - 2026-09-14
 
 A documentation accuracy correction, plus a real regression found and fixed along the way — every bullet in the README's Known Issues section was re-verified directly against the current codebase rather than assumed still accurate.

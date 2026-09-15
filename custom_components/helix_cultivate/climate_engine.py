@@ -960,6 +960,17 @@ class ClimateEngine:
                 self._get(CONF_ZONE1_REVERSE_CYCLE), HVAC_MODE_HEAT, role="zone1_ac"
             )
         else:
+            # The caller (run()) skips Zone 1's normal _control_zone bang-bang
+            # entirely for this tick (see docstring above) — which is also
+            # the only place that would otherwise turn Zone 1's AC off. If
+            # the AC was already running from a previous tick (a perfectly
+            # normal state — Zone 1 can be legitimately over its cooling
+            # setpoint the moment a dew point risk develops), it would
+            # otherwise never be told to stop, leaving it running alongside
+            # the heater this override just forced on until _control_zone
+            # resumes on some later tick. Force it off explicitly here so
+            # the override can't coexist with a stale AC-on state.
+            await self._set_switch(self._get(CONF_ZONE1_AC), False, role="zone1_ac")
             await self._set_switch(self._get(CONF_ZONE1_HEATER), True, role="zone1_heater")
 
         if not self._coord._dew_point_alerted:

@@ -375,6 +375,21 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._dew_point_risk_since: Optional[datetime] = None
         self._dew_point_alerted: bool = False
 
+        # ── Chronic VPD drift dwell timer ───────────────────────────────────────
+        # Pre-existing gap (same class of bug as the _appliance_unavail_since
+        # fix noted above): _check_chronic_vpd_drift() reads
+        # self._vpd_drift_since on its very first call whenever leaf VPD is
+        # already outside the target band (a perfectly realistic starting
+        # condition — e.g. right after a HA restart, a fresh install, or a
+        # stage transition to a tighter band) — with no init here, that read
+        # raised an unhandled AttributeError, aborting the ENTIRE coordinator
+        # tick before ClimateEngine.run() ever ran. Because the failing
+        # branch never assigns the attribute, it re-raised on every
+        # subsequent tick too, silently disabling all climate control for as
+        # long as the excursion lasted.
+        self._vpd_drift_since: Optional[datetime] = None
+        self._chronic_drift_alert_fired: bool = False
+
         # ── Canopy wind sweep (Part 3.2) ───────────────────────────────────────
         self._wind_sweep_phase_since: Optional[datetime] = None
         self._wind_sweep_current_tier: Optional[str] = None

@@ -14,6 +14,7 @@ import pytest
 import custom_components.helix_cultivate.climate_engine as climate_engine_module
 from custom_components.helix_cultivate.const import (
     CONF_HEATER_CUTOFF_C,
+    CONF_ZONE1_AC,
     CONF_ZONE1_HEATER,
     CONF_ZONE1_IS_REVERSE_CYCLE,
     CONF_ZONE1_REVERSE_CYCLE,
@@ -210,3 +211,49 @@ async def test_zone1_heater_cutoff_does_not_undo_dew_point_override(engine, mock
     mock_coord.hass.services.async_call.assert_awaited_once_with(
         "switch", "turn_on", {"entity_id": "switch.zone1_heater"}
     )
+
+
+@pytest.mark.asyncio
+async def test_sustained_override_also_turns_off_stale_ac(engine, mock_coord, monkeypatch):
+    """Regression test: Zone 1's AC can legitimately already be running when
+    a dew point risk develops (Zone 1 was simply too warm a moment ago).
+    run() skips Zone 1's normal _control_zone bang-bang entirely while the
+    override is active (see _handle_dew_point_risk's docstring) — that is
+    also the only code path that would otherwise turn the AC off, so
+    without an explicit AC-off here the heater this override forces on
+    would run alongside a stale, still-on AC indefinitely, until whenever
+    _control_zone next happens to resume. The override must turn the AC
+    off itself.
+    """
+    mock_coord.effective_leaf_temp_offset_c = MagicMock(return_value=-2.5)
+    mock_coord._calc_dew_point_c = MagicMock(return_value=20.0)  # gap 1.5 < 2.0 margin
+    mock_coord._dew_point_risk_since = None
+    mock_coord._dew_point_alerted = False
+    mock_coord._config[CONF_ZONE1_HEATER] = "switch.zone1_heater"
+    mock_coord._config[CONF_ZONE1_AC] = "switch.zone1_ac"
+    mock_coord.hass.states.get = MagicMock(
+        side_effect=lambda eid: MagicMock(state="off") if eid == "switch.zone1_heater"
+        else MagicMock(state="on") if eid == "switch.zone1_ac"
+        else None
+    )
+
+    await engine._handle_dew_point_risk(24.0, 60.0)  # starts dwell
+
+    sustained = FIXED_NOW + timedelta(minutes=DEW_POINT_OVERRIDE_DWELL_MIN + 1)
+    monkeypatch.setattr(climate_engine_module.dt_util, "utcnow", lambda: sustained)
+    risk = await engine._handle_dew_point_risk(24.0, 60.0)
+
+    assert risk is True
+    calls = mock_coord.hass.services.async_call.await_args_list
+    assert (
+        "switch", "turn_off", {"entity_id": "switch.zone1_ac"}
+    ) in [(c.args[0], c.args[1], c.args[2]) for c in calls]
+    assert (
+        "switch", "turn_on", {"entity_id": "switch.zone1_heater"}
+    ) in [(c.args[0], c.args[1], c.args[2]) for c in calls]
+    # AC must be turned off before (or at worst alongside) the heater turning
+    # on — never only after, which would still allow one control tick with
+    # both running.
+    ac_off_index = next(i for i, c in enumerate(calls) if c.args[:2] == ("switch", "turn_off"))
+    heater_on_index = next(i for i, c in enumerate(calls) if c.args[:2] == ("switch", "turn_on"))
+    assert ac_off_index < heater_on_index
