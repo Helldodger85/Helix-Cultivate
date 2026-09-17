@@ -3854,7 +3854,30 @@ customElements.define('helix-tab-growspace', HelixTabGrowspace);
 // ─────────────────────────────────────────────────────────────────────────────
 
 class HelixTabConditioning extends HTMLElement {
-  constructor() { super(); this.attachShadow({ mode: 'open' }); this._isEditingHardware = false; this._hwFormBuilt = false; }
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._isEditingHardware = false;
+    this._hwFormBuilt = false;
+    // v1.6.1 fix: this._render() rebuilds the whole shadowRoot.innerHTML on
+    // every coordinator data push (every COORDINATOR_UPDATE_INTERVAL, 30s —
+    // see const.py), same as every other tab. <helix-shadow-comparison-card>
+    // was embedded directly in that regenerated markup, so it was being
+    // destroyed and recreated from scratch every single tick: its
+    // constructor reset _rows/_events to empty, then its `hass` setter's
+    // "first assignment" fetch fired again on the brand-new instance,
+    // producing an empty->loading->loaded flash every 30 seconds. Unlike
+    // <helix-sparkline-card> (which defaults to synchronous 'live' mode and
+    // so rarely shows this), the comparison chart has no live mode — it is
+    // always in async-fetch mode, so it flickered on literally every tick.
+    // Fixed the same way the root <helix-panel> already reuses whole tab
+    // elements across ticks (see _update()'s data-tab-id check) instead of
+    // ever destroying them: this single instance is created once, cached
+    // here, and re-appended into a fresh placeholder slot on every render
+    // — never recreated — so its fetched data and one-time-fetch guard
+    // survive every subsequent coordinator tick.
+    this._shadowComparisonEl = null;
+  }
 
   set hass(h) { this._hass = h; }
   set data(d) { this._data = d; this._render(); }
@@ -3890,6 +3913,20 @@ class HelixTabConditioning extends HTMLElement {
           );
       _bindHwPicker(this.shadowRoot, this, ZONE1_HW_KEYS, () => {
         const fields = {};
+        // v1.6.1 fix: this extraFieldsGetter never read the Reverse Cycle
+        // Unit toggle at all (unlike HelixTabGrowspace/HelixTabDrying's
+        // equivalent callbacks, which both already loop over every
+        // .hw-layer-toggle) — so Save's payload never contained
+        // zone1_is_reverse_cycle, regardless of the checkbox's state. The
+        // backend accepts and persists this key correctly whenever it's
+        // actually sent (it's in VALID_SETTINGS_FIELD_KEYS, and
+        // queue_option_write's debounced flush merges against the config
+        // entry's current options rather than overwriting them), and the
+        // read-back on reopen was also always correct — this single line
+        // was the entire bug.
+        this.shadowRoot.querySelectorAll('.hw-layer-toggle').forEach(el => {
+          fields[el.dataset.layer] = el.checked;
+        });
         const preheatSl = this.shadowRoot.querySelector('#hw-preheat-lead-slider');
         if (preheatSl) fields.preheat_lead_min = parseFloat(preheatSl.value);
         return fields;
@@ -3926,8 +3963,10 @@ class HelixTabConditioning extends HTMLElement {
 
     // v1.6.0 Part 6/7: the real-vs-shadow comparison chart + weather-event
     // log, only meaningful once Environmental Learning is actually on.
+    // v1.6.1: a placeholder slot, not the element itself — see the
+    // constructor comment on _shadowComparisonEl for why.
     const comparisonChartHtml = d.thermal_learning_enabled
-      ? `<helix-shadow-comparison-card id="shadow-comparison"></helix-shadow-comparison-card>`
+      ? `<div id="shadow-comparison-slot"></div>`
       : '';
 
     this.shadowRoot.innerHTML = `
@@ -3971,8 +4010,15 @@ class HelixTabConditioning extends HTMLElement {
       </div>
       ${comparisonChartHtml}`;
 
-    const shadowComparisonEl = this.shadowRoot.querySelector('#shadow-comparison');
-    if (shadowComparisonEl && this._hass) shadowComparisonEl.hass = this._hass;
+    // v1.6.1: re-mount the one persistent chart instance into the fresh
+    // slot rather than letting the innerHTML rebuild above create a new
+    // one — see the constructor comment on _shadowComparisonEl.
+    const shadowSlot = this.shadowRoot.querySelector('#shadow-comparison-slot');
+    if (shadowSlot) {
+      if (!this._shadowComparisonEl) this._shadowComparisonEl = new HelixShadowComparisonCard();
+      shadowSlot.appendChild(this._shadowComparisonEl);
+      if (this._hass) this._shadowComparisonEl.hass = this._hass;
+    }
 
     const sl = this.shadowRoot.querySelector('#z1-temp');
     const vl = this.shadowRoot.querySelector('#z1-temp-val');

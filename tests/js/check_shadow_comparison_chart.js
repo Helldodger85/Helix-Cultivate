@@ -35,8 +35,8 @@ const offHtml = renderConditioning({
 });
 assert.ok(!offHtml.includes('Shadow suggestion'),
   'Shadow readout must be hidden entirely when master toggle is off');
-assert.ok(!offHtml.includes('helix-shadow-comparison-card'),
-  'Comparison chart element must be absent when master toggle is off');
+assert.ok(!offHtml.includes('shadow-comparison-slot'),
+  'Comparison chart placeholder slot must be absent when master toggle is off');
 
 // ── Master toggle on, Shadow Mode ON: "not applied" phrasing ───────────────
 const shadowOnHtml = renderConditioning({
@@ -49,8 +49,12 @@ assert.ok(shadowOnHtml.includes('confidence: 72%'),
   'Shadow readout must show confidence as a percentage');
 assert.ok(shadowOnHtml.includes('not applied'),
   'Shadow Mode ON must render "not applied"');
-assert.ok(shadowOnHtml.includes('<helix-shadow-comparison-card'),
-  'Comparison chart element must be present when master toggle is on');
+// v1.6.1: the chart is no longer embedded as literal markup (that was the
+// flicker bug's root cause — see check_shadow_comparison_persistence.js) —
+// it's a placeholder slot that HelixTabConditioning mounts one persistent
+// instance into imperatively.
+assert.ok(shadowOnHtml.includes('id="shadow-comparison-slot"'),
+  'Comparison chart placeholder slot must be present when master toggle is on');
 
 // ── Master toggle on, Shadow Mode OFF: "applied" phrasing ──────────────────
 const shadowOffHtml = renderConditioning({
