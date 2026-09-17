@@ -88,6 +88,23 @@ def mock_coord():
     coord.is_deep_calibration_active = MagicMock(return_value=False)
     coord.active_live_actuator_test_for_zone = MagicMock(return_value=None)
 
+    # ── v1.6.0 Part 5.2: Shadow Mode feedforward — a real callable (not a
+    # bare MagicMock, which isn't subscriptable) returning the inert
+    # "Environmental Learning disabled" shape by default, matching the
+    # real coordinator method's own disabled-toggle fallback exactly.
+    def _default_shadow_feedforward(generic_bias_c, outdoor_temp_c=None, indoor_temp_c=None,
+                                     lights_on=False, light_pct=0.0, occupied=False):
+        return {
+            "shadow_mode": True,
+            "generic_bias_c": generic_bias_c,
+            "blended_bias_c": 0.0,
+            "confidence": 0.0,
+            "applied_bias_c": generic_bias_c,
+            "predicted_indoor_temp_c": None,
+        }
+
+    coord.get_conditioning_shadow_feedforward = MagicMock(side_effect=_default_shadow_feedforward)
+
     # ── v1.4.1 Part 1.2: real dict (not a MagicMock auto-attribute), same
     # reasoning as _learning_last_log above — follow_me's rate-limit compares
     # a float against the "last sent" value, which must be able to be None.

@@ -24,6 +24,7 @@ from .const import (
     CONF_ENABLE_CONDITIONING_ROOM,
     CONF_ENABLE_DRYING_ENVIRONMENT,
     CONF_LEARNING_DURATION_DAYS,
+    CONF_LEARNING_SHADOW_MODE,
     CONF_LEARNING_STARTED_AT,
     CONF_LEARNING_STATE,
     CONF_ZONE1_IS_REVERSE_CYCLE,
@@ -31,6 +32,7 @@ from .const import (
     DEEP_CALIBRATION_MAX_MIN,
     DEEP_CALIBRATION_MIN_MIN,
     DEFAULT_LEARNING_DURATION_DAYS,
+    DEFAULT_LEARNING_SHADOW_MODE,
     DOMAIN,
     LEARNING_CONFIDENT_SAMPLE_COUNT,
     LEARNING_LOG_INTERVAL_MIN,
@@ -41,6 +43,8 @@ from .const import (
     LIVE_TEST_MAX_WAIT_MIN,
     LIVE_TEST_REACHED_TOLERANCE_C,
     LIVE_TEST_SETPOINT_NUDGE_C,
+    WEATHER_EVENT_PRECIP_THRESHOLD_PCT,
+    WEATHER_EVENT_TEMP_SWING_C,
 )
 
 if TYPE_CHECKING:
@@ -97,6 +101,16 @@ class LearningEngine:
         self._coord._config[CONF_LEARNING_STARTED_AT] = now.isoformat()
         self._coord.queue_option_write(CONF_LEARNING_STATE, LEARNING_STATE_LEARNING)
         self._coord.queue_option_write(CONF_LEARNING_STARTED_AT, now.isoformat())
+        # Part 5.1 (v1.6.0): Shadow Mode defaults ON whenever Environmental
+        # Learning is first enabled — a grower must opt IN to letting the
+        # regression touch a real setpoint, never the other way around.
+        self._coord._config[CONF_LEARNING_SHADOW_MODE] = DEFAULT_LEARNING_SHADOW_MODE
+        self._coord.queue_option_write(CONF_LEARNING_SHADOW_MODE, DEFAULT_LEARNING_SHADOW_MODE)
+
+    def shadow_mode_enabled(self) -> bool:
+        """Part 5.1: True while the regression's predictions must never
+        touch a real setpoint — only ever observed, never applied."""
+        return bool(self._get(CONF_LEARNING_SHADOW_MODE, DEFAULT_LEARNING_SHADOW_MODE))
 
     def maybe_graduate_to_active(self) -> bool:
         """Part 7.2: unconditional graduation after the configured fixed
@@ -147,12 +161,33 @@ class LearningEngine:
         feedforward; it's summed on top of it, exactly as before — only
         what feeds the blending changed, not the blending mechanism.
         """
+        predicted, confidence = self._predict_with_confidence(
+            zone, outdoor_temp_c, hour_of_day, month, lights_on, light_pct, occupied,
+        )
+        if confidence <= 0.0:
+            return 0.0
+        return predicted * confidence
+
+    def _predict_with_confidence(
+        self,
+        zone: str,
+        outdoor_temp_c: Optional[float],
+        hour_of_day: Optional[int],
+        month: Optional[int],
+        lights_on: bool,
+        light_pct: float,
+        occupied: bool,
+    ) -> tuple[float, float]:
+        """Shared regression lookup backing both get_confidence_blended_bias
+        and the Part 5.2 Shadow Mode readout, so both see the exact same
+        raw prediction/confidence pair from a single fit — never computed
+        twice with any chance of drifting apart."""
         store = self._store
         if store is None:
-            return 0.0
+            return 0.0, 0.0
         model = store.get_regression_model(zone)
         if model is None:
-            return 0.0
+            return 0.0, 0.0
 
         from .learning_regression import build_feature_vector, predict_with_confidence
 
@@ -161,11 +196,163 @@ class LearningEngine:
             lights_on=lights_on, light_pct=light_pct, occupied=occupied,
         )
         if x0 is None:
-            return 0.0
-        predicted, confidence = predict_with_confidence(model, x0)
-        if confidence <= 0.0:
-            return 0.0
-        return predicted * confidence
+            return 0.0, 0.0
+        return predict_with_confidence(model, x0)
+
+    # ── Shadow Mode feedforward (Part 5.2, v1.6.0) ───────────────────────────
+
+    def compute_conditioning_shadow_feedforward(
+        self,
+        generic_bias_c: float,
+        outdoor_temp_c: Optional[float],
+        indoor_temp_c: Optional[float],
+        lights_on: bool = False,
+        light_pct: float = 0.0,
+        occupied: bool = False,
+    ) -> dict[str, Any]:
+        """Computes Conditioning Room's confidence-weighted blended
+        feedforward bias every tick regardless of Shadow Mode's state (so
+        the Part 6 comparison chart and Part 8 readout stay live either
+        way), and decides which bias value is actually applied to the real
+        setpoint: the existing generic weather feedforward alone while
+        Shadow Mode is on, or the full blended value once it's off.
+        """
+        now = dt_util.utcnow()
+        predicted, confidence = self._predict_with_confidence(
+            "conditioning", outdoor_temp_c, now.hour, now.month,
+            lights_on, light_pct, occupied,
+        )
+        blended_bias_c = predicted * confidence if confidence > 0.0 else 0.0
+        shadow_mode = self.shadow_mode_enabled()
+        applied_bias_c = generic_bias_c if shadow_mode else blended_bias_c
+
+        setpoint = getattr(self._coord, "temp_setpoint", None)
+        predicted_indoor_temp_c: Optional[float] = (
+            setpoint - blended_bias_c if setpoint is not None else None
+        )
+
+        return {
+            "shadow_mode": shadow_mode,
+            "generic_bias_c": generic_bias_c,
+            "blended_bias_c": blended_bias_c,
+            "confidence": confidence,
+            "applied_bias_c": applied_bias_c,
+            "predicted_indoor_temp_c": predicted_indoor_temp_c,
+        }
+
+    # ── Retrospective summary (v1.6.0 Part 9) ────────────────────────────────
+
+    def compute_shadow_retrospective_summary(
+        self, zone: str = "conditioning", trailing_days: float = 7.0,
+    ) -> Optional[dict[str, Any]]:
+        """Aggregate summary over a trailing window for the Settings tab —
+        NOT a live graph, that tab's role is configuration, not ongoing
+        monitoring (Part 6 already covers live monitoring on Conditioning
+        Room's own tab). Derived from the same logged comparison data.
+
+        Returns None when there's nothing yet to summarise (no rows with
+        both a generic and a blended bias logged in the window).
+        """
+        store = self._store
+        if store is None:
+            return None
+
+        cutoff = dt_util.utcnow() - timedelta(days=trailing_days)
+        agree_count = 0
+        disagree_count = 0
+        disagree_magnitude_sum = 0.0
+
+        for row in store.get_hourly_logs(zone):
+            generic = row.get("shadow_generic_bias_c")
+            blended = row.get("shadow_blended_bias_c")
+            if generic is None or blended is None:
+                continue
+            ts_raw = row.get("ts")
+            if not ts_raw:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+            except (TypeError, ValueError):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=cutoff.tzinfo)
+            if ts < cutoff:
+                continue
+
+            same_direction = (generic >= 0) == (blended >= 0)
+            if same_direction:
+                agree_count += 1
+            else:
+                disagree_count += 1
+                disagree_magnitude_sum += abs(blended)
+
+        total = agree_count + disagree_count
+        if total == 0:
+            return None
+
+        return {
+            "sample_count": total,
+            "agreement_pct": round(100.0 * agree_count / total, 1),
+            "avg_disagreement_bias_c": (
+                round(disagree_magnitude_sum / disagree_count, 2) if disagree_count else 0.0
+            ),
+            "trailing_days": trailing_days,
+        }
+
+    # ── Weather-event log (v1.6.0 Part 7) ────────────────────────────────────
+
+    async def maybe_log_weather_event(
+        self,
+        future_temp_c: Optional[float],
+        current_outdoor_temp_c: Optional[float],
+        precipitation_probability: Optional[float],
+        shadow_prediction: Optional[dict[str, Any]],
+    ) -> None:
+        """Edge-triggered detection of a notable discrete forecast change —
+        logs once when a threshold condition BECOMES true, not again on
+        every tick it stays true, and again once it clears and re-triggers.
+        Each logged entry is correlated with the Shadow prediction at that
+        exact moment (Part 7.2), whatever it happened to be.
+        """
+        store = self._store
+        if store is None:
+            return
+
+        state = store.get_weather_event_state()
+        precip_active = bool(state.get("precip_active", False))
+        swing_active = bool(state.get("temp_swing_active", False))
+        new_state = dict(state)
+        now = dt_util.utcnow()
+        messages: list[str] = []
+
+        if precipitation_probability is not None:
+            now_high = precipitation_probability >= WEATHER_EVENT_PRECIP_THRESHOLD_PCT
+            if now_high and not precip_active:
+                messages.append(
+                    f"Rain expected within the next hour ({precipitation_probability:.0f}% chance)"
+                )
+            new_state["precip_active"] = now_high
+
+        if future_temp_c is not None and current_outdoor_temp_c is not None:
+            delta = future_temp_c - current_outdoor_temp_c
+            now_swinging = abs(delta) >= WEATHER_EVENT_TEMP_SWING_C
+            if now_swinging and not swing_active:
+                direction = "rise" if delta > 0 else "drop"
+                messages.append(
+                    f"Significant temperature {direction} forecast ({delta:+.1f}°C within the hour)"
+                )
+            new_state["temp_swing_active"] = now_swinging
+
+        if new_state != state:
+            await store.set_weather_event_state(new_state)
+
+        for message in messages:
+            await store.record_weather_event({
+                "ts": now.isoformat(),
+                "message": message,
+                "correlated_bias_c": (shadow_prediction or {}).get("blended_bias_c"),
+                "correlated_predicted_temp_c": (shadow_prediction or {}).get("predicted_indoor_temp_c"),
+            })
 
     # ── Passive continuous logging (7.5/7.6) ────────────────────────────────────
 
@@ -178,6 +365,9 @@ class LearningEngine:
         lights_on: bool,
         light_pct: float,
         cycle_id: Optional[str],
+        shadow_predicted_indoor_temp_c: Optional[float] = None,
+        shadow_generic_bias_c: Optional[float] = None,
+        shadow_blended_bias_c: Optional[float] = None,
     ) -> None:
         """Rate-limited to roughly once per LEARNING_LOG_INTERVAL_MIN per
         zone — captures a snapshot naturally whenever the tick lands near
@@ -219,6 +409,18 @@ class LearningEngine:
             "month": now.month,
             "setpoint_gap_c": setpoint_gap_c,
             "occupied": occupied,
+            # Part 6 (v1.6.0): piggybacks on this same hourly row/cadence —
+            # no separate data-collection cadence for the Conditioning Room
+            # comparison chart. None for every zone except "conditioning",
+            # and even there only once Environmental Learning has a fitted
+            # model to predict from.
+            "shadow_predicted_indoor_temp_c": shadow_predicted_indoor_temp_c,
+            # Part 9 (v1.6.0): the raw generic/blended bias pair behind the
+            # predicted temp above — kept alongside it so the Settings tab's
+            # retrospective agreement summary can be derived later without
+            # re-deriving anything from the temperature delta.
+            "shadow_generic_bias_c": shadow_generic_bias_c,
+            "shadow_blended_bias_c": shadow_blended_bias_c,
         })
 
         if setpoint_gap_c is not None:

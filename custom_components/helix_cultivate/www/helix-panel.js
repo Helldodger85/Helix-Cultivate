@@ -375,6 +375,56 @@ function buildSparklineSVG(points, colour, width = 200, height = 40, filled = fa
   </svg>`;
 }
 
+// v1.6.0 Part 6: a larger two-line comparison chart (real vs shadow-
+// predicted temperature) with day/hour gridlines — rows are ~1 per hour
+// (Environmental Learning's existing hourly-summary cadence), so index i
+// is treated as "hour i" for gridline placement.
+function buildComparisonChartSVG(realPoints, shadowPoints, width = 600, height = 160) {
+  const n = Math.max(realPoints.length, shadowPoints.length);
+  if (n < 2) {
+    return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      <text x="${width/2}" y="${height/2}" text-anchor="middle" font-size="11"
+        fill="rgba(150,160,180,0.6)">Not enough data yet</text></svg>`;
+  }
+  const allVals = [...realPoints, ...shadowPoints].filter(v => v != null);
+  const min = Math.min(...allVals);
+  const max = Math.max(...allVals);
+  const range = (max - min) || 1;
+  const pad = 6;
+  const w = width - pad * 2;
+  const h = height - pad * 2;
+  const toX = (i) => pad + (i / (n - 1)) * w;
+  const toY = (v) => pad + h - ((v - min) / range) * h;
+
+  const toPolyline = (points) => points
+    .map((v, i) => (v == null ? null : `${toX(i).toFixed(1)},${toY(v).toFixed(1)}`))
+    .filter(Boolean)
+    .join(' ');
+
+  // 2-hour marks instead of hourly once a run gets too dense to read
+  // cleanly (7d ≈ 168 hourly rows) — day boundaries always heavier.
+  const hourStep = n > 72 ? 2 : 1;
+  let gridlines = '';
+  for (let i = 0; i < n; i += hourStep) {
+    const isDayBoundary = i % 24 === 0;
+    const x = toX(i).toFixed(1);
+    gridlines += `<line x1="${x}" y1="${pad}" x2="${x}" y2="${pad + h}"
+      stroke="${isDayBoundary ? 'rgba(150,160,180,0.35)' : 'rgba(150,160,180,0.12)'}"
+      stroke-width="${isDayBoundary ? 1.2 : 0.6}"/>`;
+  }
+
+  const realLine = toPolyline(realPoints);
+  const shadowLine = toPolyline(shadowPoints);
+
+  return `<svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="overflow:visible;display:block">
+    ${gridlines}
+    ${realLine ? `<polyline points="${realLine}" fill="none" stroke="#ef4444" stroke-width="2"
+      stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>` : ''}
+    ${shadowLine ? `<polyline points="${shadowLine}" fill="none" stroke="#a78bfa" stroke-width="2"
+      stroke-dasharray="5,4" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>` : ''}
+  </svg>`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // VPD Radial Gauge  <helix-vpd-gauge>
 // ─────────────────────────────────────────────────────────────────────────────
@@ -661,6 +711,134 @@ class HelixSparklineCard extends HTMLElement {
   connectedCallback() { this._renderShell(); }
 }
 customElements.define('helix-sparkline-card', HelixSparklineCard);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shadow Comparison Chart  <helix-shadow-comparison-card>
+// v1.6.0 Parts 6/7/8 — Conditioning Room's real-vs-shadow-predicted
+// temperature comparison, with the weather-event log for the same window
+// directly beneath it (read together as one piece).
+// ─────────────────────────────────────────────────────────────────────────────
+
+class HelixShadowComparisonCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._timeframe = '24h'; // 24h | 48h | 7d — no 'live', this is a history-only chart
+    this._rows = [];
+    this._events = [];
+    this._loading = false;
+  }
+
+  set hass(h) {
+    const first = !this._hass;
+    this._hass = h;
+    if (first) this._fetch();
+  }
+
+  _tfBtn(id, label) {
+    const active = this._timeframe === id ? 'active' : '';
+    return `<button class="tf-btn ${active}" data-tf="${id}">${label}</button>`;
+  }
+
+  async _fetch() {
+    if (!this._hass) return;
+    this._loading = true;
+    this._render();
+    try {
+      const result = await this._hass.callWS({
+        type: 'helix_cultivate/get_shadow_comparison_data',
+        timeframe: this._timeframe,
+      });
+      this._rows = result.rows || [];
+      this._events = result.weather_events || [];
+    } catch (e) {
+      this._rows = [];
+      this._events = [];
+    } finally {
+      this._loading = false;
+      this._render();
+    }
+  }
+
+  _render() {
+    const realPoints = this._rows.map(r => r.indoor_temp_c);
+    const shadowPoints = this._rows.map(r => r.shadow_predicted_indoor_temp_c);
+    const chart = this._loading
+      ? `<div style="font-size:.75rem;color:var(--hx-text2);padding:16px 0;text-align:center">Loading…</div>`
+      : buildComparisonChartSVG(realPoints, shadowPoints, 600, 180);
+
+    const eventsHtml = this._events.length
+      ? this._events.slice().reverse().map(ev => {
+          const when = ev.ts ? new Date(ev.ts).toLocaleString() : '—';
+          const bias = ev.correlated_bias_c != null ? `${ev.correlated_bias_c >= 0 ? '+' : ''}${fn(ev.correlated_bias_c, 1)}°C` : '—';
+          return `<div class="weather-event-row">
+            <span class="weather-event-time">${when}</span>
+            <span class="weather-event-msg">${ev.message}</span>
+            <span class="weather-event-bias" title="Shadow bias at that moment">${bias}</span>
+          </div>`;
+        }).join('')
+      : `<div style="font-size:.72rem;color:var(--hx-text2);padding:8px 0">No notable weather events in this window.</div>`;
+
+    this.shadowRoot.innerHTML = `
+      <style>
+        ${BASE_CSS}
+        :host { display: block; }
+        .card { background: var(--hx-card); border-radius: 14px; padding: 14px;
+          border: 1px solid var(--hx-border); box-shadow: var(--hx-shadow); }
+        .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+        .title { font-size: .85rem; font-weight: 700; }
+        .tf-bar { display: flex; gap: 3px; }
+        .tf-btn {
+          padding: 3px 7px; font-size: .68rem; font-weight: 600;
+          border: 1px solid var(--hx-border); background: var(--hx-surface2);
+          color: var(--hx-text2); cursor: pointer; border-radius: 5px;
+          transition: background .15s, color .15s;
+        }
+        .tf-btn.active { background: var(--hx-accent); color: #fff; border-color: var(--hx-accent); }
+        .legend { display: flex; gap: 14px; font-size: .68rem; color: var(--hx-text2); margin: 6px 0 2px; }
+        .legend span::before { content: ''; display: inline-block; width: 10px; height: 2px;
+          margin-right: 4px; vertical-align: middle; }
+        .legend .real::before { background: #ef4444; }
+        .legend .shadow::before { background: #a78bfa; border-top: 2px dashed #a78bfa; }
+        .weather-events { margin-top: 10px; border-top: 1px solid var(--hx-border); padding-top: 8px; }
+        .weather-event-row { display: flex; gap: 8px; align-items: baseline; font-size: .72rem;
+          padding: 3px 0; flex-wrap: wrap; }
+        .weather-event-time { color: var(--hx-text2); min-width: 120px; flex-shrink: 0; }
+        .weather-event-msg { flex: 1 1 auto; }
+        .weather-event-bias { color: var(--hx-text2); flex-shrink: 0; }
+      </style>
+      <div class="card">
+        <div class="head">
+          <span class="title">🔬 Shadow vs Real — Conditioning Room</span>
+          <div class="tf-bar">
+            ${this._tfBtn('24h','24h')}
+            ${this._tfBtn('48h','48h')}
+            ${this._tfBtn('7d','7d')}
+          </div>
+        </div>
+        <div class="legend">
+          <span class="real">Real (recorded)</span>
+          <span class="shadow">Shadow (predicted)</span>
+        </div>
+        ${chart}
+        <div class="weather-events">
+          <div style="font-size:.72rem;font-weight:700;margin-bottom:4px">🌦 Weather Events</div>
+          ${eventsHtml}
+        </div>
+      </div>`;
+
+    this.shadowRoot.querySelectorAll('.tf-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.dataset.tf === this._timeframe) return;
+        this._timeframe = btn.dataset.tf;
+        this._fetch();
+      });
+    });
+  }
+
+  connectedCallback() { this._render(); }
+}
+customElements.define('helix-shadow-comparison-card', HelixShadowComparisonCard);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tab Bar  <helix-tab-bar>
@@ -1980,6 +2158,11 @@ class HelixTabCycle extends HTMLElement {
             <span class="sw-thumb"></span>
           </label>
         </div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:2px">
+          When on, Helix Cultivate automatically moves to the next stage once the current
+          stage's day-count target is reached. When off, stages only advance when you do it
+          manually — the day-count still shows progress, but won't trigger anything on its own.
+        </div>
         <div class="toggle-row">
           <span class="toggle-lbl">✦ Smooth Glides (interpolate VPD/light between stages)</span>
           <label class="sw">
@@ -1987,6 +2170,11 @@ class HelixTabCycle extends HTMLElement {
             <span class="sw-track"></span>
             <span class="sw-thumb"></span>
           </label>
+        </div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:2px">
+          When on, every target gradually shifts from this stage's values toward the next
+          stage's values across the whole stage, so the actual transition is seamless with no
+          sudden jump. When off, changes happen instantly the moment a stage begins.
         </div>
         <div class="sec">Stage-Progression Heads-Up Warning</div>
         <div class="slider-row">
@@ -2004,6 +2192,12 @@ class HelixTabCycle extends HTMLElement {
       <!-- Recipe export / import -->
       <div class="card">
         <div class="card-title">📋 Recipe Sharing</div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-bottom:6px">
+          Export/Import covers your entire grow plan — every stage's targets, all in one file
+          — not just the current stage. This is a plain file export/import for sharing your own
+          settings with other growers directly (e.g. pasting into a forum post or a shared
+          folder) — there is no built-in database, directory, or automated strain-lookup feature.
+        </div>
         <div style="display:flex;gap:8px">
           <button id="export-recipe-btn" style="flex:1;padding:10px;border-radius:8px;border:1px solid var(--hx-border);
             background:none;color:var(--hx-text);cursor:pointer">📋 Export Recipe</button>
@@ -3718,6 +3912,24 @@ class HelixTabConditioning extends HTMLElement {
     const tempSP = d.temp_setpoint ?? 24;
     const rhSP   = d.zone1_rh_setpoint ?? 55;
 
+    // v1.6.0 Part 8: current-moment Shadow Mode readout, hidden entirely
+    // when Environmental Learning's master toggle is off or no prediction
+    // has been computed yet this tick.
+    const shadowPred = d.shadow_prediction;
+    const shadowReadoutHtml = (d.thermal_learning_enabled && shadowPred)
+      ? `<div style="font-size:.75rem;color:var(--hx-text2);margin-bottom:10px">
+          🔬 Shadow suggestion: ${fT(shadowPred.predicted_indoor_temp_c)}
+          (confidence: ${Math.round((shadowPred.confidence || 0) * 100)}%)
+          — ${shadowPred.shadow_mode ? 'not applied' : 'applied'}
+        </div>`
+      : '';
+
+    // v1.6.0 Part 6/7: the real-vs-shadow comparison chart + weather-event
+    // log, only meaningful once Environmental Learning is actually on.
+    const comparisonChartHtml = d.thermal_learning_enabled
+      ? `<helix-shadow-comparison-card id="shadow-comparison"></helix-shadow-comparison-card>`
+      : '';
+
     this.shadowRoot.innerHTML = `
       <style>${BASE_CSS}:host{display:block;}</style>
       <div class="card">
@@ -3745,6 +3957,7 @@ class HelixTabConditioning extends HTMLElement {
       </div>
       <div class="card">
         <div class="card-title">🎯 Setpoints</div>
+        ${shadowReadoutHtml}
         <div class="slider-row">
           <span class="slider-lbl">Temp Setpoint</span>
           <input type="range" id="z1-temp" min="15" max="30" step="0.5" value="${tempSP}"/>
@@ -3755,7 +3968,11 @@ class HelixTabConditioning extends HTMLElement {
           <input type="range" id="z1-rh" min="30" max="90" step="1" value="${rhSP}"/>
           <span class="slider-val" id="z1-rh-val">${fRH(rhSP)}</span>
         </div>
-      </div>`;
+      </div>
+      ${comparisonChartHtml}`;
+
+    const shadowComparisonEl = this.shadowRoot.querySelector('#shadow-comparison');
+    if (shadowComparisonEl && this._hass) shadowComparisonEl.hass = this._hass;
 
     const sl = this.shadowRoot.querySelector('#z1-temp');
     const vl = this.shadowRoot.querySelector('#z1-temp-val');
@@ -4310,6 +4527,23 @@ class HelixTabSettings extends HTMLElement {
     this._render();
   }
 
+  // v1.6.0 Part 9: a trailing-window aggregate summary — NOT a live graph,
+  // this tab's role is configuration, not ongoing monitoring (the Part 6
+  // chart on Conditioning Room's own tab already covers live monitoring).
+  _renderShadowRetrospective(summary) {
+    if (!summary) return '';
+    return `
+      <div class="card" style="margin-top:10px">
+        <div class="card-title">📊 Shadow Mode — Last ${summary.trailing_days} Days</div>
+        <div style="font-size:.8rem;color:var(--hx-text2);line-height:1.5">
+          Over the last ${summary.trailing_days} days, shadow and real control agreed on
+          direction ${fn(summary.agreement_pct, 1)}% of the time; average predicted adjustment
+          when they disagreed was ${fn(summary.avg_disagreement_bias_c, 1)}°C
+          (${summary.sample_count} samples).
+        </div>
+      </div>`;
+  }
+
   _renderLearningZoneCard(zoneKey, label, occupied, eligible) {
     const status = this._learningStatus || {};
     const active = status.active_test;
@@ -4368,6 +4602,7 @@ class HelixTabSettings extends HTMLElement {
     const status = this._learningStatus || {};
     const stateLabel = status.learning_state === 'active' ? '✅ Active' : '📖 Learning';
     const startedAt = status.started_at ? new Date(status.started_at).toLocaleDateString() : '—';
+    const shadowMode = d.learning_shadow_mode !== false;
 
     return `
       <div class="card">
@@ -4379,6 +4614,18 @@ class HelixTabSettings extends HTMLElement {
             <span class="sw-track"></span>
             <span class="sw-thumb"></span>
           </label>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-lbl">🔬 Shadow Mode</span>
+          <label class="sw">
+            <input type="checkbox" id="learning-shadow-toggle" ${shadowMode ? 'checked' : ''}/>
+            <span class="sw-track"></span>
+            <span class="sw-thumb"></span>
+          </label>
+        </div>
+        <div style="font-size:.7rem;color:var(--hx-text2);margin-top:2px">
+          While on, the model keeps learning and predicting, but never touches real control — you
+          can watch what it would have done before trusting it with your actual setpoints.
         </div>
         <div class="metric-row">
           <span class="metric-label">State</span>
@@ -4409,6 +4656,7 @@ class HelixTabSettings extends HTMLElement {
         ${status.drying_enabled ? this._renderLearningZoneCard('drying', '🍃 Drying Room', status.drying_occupied, true) : ''}
         ${this._renderLearningZoneCard('conditioning', '🌬 Conditioning Room', false, status.conditioning_eligible !== false)}
       </div>
+      ${this._renderShadowRetrospective(status.shadow_retrospective)}
       <div class="card" style="margin-top:10px">
         <div class="card-title">📡 Optional Data Export</div>
         <div style="font-size:.7rem;color:var(--hx-text2);margin-bottom:8px">
@@ -4944,6 +5192,22 @@ class HelixTabSettings extends HTMLElement {
         }
       });
     }
+    const shadowToggle = this.shadowRoot.querySelector('#learning-shadow-toggle');
+    if (shadowToggle) {
+      shadowToggle.addEventListener('change', async e => {
+        const entryId = (this._data || {}).entry_id;
+        if (!this._hass || !entryId) return;
+        try {
+          await this._hass.callWS({
+            type: 'helix_cultivate/update_settings_fields',
+            entry_id: entryId,
+            fields: { learning_shadow_mode: e.target.checked },
+          });
+        } catch (err) {
+          console.error('Helix Cultivate: learning_shadow_mode save failed', err);
+        }
+      });
+    }
     const durationSl = this.shadowRoot.querySelector('#learning-duration-slider');
     const durationVl = this.shadowRoot.querySelector('#learning-duration-val');
     if (durationSl) {
@@ -5270,6 +5534,7 @@ class HelixPanel extends HTMLElement {
       thermal_learning_duration_days: this._attr('exhaust_speed', 'sensor', 'thermal_learning_duration_days') ?? 18,
       thermal_learning_export_enabled: this._attr('exhaust_speed', 'sensor', 'thermal_learning_export_enabled') === true,
       thermal_learning_export_url: this._attr('exhaust_speed', 'sensor', 'thermal_learning_export_url') ?? '',
+      learning_shadow_mode: this._attr('exhaust_speed', 'sensor', 'learning_shadow_mode') !== false,
       // Zone occupancy (v1.4.0 Part 4)
       zone2_occupied: this._attr('exhaust_speed', 'sensor', 'zone2_occupied') === true,
       drying_occupied: this._attr('exhaust_speed', 'sensor', 'drying_occupied') === true,

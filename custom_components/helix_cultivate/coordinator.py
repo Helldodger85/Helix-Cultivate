@@ -1789,6 +1789,41 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return LearningEngine(self).is_deep_calibration_active(zone)
 
+    def get_conditioning_shadow_feedforward(
+        self,
+        generic_bias_c: float,
+        outdoor_temp_c: Optional[float],
+        indoor_temp_c: Optional[float],
+        lights_on: bool = False,
+        light_pct: float = 0.0,
+        occupied: bool = False,
+    ) -> dict[str, Any]:
+        """Cheap, always-safe check mirroring is_deep_calibration_active —
+        Part 5.2 (v1.6.0) Shadow Mode. Returns the generic weather
+        feedforward bias unchanged (Shadow Mode effectively "on") whenever
+        Environmental Learning is disabled, so this costs nothing and never
+        touches a real setpoint for the overwhelming majority of installs.
+        """
+        if not self._get(CONF_THERMAL_LEARNING_ENABLED, DEFAULT_THERMAL_LEARNING_ENABLED):
+            return {
+                "shadow_mode": True,
+                "generic_bias_c": generic_bias_c,
+                "blended_bias_c": 0.0,
+                "confidence": 0.0,
+                "applied_bias_c": generic_bias_c,
+                "predicted_indoor_temp_c": None,
+            }
+        from .learning_engine import LearningEngine
+
+        return LearningEngine(self).compute_conditioning_shadow_feedforward(
+            generic_bias_c=generic_bias_c,
+            outdoor_temp_c=outdoor_temp_c,
+            indoor_temp_c=indoor_temp_c,
+            lights_on=lights_on,
+            light_pct=light_pct,
+            occupied=occupied,
+        )
+
     def active_live_actuator_test_for_zone(self, zone: str) -> Optional[dict[str, Any]]:
         """Cheap, always-safe check mirroring is_deep_calibration_active
         above — returns the active test dict when a Live Actuator Response
@@ -1816,6 +1851,8 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         upper_canopy_temp: Optional[float],
         lung_temp: Optional[float],
         outdoor_temp: Optional[float],
+        shadow_prediction: Optional[dict[str, Any]] = None,
+        weather_forecast_snapshot: Optional[dict[str, Any]] = None,
     ) -> None:
         """Part 7: entirely inert (no import even happens meaningfully
         beyond this early return) whenever the master toggle is off —
@@ -1842,8 +1879,25 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._get(CONF_ZONE2_CYCLE_ID),
         )
         if self._get(CONF_ENABLE_CONDITIONING_ROOM, False):
+            shadow_predicted_temp = (
+                (shadow_prediction or {}).get("predicted_indoor_temp_c")
+            )
             await engine.maybe_log_hourly(
                 "conditioning", outdoor_temp, lung_temp, 0.0, lights_on, light_pct, None,
+                shadow_predicted_indoor_temp_c=shadow_predicted_temp,
+                shadow_generic_bias_c=(shadow_prediction or {}).get("generic_bias_c"),
+                shadow_blended_bias_c=(shadow_prediction or {}).get("blended_bias_c"),
+            )
+            # Part 7: weather-event detection piggybacks on the same
+            # forecast reading Conditioning Room's feedforward already
+            # fetched this tick — correlated with the Shadow prediction
+            # computed above, whatever it happened to be.
+            snapshot = weather_forecast_snapshot or {}
+            await engine.maybe_log_weather_event(
+                future_temp_c=snapshot.get("future_temp_c"),
+                current_outdoor_temp_c=snapshot.get("current_temp_c"),
+                precipitation_probability=snapshot.get("precipitation_probability"),
+                shadow_prediction=shadow_prediction,
             )
         if drying_temp is not None:
             await engine.maybe_log_hourly(
@@ -2102,7 +2156,9 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # master toggle is off; nothing below this line runs at all in
         # that case.
         await self._run_environmental_learning_tick(
-            upper_canopy_temp, lung_temp, climate_state.get("outdoor_temp_c")
+            upper_canopy_temp, lung_temp, climate_state.get("outdoor_temp_c"),
+            shadow_prediction=climate_state.get("shadow_prediction"),
+            weather_forecast_snapshot=climate_state.get("weather_forecast_snapshot"),
         )
 
         # ── Lights-off day boundary: DLI target alert + reset ───────────────────
@@ -2167,6 +2223,10 @@ class HelixCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "outdoor_rh_pct": climate_state.get("outdoor_rh_pct"),
                 # Light schedule engine
                 "light_applied_pct": self._light_applied_pct,
+                # Part 8 (v1.6.0): Environmental Learning Shadow Mode's
+                # current-moment readout — None whenever Conditioning Room
+                # isn't active this tick.
+                "shadow_prediction": climate_state.get("shadow_prediction"),
             },
             NS_LIGHTING: {
                 "intensity_pct": self.light_intensity_pct,

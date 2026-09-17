@@ -4,6 +4,29 @@ All notable changes to Helix Cultivate are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.6.0] - 2026-09-17
+
+Drying Room's Reverse Cycle upgrade brought to parity with Conditioning Room and Primary Grow Space, three polish fixes from direct user feedback, and Environmental Learning's regression finally wired into a live control decision — behind a Shadow Mode that defaults to observe-only until you trust it.
+
+### Added
+
+- **Drying Room Reverse Cycle parity (Part 1).** `_control_drying_zone()` never passed `target_temp` to `_set_reverse_cycle`, so a thermostat-capable AirCon there always fell back to discrete heat/cool/off switching, `midea_ac.follow_me` never fired, and no backup-heater staging existed at all when the Reverse Cycle toggle was on — `heater_id` was fetched but silently unused in that branch. Now mirrors Zone 1/Zone 2 exactly: real thermostat control (`climate.set_hvac_mode` to `heat_cool`/`auto` + `climate.set_temperature`) when the entity actually reports support, `follow_me` fed Drying's own dedicated sensor, and instantaneous backup-heater staging (the main heater entity becomes the backup) driven exclusively by that same sensor — never an actuator's own onboard reading. The frontend's "Drying AirCon" rename and `reverseCycleToggle` wiring already existed from an earlier pass and needed no changes.
+- **Environmental Learning Shadow Mode.** The confidence-weighted regression (`get_confidence_blended_bias`) is now wired into Conditioning Room's weather-feedforward setpoint pre-compensation — the mechanism it was always intended to plug into. A new Shadow Mode toggle (on by default whenever Environmental Learning is first enabled) gates whether the blended prediction is actually *applied*: on, the real setpoint keeps using only the existing generic weather feedforward, unaffected by the regression; off, it switches to the full confidence-weighted blended value. The prediction itself is computed and logged every tick regardless of Shadow Mode's state, so the new comparison chart works from the moment Environmental Learning is enabled, not from the moment you first trust it.
+- **Conditioning Room comparison chart.** A larger real-vs-shadow-predicted temperature chart on Conditioning Room's own tab, reusing Environmental Learning's existing hourly-summary logging (no new data-collection cadence), with the same 24h/48h/7d timeframe pattern as every other sparkline (no "Live" option — this is a history-only chart) and heavier day-boundary gridlines against lighter hour (or 2-hour, once a 7-day run gets dense) sub-gridlines.
+- **Weather-event log.** New, genuinely separate logging (not a reuse of the hourly summaries) detects notable discrete forecast changes — precipitation probability crossing 50%, or a forecast temperature swing of 5°C or more — as edge-triggered, timestamped, human-readable entries ("Rain expected within the next hour (75% chance)"), each correlated with the Shadow prediction at that exact moment. Rendered directly beneath the comparison chart, read together as one piece.
+- **Current-moment Shadow readout.** A simple, always-current line near Conditioning Room's Setpoints card — "🔬 Shadow suggestion: 23.5°C (confidence: 72%) — not applied" while Shadow Mode is on, "— applied" once it's off — hidden entirely when Environmental Learning's master toggle is off.
+- **Settings tab retrospective summary.** A trailing 7-day aggregate ("shadow and real control agreed on direction X% of the time; average predicted adjustment when they disagreed was Y°C") on the Environmental Learning Settings tab, derived from the same logged comparison data as the chart — intentionally not a live graph, since that tab's role is configuration, not ongoing monitoring.
+
+### Changed
+
+- **Breeze re-modulation interval widened from ~8-25 seconds to ~60-90 seconds** — direct user feedback that the shorter interval read as unnatural fan-hunting rather than gentle gusting.
+- **Auto-Advance Stages and Smooth Glides now carry explanatory copy** directly beside each toggle in the Progression Mode section, clarifying exactly what each one does and doesn't do.
+- **Recipe Sharing now states its real, verified scope**: export/import covers the entire grow plan (every stage) as one file, not a single stage — confirmed directly against `export_current_recipe`/`import_recipe` rather than assumed — and explicitly disclaims any built-in database, directory, or strain-lookup feature it might otherwise be mistaken for.
+
+### Testing
+
+Added dedicated coverage for every part above: Drying Room's reverse-cycle/`follow_me`/backup-heater behavior (10 new tests, previously zero — `_control_drying_zone` had no direct test coverage at all), the widened Breeze interval, both explanatory-copy blocks rendering verbatim, Recipe Sharing's scope claim against the real backend behavior, Shadow Mode's default-on and on/off application gating (proven through `ClimateEngine.run()`'s actual Zone 1 control path, not just the isolated helper), the comparison-chart WS command's timeframe filtering, the weather-event detector's edge-triggering and correlation, and the retrospective summary's aggregation math. Full suite: 512 passing (up from 464).
+
 ## [1.5.4] - 2026-09-16
 
 Two real control-loop bugs found via a full simulated grow cycle (all eight stages, germination through drying, plus targeted stress bursts) exercising the actual coordinator/stage-manager/climate-engine code against a live Home Assistant test instance rather than the mocked unit-test fixtures alone. Both are genuine regressions with real operational impact; neither was caught by the existing 463-test suite because each depends on a runtime condition (an uninitialized attribute's first real-world hit; a hardware state left over from a previous tick) that unit tests built around fresh, pre-seeded mocks don't naturally exercise.

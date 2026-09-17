@@ -121,6 +121,10 @@ from .const import (
     CONF_PREHEAT_LEAD_MIN,
     DEFAULT_PREHEAT_LEAD_MIN,
     PREHEAT_BIAS_C,
+    # Part 5.2 (v1.6.0): Conditioning Room's weather-feedforward setpoint
+    # pre-compensation — the mechanism Shadow Mode plugs into.
+    WEATHER_FEEDFORWARD_BIAS_MAX_C,
+    WEATHER_FEEDFORWARD_BIAS_SCALE,
 )
 
 if TYPE_CHECKING:
@@ -1143,6 +1147,51 @@ class ClimateEngine:
         except (TypeError, ValueError, KeyError, IndexError):
             return 0.0
 
+    async def _weather_feedforward_bias_c(self) -> float:
+        """Conditioning Room's generic weather-feedforward setpoint
+        pre-compensation (Part 5.2, v1.6.0) — the mechanism the
+        Environmental Learning regression's confidence-weighted blending
+        was always intended to plug into. Reuses the exact same
+        outdoor-forecast fetch as _feedforward_adjustment above, scaled to
+        a small °C setpoint bias instead of an exhaust percentage: a
+        forecast temperature rise nudges the setpoint down slightly ahead
+        of time (and vice versa), the same "start responding ahead of the
+        forecast rather than after" idea, applied to Zone 1's own setpoint.
+
+        Returns 0.0 wherever _feedforward_adjustment also would — no
+        weather entity configured, entity unavailable, or no usable
+        forecast (same graceful bypass).
+        """
+        weather_id: Optional[str] = self._get(CONF_OUTDOOR_WEATHER_ENTITY)
+        if not weather_id:
+            return 0.0
+        if self._coord.hass.states.get(weather_id) is None:
+            return 0.0
+
+        forecast = await self._fetch_weather_forecast(weather_id)
+        if not forecast:
+            return 0.0
+
+        try:
+            future_temp = float(forecast[0].get("temperature", 0))
+            current_temp = self._outdoor_temp_c()
+            if current_temp is None:
+                current_temp = future_temp
+            temp_delta = future_temp - current_temp
+            # Part 7 (v1.6.0): stash the same forecast reading the weather-
+            # event detector needs, so it never has to fetch it again.
+            self._last_weather_forecast_snapshot = {
+                "future_temp_c": future_temp,
+                "current_temp_c": current_temp,
+                "precipitation_probability": forecast[0].get("precipitation_probability"),
+            }
+            return max(
+                -WEATHER_FEEDFORWARD_BIAS_MAX_C,
+                min(WEATHER_FEEDFORWARD_BIAS_MAX_C, temp_delta * WEATHER_FEEDFORWARD_BIAS_SCALE),
+            )
+        except (TypeError, ValueError, KeyError, IndexError):
+            return 0.0
+
     # ── Exhaust fan control ───────────────────────────────────────────────────
 
     async def _control_exhaust(
@@ -2093,17 +2142,41 @@ class ClimateEngine:
 
         # ── Apply HVAC control ─────────────────────────────────────────────────
         if is_rc and ac_id:
-            # AC entity is a heat pump — drive via hvac_mode
-            if want_heat:
-                await self._set_reverse_cycle(ac_id, HVAC_MODE_HEAT, role="drying_ac")
-            elif want_cool:
-                await self._set_reverse_cycle(ac_id, HVAC_MODE_COOL, role="drying_ac")
-            else:
-                await self._set_reverse_cycle(ac_id, None, role="drying_ac")
+            # Part 1.1/1.2 (v1.6.0): mirrors Conditioning Room/Primary Grow
+            # Space exactly — target_temp is always passed when reverse-
+            # cycle, so _set_reverse_cycle itself decides thermostat-mode
+            # (heat_cool/auto, with midea_ac.follow_me best-effort-fed
+            # Drying's own dedicated sensor) vs. the discrete mode fallback
+            # for entities that don't report supporting it. drying_temp
+            # (never an actuator's own attribute) is the only current_temp
+            # source, exactly matching the sensor-sourcing rule already
+            # enforced for the other two zones.
+            discrete_mode = HVAC_MODE_HEAT if want_heat else HVAC_MODE_COOL if want_cool else None
+            await self._set_reverse_cycle(
+                ac_id, discrete_mode, role="drying_ac",
+                target_temp=target_temp, current_temp=drying_temp,
+            )
         else:
             # Discrete appliances
             await self._set_switch(heater_id, want_heat, role="drying_heater")
             await self._set_switch(ac_id, want_cool, role="drying_ac")
+
+        # ── Backup heater staging when is_reverse_cycle=True (Part 1.3,
+        # v1.6.0) — the main heater entity BECOMES the backup, exactly the
+        # same convention already established for Zone 1/Zone 2. Driven
+        # exclusively by Drying's own dedicated sensor (drying_temp),
+        # never any actuator's own onboard reading — same instantaneous
+        # (non-dwell) check already used for Zone 1/Zone 2's own
+        # is_reverse_cycle backup-heater staging.
+        if is_rc and heater_id:
+            outdoor_temp = self._outdoor_temp_c()
+            threshold = self._backup_heater_threshold()
+            outdoor_cold = outdoor_temp is not None and outdoor_temp < threshold
+            falling_behind = (
+                outdoor_cold and want_heat and drying_temp is not None
+                and drying_temp < (target_temp - TEMP_DEADBAND_C * 2.0)
+            )
+            await self._set_switch(heater_id, falling_behind, role="drying_backup_heater")
 
         # ── Dehumidifier ───────────────────────────────────────────────────────
         await self._set_switch(dehumid_id, want_dehumid, role="drying_dehumid")
@@ -2237,6 +2310,8 @@ class ClimateEngine:
         zone1_dehumid_on = False
         zone1_reverse_cycle_mode: Optional[str] = None
         zone1_backup_heater_on = False
+        self._last_shadow_prediction: Optional[dict[str, Any]] = None
+        self._last_weather_forecast_snapshot: Optional[dict[str, Any]] = None
 
         zone2_heater_on = False
         zone2_ac_on = False
@@ -2267,6 +2342,23 @@ class ClimateEngine:
                         self._get(CONF_ZONE1_RH_SETPOINT, DEFAULT_ZONE1_RH_SETPOINT_PCT)
                     )
                     zone1_humidity_demand = self._bang_bang_rh(lung_rh, zone1_rh_setpoint)
+
+                    # Part 5.2 (v1.6.0): Environmental Learning Shadow Mode.
+                    # The generic weather feedforward and the regression's
+                    # confidence-blended prediction are both computed every
+                    # tick regardless of Shadow Mode — only which one is
+                    # actually applied to the real setpoint changes. See
+                    # HelixCoordinator.get_conditioning_shadow_feedforward.
+                    generic_ff_bias_c = await self._weather_feedforward_bias_c()
+                    self._last_shadow_prediction = self._coord.get_conditioning_shadow_feedforward(
+                        generic_bias_c=generic_ff_bias_c,
+                        outdoor_temp_c=self._outdoor_temp_c(),
+                        indoor_temp_c=lung_temp,
+                        lights_on=lights_on,
+                        light_pct=float(self._coord.light_intensity_pct or 0.0),
+                        occupied=False,
+                    )
+
                     zone1_reverse_cycle_mode = await self._control_zone(
                         zone=self._z1,
                         zone_label="zone1",
@@ -2279,7 +2371,9 @@ class ClimateEngine:
                         is_reverse_cycle=z1_is_rc,
                         reverse_cycle_id=self._get(CONF_ZONE1_REVERSE_CYCLE),
                         enable_heat_cutoff=True,
-                        extra_setpoint_bias_c=self._preheat_bias_c(),
+                        extra_setpoint_bias_c=(
+                            self._preheat_bias_c() + self._last_shadow_prediction["applied_bias_c"]
+                        ),
                         humidity_demand=zone1_humidity_demand,
                     )
                     zone1_heater_on = self._z1.heater_on
@@ -2372,6 +2466,14 @@ class ClimateEngine:
             "zone1_dehumid_on": zone1_dehumid_on,
             "zone1_reverse_cycle_mode": zone1_reverse_cycle_mode,
             "zone1_backup_heater_on": zone1_backup_heater_on,
+            # Part 5/8 (v1.6.0): Environmental Learning Shadow Mode's
+            # current-moment prediction — None whenever Conditioning Room
+            # isn't active this tick (module disabled, dew point override).
+            "shadow_prediction": self._last_shadow_prediction,
+            # Part 7 (v1.6.0): the same outdoor-forecast reading behind the
+            # weather feedforward bias above, reused for weather-event
+            # detection — None whenever no forecast was fetched this tick.
+            "weather_forecast_snapshot": self._last_weather_forecast_snapshot,
             # Zone 2
             "zone2_heater_on": zone2_heater_on,
             "zone2_ac_on": zone2_ac_on,

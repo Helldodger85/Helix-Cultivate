@@ -95,8 +95,10 @@ FAN_CONTROL_LABELS: dict[str, str] = {
 }
 
 # ── Breeze engine parameters ─────────────────────────────────────────────────
-BREEZE_INTERVAL_MIN_SEC: int = 8
-BREEZE_INTERVAL_MAX_SEC: int = 25
+# v1.6.0 Part 2: widened from 8-25s to 60-90s — the shorter interval read as
+# unnatural fan-hunting rather than gentle gusting.
+BREEZE_INTERVAL_MIN_SEC: int = 60
+BREEZE_INTERVAL_MAX_SEC: int = 90
 
 # ── Grow stages ──────────────────────────────────────────────────────────────
 STAGE_GERMINATION: str = "germination"
@@ -1014,6 +1016,30 @@ CONF_LEARNING_STATE: str = "thermal_learning_state"
 CONF_LEARNING_STARTED_AT: str = "thermal_learning_started_at"
 CONF_LEARNING_DURATION_DAYS: str = "thermal_learning_duration_days"
 DEFAULT_LEARNING_DURATION_DAYS: int = 18  # within the ticket's 2-3 week default range
+
+# Shadow Mode (v1.6.0 Part 5.1) — while on, the regression keeps learning and
+# predicting every tick but never touches a real setpoint; a grower can watch
+# what it would have done before trusting it. Defaults on whenever
+# Environmental Learning is first enabled (see LearningEngine.ensure_started).
+CONF_LEARNING_SHADOW_MODE: str = "learning_shadow_mode"
+DEFAULT_LEARNING_SHADOW_MODE: bool = True
+
+# Conditioning Room's generic weather-feedforward setpoint pre-compensation
+# (v1.6.0 Part 5.2) — the mechanism get_confidence_blended_bias was always
+# intended to plug into. Reuses the same outdoor-forecast machinery as the
+# exhaust fan's _feedforward_adjustment, scaled to a small °C setpoint bias
+# instead of an exhaust percentage.
+WEATHER_FEEDFORWARD_BIAS_SCALE: float = 0.2
+WEATHER_FEEDFORWARD_BIAS_MAX_C: float = 1.5
+
+# Weather-event log (v1.6.0 Part 7) — edge-triggered on a threshold crossing
+# (fires once when a condition becomes true, not again until it clears and
+# re-triggers), so a sustained forecast condition never spams duplicate
+# entries every tick. 50% is the conventional "more likely than not"
+# precipitation threshold; 5°C is a materially HVAC-relevant forecast swing
+# — both plain, defensible defaults, refinable later.
+WEATHER_EVENT_PRECIP_THRESHOLD_PCT: float = 50.0
+WEATHER_EVENT_TEMP_SWING_C: float = 5.0
 
 # Confidence-weighted blending (7.3) — a condition bucket needs at least
 # this many independent observations before the learned model's influence

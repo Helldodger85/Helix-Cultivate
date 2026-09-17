@@ -449,6 +449,10 @@ class HelixSensor(CoordinatorEntity[HelixCoordinator], SensorEntity):
             attrs["thermal_learning_export_url"] = self.coordinator._get(
                 "thermal_learning_export_url", ""
             )
+            # Shadow Mode (v1.6.0 Part 5.1)
+            attrs["learning_shadow_mode"] = self.coordinator._get(
+                "learning_shadow_mode", True
+            )
             # Zone occupancy (v1.4.0 Part 4) — drives "Space Now Empty" and
             # "Harvest Complete" (dedicated Drying Room) visibility.
             attrs["zone2_occupied"] = self.coordinator.is_zone2_occupied()

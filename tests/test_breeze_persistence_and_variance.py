@@ -196,3 +196,49 @@ class TestBreezeLoopPerTierVariance:
             await HelixCoordinator._breeze_loop(coord, FAN_TIER_LOWER)
 
         assert calls[0] == (-float(DEFAULT_FAN_VARIANCE_PCT), float(DEFAULT_FAN_VARIANCE_PCT))
+
+
+class TestBreezeReModulationInterval:
+    """v1.6.0 Part 2: the re-modulation interval was widened from ~8-25s to
+    ~60-90s — the shorter interval read as unnatural fan-hunting rather than
+    gentle gusting."""
+
+    @pytest.mark.asyncio
+    async def test_sleep_interval_drawn_from_60_to_90_seconds(self, monkeypatch):
+        coord = MagicMock()
+        coord._config = {}
+        coord._fan_speeds = {FAN_TIER_UPPER: 50.0}
+        coord._get = lambda key, default=None: coord._config.get(key, default)
+        coord._apply_fan_speed_to_tier = AsyncMock()
+
+        import custom_components.helix_cultivate.coordinator as coordinator_module
+
+        # Real random.uniform for the variance call (irrelevant here); only
+        # capture the second call, which sizes the sleep interval.
+        uniform_calls = []
+        real_uniform = coordinator_module.random.uniform
+
+        def spying_uniform(lo, hi):
+            uniform_calls.append((lo, hi))
+            return real_uniform(lo, hi)
+
+        monkeypatch.setattr(coordinator_module.random, "uniform", spying_uniform)
+
+        async def fake_sleep(_seconds):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(coordinator_module.asyncio, "sleep", fake_sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            await HelixCoordinator._breeze_loop(coord, FAN_TIER_UPPER)
+
+        # calls[0] is the variance delta, calls[1] is the interval range.
+        assert uniform_calls[1] == (60, 90)
+
+    def test_interval_constants_are_60_to_90(self):
+        from custom_components.helix_cultivate.const import (
+            BREEZE_INTERVAL_MAX_SEC,
+            BREEZE_INTERVAL_MIN_SEC,
+        )
+        assert BREEZE_INTERVAL_MIN_SEC == 60
+        assert BREEZE_INTERVAL_MAX_SEC == 90

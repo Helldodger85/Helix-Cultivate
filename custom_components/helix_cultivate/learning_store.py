@@ -55,7 +55,19 @@ EMPTY_LEARNING_STORE: dict[str, Any] = {
     # Durable in-progress test state (7.7) — None when no test is running.
     "active_test": None,
     "test_history": [],
+    # Weather-event log (v1.6.0 Part 7) — one entry per detected notable
+    # forecast change: {ts, message, correlated_bias_c,
+    # correlated_predicted_temp_c}. Genuinely new logging, not a reuse of
+    # hourly_logs — these are discrete, human-readable events, not a
+    # continuous time series.
+    "weather_events": [],
+    # Edge-triggered debounce state for the detector above — {precip_active,
+    # temp_swing_active} — so a sustained forecast condition logs once when
+    # it starts, not again every tick until it actually clears.
+    "weather_event_state": {},
 }
+
+MAX_WEATHER_EVENTS: int = 2000
 
 
 class LearningStore:
@@ -92,6 +104,25 @@ class LearningStore:
         if zone is None:
             return list(logs)
         return [row for row in logs if row.get("zone") == zone]
+
+    # ── Weather-event log (v1.6.0 Part 7) ───────────────────────────────────
+
+    async def record_weather_event(self, entry: dict[str, Any]) -> None:
+        entry = {**entry, "ts": entry.get("ts") or datetime.now(timezone.utc).isoformat()}
+        self._data.setdefault("weather_events", []).append(entry)
+        if len(self._data["weather_events"]) > MAX_WEATHER_EVENTS:
+            self._data["weather_events"] = self._data["weather_events"][-MAX_WEATHER_EVENTS:]
+        await self._save()
+
+    def get_weather_events(self) -> list[dict[str, Any]]:
+        return list(self._data.get("weather_events", []))
+
+    def get_weather_event_state(self) -> dict[str, Any]:
+        return dict(self._data.get("weather_event_state", {}))
+
+    async def set_weather_event_state(self, state: dict[str, Any]) -> None:
+        self._data["weather_event_state"] = state
+        await self._save()
 
     # ── Regression buckets (7.3/7.6) ───────────────────────────────────────────
 

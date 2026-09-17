@@ -41,6 +41,7 @@ WS_CMD_START_DEEP_CALIBRATION: str = "helix_cultivate/start_deep_calibration"
 WS_CMD_START_LIVE_ACTUATOR_TEST: str = "helix_cultivate/start_live_actuator_test"
 WS_CMD_GET_LEARNING_STATUS: str = "helix_cultivate/get_learning_status"
 WS_CMD_APPLY_TEMPORARY_OVERRIDE: str = "helix_cultivate/apply_temporary_override"
+WS_CMD_GET_SHADOW_COMPARISON_DATA: str = "helix_cultivate/get_shadow_comparison_data"
 
 VALID_STAGE_TARGET_KEYS: frozenset[str] = frozenset({
     "day_temp_c", "night_temp_c",
@@ -107,6 +108,9 @@ VALID_SETTINGS_FIELD_KEYS: frozenset[str] = frozenset({
     # Environmental Learning System (v1.4.0 Parts 7-10)
     "thermal_learning_enabled", "thermal_learning_duration_days",
     "thermal_learning_export_enabled", "thermal_learning_export_url",
+    # Shadow Mode (v1.6.0 Part 5.1) — lets the regression keep learning and
+    # predicting without ever touching the real setpoint until trusted.
+    "learning_shadow_mode",
 })
 
 PLATFORMS: list[Platform] = [
@@ -1035,7 +1039,68 @@ async def ws_get_learning_status(
         "drying_enabled": bool(coordinator._get(CONF_ENABLE_DRYING_ENVIRONMENT, False)),
         "conditioning_eligible": coordinator.is_conditioning_room_calibration_eligible(),
         "active_test": store.get_active_test() if store else None,
+        # Part 9 (v1.6.0): trailing-window retrospective summary — None
+        # whenever there's nothing yet to summarise.
+        "shadow_retrospective": engine.compute_shadow_retrospective_summary(),
     })
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_CMD_GET_SHADOW_COMPARISON_DATA,
+        vol.Optional("timeframe", default="24h"): vol.In(["24h", "48h", "7d"]),
+    }
+)
+@websocket_api.async_response
+async def ws_get_shadow_comparison_data(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Part 6/7 (v1.6.0): Conditioning Room's real-vs-shadow-predicted
+    temperature comparison, plus the weather-event log for the same
+    window — read together as one piece. Reuses the existing hourly-
+    summary rows Environmental Learning already stores; no new
+    data-collection cadence for the chart itself."""
+    from datetime import datetime, timedelta
+
+    from homeassistant.util import dt as dt_util
+
+    store = hass.data.get(DOMAIN, {}).get("learning_store")
+    if store is None:
+        connection.send_result(msg["id"], {"rows": [], "weather_events": []})
+        return
+
+    hours_map = {"24h": 24, "48h": 48, "7d": 168}
+    hours = hours_map[msg.get("timeframe", "24h")]
+    cutoff = dt_util.utcnow() - timedelta(hours=hours)
+
+    def _after_cutoff(ts_raw: Optional[str]) -> bool:
+        if not ts_raw:
+            return False
+        try:
+            ts = datetime.fromisoformat(ts_raw)
+        except (TypeError, ValueError):
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=cutoff.tzinfo)
+        return ts >= cutoff
+
+    rows = [
+        {
+            "ts": row.get("ts"),
+            "indoor_temp_c": row.get("indoor_temp_c"),
+            "shadow_predicted_indoor_temp_c": row.get("shadow_predicted_indoor_temp_c"),
+        }
+        for row in store.get_hourly_logs("conditioning")
+        if _after_cutoff(row.get("ts"))
+    ]
+    events = [
+        event for event in store.get_weather_events()
+        if _after_cutoff(event.get("ts"))
+    ]
+
+    connection.send_result(msg["id"], {"rows": rows, "weather_events": events})
 
 
 @websocket_api.websocket_command(
@@ -1136,6 +1201,7 @@ def _async_register_zone_device_ws_commands(hass: HomeAssistant) -> None:
         websocket_api.async_register_command(hass, ws_start_deep_calibration)
         websocket_api.async_register_command(hass, ws_start_live_actuator_test)
         websocket_api.async_register_command(hass, ws_get_learning_status)
+        websocket_api.async_register_command(hass, ws_get_shadow_comparison_data)
         hass.data.setdefault(DOMAIN, {})["_zone_ws_registered"] = True
         _LOGGER.info("Helix Cultivate: zone-device WebSocket commands registered")
     except Exception:  # noqa: BLE001
